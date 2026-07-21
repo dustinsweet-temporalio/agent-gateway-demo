@@ -24,7 +24,7 @@ class CorrelationContext:
 
     workflow_id_source records how the ID was resolved (explicit propagation is
     the preferred contract for controlled agents such as Claude Code; the gateway
-    generates one only when no usable correlation exists).
+    derives one from the MCP session when no explicit id is supplied).
     """
 
     workflow_id: str
@@ -43,6 +43,15 @@ class ToolCallRequest:
     idempotency_key: str
     correlation: CorrelationContext
     approval_timeout_seconds: int = 300
+    # Human sentence describing what will happen, built by the gateway.
+    requested_action: str = ""
+    # Optional requester-supplied reason for the request, distinct from the
+    # policy's risk reason.
+    justification: Optional[str] = None
+    # Gateway-supplied operation id, derived from the idempotency key so the
+    # gateway knows it up front (needed when a call converts to async before the
+    # workflow responds).
+    operation_id: str = ""
 
 
 @dataclass
@@ -109,8 +118,12 @@ class Operation:
     idempotency_key: str
     status: OperationStatus
     requester: Optional[str] = None
+    requested_action: str = ""
+    justification: Optional[str] = None
     risk_reason: Optional[str] = None
+    protected: bool = False
     created_iso: str = ""
+    approval_timeout_seconds: Optional[int] = None
     deadline_epoch: Optional[float] = None
     deadline_iso: Optional[str] = None
     approver: Optional[str] = None
@@ -121,16 +134,26 @@ class Operation:
 
 @dataclass
 class OperationView:
-    """A compact, query-friendly projection of an Operation."""
+    """A query-friendly projection of an Operation, with everything an approver
+    or an auditor needs to see for both the pending and the decided views."""
 
     operation_id: str
     tool_name: str
     status: str
     requester: Optional[str] = None
-    approver: Optional[str] = None
-    created_iso: str = ""
-    deadline_iso: Optional[str] = None
+    requested_action: str = ""
+    arguments: dict[str, Any] = field(default_factory=dict)
+    justification: Optional[str] = None
     risk_reason: Optional[str] = None
+    protected: bool = False
+    created_iso: str = ""
+    approval_timeout_seconds: Optional[int] = None
+    deadline_epoch: Optional[float] = None
+    deadline_iso: Optional[str] = None
+    approver: Optional[str] = None
+    decided_iso: Optional[str] = None
+    decision_reason: Optional[str] = None
+    result: Optional[Any] = None
 
 
 @dataclass
@@ -145,6 +168,10 @@ class ChainState:
     ledger: list[LedgerEntry] = field(default_factory=list)
     op_seq: int = 0
     poll_after_seconds: int = 5
+    # Absolute workflow time of the last session activity. Seeded on first run and
+    # updated on each tool call and decision. Drives the idle timeout. Carried
+    # across Continue-As-New.
+    last_activity_epoch: float = 0.0
 
 
 @dataclass

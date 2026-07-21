@@ -28,6 +28,14 @@ with workflow.unsafe.imports_passed_through():
 POLICY_TIMEOUT = timedelta(seconds=10)
 INVOKE_TIMEOUT = timedelta(seconds=30)
 
+# Idle timeout for an agentic chain. A chain that has no pending work and receives
+# no new tool call or decision for this long completes on its own. This is a fixed
+# constant rather than an environment read, because Workflow code must not read
+# non-deterministic sources: every Worker replaying this Workflow must agree on the
+# value. To demo the idle close live, lower this and rebuild the worker image. To
+# make it per-chain configurable, carry it on ChainInput instead of here.
+IDLE_TIMEOUT_SECONDS = 24 * 60 * 60
+
 TERMINAL = {
     OperationStatus.COMPLETED,
     OperationStatus.REJECTED,
@@ -58,7 +66,8 @@ class AgenticChainWorkflow:
     reject decisions arrive as Signals that only mutate state; the main loop reacts
     to those state changes and performs the downstream invocation. This mirrors the
     Temporal best practice that message handlers should not drive Activities
-    directly. The workflow rolls over with Continue-As-New to keep history bounded.
+    directly. The workflow rolls over with Continue-As-New to keep history bounded,
+    and completes on its own once it has been idle with no pending work.
     """
 
     @workflow.init
@@ -74,6 +83,11 @@ class AgenticChainWorkflow:
 
     @workflow.run
     async def run(self, input: ChainInput) -> ChainSummary:
+        # Seed the idle clock on first run only. On Continue-As-New the carried value
+        # is preserved so a rollover does not reset the idle window.
+        if self._state.last_activity_epoch == 0.0:
+            self._state.last_activity_epoch = workflow.now().timestamp()
+
         while True:
             try:
                 await workflow.wait_condition(
@@ -81,7 +95,7 @@ class AgenticChainWorkflow:
                     timeout=self._next_wait(),
                 )
             except asyncio.TimeoutError:
-                # Timeout means an approval deadline may have elapsed.
+                # Timeout means an approval deadline or the idle window may have elapsed.
                 pass
 
             self._reschedule = False
@@ -91,9 +105,17 @@ class AgenticChainWorkflow:
             if not self._closing and workflow.info().is_continue_as_new_suggested():
                 await self._do_continue_as_new()  # does not return
 
-            if self._closing and not self._has_pending_work():
+            # Graceful completion: an explicit close signal, or the chain has been
+            # idle with nothing pending. Drain handlers first, then re-check that no
+            # work arrived during the drain before completing.
+            if not self._has_pending_work() and (self._closing or self._is_idle()):
                 await workflow.wait_condition(workflow.all_handlers_finished)
-                return self._summary()
+                if not self._has_pending_work():
+                    if self._closing:
+                        self._log("closed", None)
+                    else:
+                        self._log("idle_timeout", None, {"idle_seconds": IDLE_TIMEOUT_SECONDS})
+                    return self._summary()
 
     # ----------------------------------------------------------------- handlers
 
@@ -106,6 +128,7 @@ class AgenticChainWorkflow:
         approval path; the main loop performs it after approval.
         """
         async with self._lock:
+            self._touch()
             existing_id = self._state.idempotency_index.get(req.idempotency_key)
             if existing_id is not None:
                 op = self._state.operations[existing_id]
@@ -127,6 +150,7 @@ class AgenticChainWorkflow:
                 start_to_close_timeout=POLICY_TIMEOUT,
             )
             op.risk_reason = decision.reason
+            op.protected = decision.requires_approval
             self._log(
                 "policy_evaluated",
                 op,
@@ -161,6 +185,7 @@ class AgenticChainWorkflow:
         op = self._state.operations.get(decision.operation_id)
         if op is None or op.status != OperationStatus.WAITING_FOR_APPROVAL:
             return
+        self._touch()
         op.status = OperationStatus.APPROVED
         op.approver = decision.approver
         op.decided_iso = workflow.now().isoformat()
@@ -171,6 +196,7 @@ class AgenticChainWorkflow:
         op = self._state.operations.get(decision.operation_id)
         if op is None or op.status != OperationStatus.WAITING_FOR_APPROVAL:
             return
+        self._touch()
         op.status = OperationStatus.REJECTED
         op.approver = decision.approver
         op.error = decision.reason
@@ -217,6 +243,8 @@ class AgenticChainWorkflow:
             return True
         if workflow.info().is_continue_as_new_suggested():
             return True
+        if not self._has_pending_work() and self._is_idle():
+            return True
         now = workflow.now().timestamp()
         for op in self._state.operations.values():
             if op.status == OperationStatus.APPROVED:
@@ -229,17 +257,27 @@ class AgenticChainWorkflow:
                 return True
         return False
 
-    def _next_wait(self):
+    def _next_wait(self) -> timedelta:
         now = workflow.now().timestamp()
-        deadlines = [
+        candidates = [
             op.deadline_epoch
             for op in self._state.operations.values()
             if op.status == OperationStatus.WAITING_FOR_APPROVAL
             and op.deadline_epoch is not None
         ]
-        if not deadlines:
-            return None
-        return timedelta(seconds=max(0.0, min(deadlines) - now))
+        # The idle deadline is always a candidate, so the loop always has a finite
+        # wake time and will eventually evaluate the idle-close condition.
+        candidates.append(self._state.last_activity_epoch + IDLE_TIMEOUT_SECONDS)
+        return timedelta(seconds=max(0.0, min(candidates) - now))
+
+    def _is_idle(self) -> bool:
+        return (
+            workflow.now().timestamp()
+            >= self._state.last_activity_epoch + IDLE_TIMEOUT_SECONDS
+        )
+
+    def _touch(self) -> None:
+        self._state.last_activity_epoch = workflow.now().timestamp()
 
     def _expire_overdue(self) -> None:
         now = workflow.now().timestamp()
@@ -267,6 +305,7 @@ class AgenticChainWorkflow:
                 op.status = OperationStatus.INVOKING
                 self._log("invoking", op)
             await self._invoke(op)
+            self._touch()
 
     async def _invoke(self, op: Operation) -> None:
         try:
@@ -321,7 +360,7 @@ class AgenticChainWorkflow:
 
     def _new_operation(self, req: ToolCallRequest) -> Operation:
         self._state.op_seq += 1
-        op_id = f"op-{self._state.workflow_id}-{self._state.op_seq}"
+        op_id = req.operation_id or ("op-" + workflow.uuid4().hex[:6])
         return Operation(
             operation_id=op_id,
             tool_name=req.tool_name,
@@ -329,18 +368,33 @@ class AgenticChainWorkflow:
             idempotency_key=req.idempotency_key,
             status=OperationStatus.EVALUATING,
             requester=req.correlation.caller_principal,
+            requested_action=req.requested_action,
+            justification=req.justification,
+            approval_timeout_seconds=req.approval_timeout_seconds,
             created_iso=workflow.now().isoformat(),
         )
 
     def _response_for(self, op: Operation) -> ToolCallResponse:
         wf_id = self._state.workflow_id
-        if op.status in PENDING:
+        if op.status == OperationStatus.WAITING_FOR_APPROVAL:
             return ToolCallResponse(
                 status="waiting_for_approval",
                 workflow_id=wf_id,
                 operation_id=op.operation_id,
                 reason="approval_required",
                 message="Approval is required before this tool call can continue.",
+                poll_after_seconds=self._state.poll_after_seconds,
+            )
+        if op.status in (
+            OperationStatus.EVALUATING,
+            OperationStatus.APPROVED,
+            OperationStatus.INVOKING,
+        ):
+            return ToolCallResponse(
+                status="processing",
+                workflow_id=wf_id,
+                operation_id=op.operation_id,
+                message="The tool call is still running.",
                 poll_after_seconds=self._state.poll_after_seconds,
             )
         if op.status == OperationStatus.COMPLETED:
@@ -385,10 +439,19 @@ class AgenticChainWorkflow:
                     tool_name=op.tool_name,
                     status=op.status.value,
                     requester=op.requester,
-                    approver=op.approver,
-                    created_iso=op.created_iso,
-                    deadline_iso=op.deadline_iso,
+                    requested_action=op.requested_action,
+                    arguments=op.arguments,
+                    justification=op.justification,
                     risk_reason=op.risk_reason,
+                    protected=op.protected,
+                    created_iso=op.created_iso,
+                    approval_timeout_seconds=op.approval_timeout_seconds,
+                    deadline_epoch=op.deadline_epoch,
+                    deadline_iso=op.deadline_iso,
+                    approver=op.approver,
+                    decided_iso=op.decided_iso,
+                    decision_reason=op.error,
+                    result=op.result,
                 )
             )
         return ChainSummary(

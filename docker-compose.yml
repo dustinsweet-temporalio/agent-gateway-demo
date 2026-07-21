@@ -23,6 +23,9 @@ services:
     command: ["python", "-m", "mock_tool.server"]
     environment:
       MOCK_TOOL_PORT: "9000"
+      # Cutting this release runs long and trips the gateway convert-to-async path.
+      SLOW_CUT_VERSION: "2.3.1"
+      SLOW_CUT_DELAY_SECONDS: "8"
     ports:
       - "9000:9000"
 
@@ -38,8 +41,7 @@ services:
       TEMPORAL_ADDRESS: "temporal:7233"
       TASK_QUEUE: "agentic-gateway"
       MOCK_TOOL_URL: "http://mock-tool:9000/invoke"
-      PROTECTED_TOOLS: "deploy_service,delete_resource,transfer_funds"
-      APPROVAL_AMOUNT_THRESHOLD: "1000"
+      PROTECTED_ENVIRONMENTS: "prod,production"
 
   gateway:
     build:
@@ -54,6 +56,11 @@ services:
       TASK_QUEUE: "agentic-gateway"
       APPROVAL_TIMEOUT_SECONDS: "300"
       GATEWAY_PORT: "8080"
+      # Static bearer-token to identity map. The gateway sets the approval
+      # requester from a matching token, never from anything the agent says.
+      # Connect Claude Code with: --header "Authorization: Bearer tok_dustin"
+      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>"}'
+      GATEWAY_DEBUG: "1"
     ports:
       - "8080:8080"
 

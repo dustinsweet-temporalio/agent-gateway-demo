@@ -10,9 +10,9 @@ from temporalio.exceptions import ApplicationError
 from common.models import EvaluatePolicyInput, InvokeToolInput, PolicyDecision
 
 
-def _protected_tools() -> set[str]:
-    raw = os.getenv("PROTECTED_TOOLS", "deploy_service,delete_resource,transfer_funds")
-    return {name.strip() for name in raw.split(",") if name.strip()}
+def _protected_environments() -> set[str]:
+    raw = os.getenv("PROTECTED_ENVIRONMENTS", "prod,production")
+    return {e.strip().lower() for e in raw.split(",") if e.strip()}
 
 
 @activity.defn
@@ -20,35 +20,29 @@ def evaluate_policy(input: EvaluatePolicyInput) -> PolicyDecision:
     """Represents the Agent Gateway policy engine.
 
     Kept in an Activity, not in Workflow code, so policy rules can change without
-    a Workflow code change and without introducing non-determinism. The Workflow
-    records the returned decision in Event History, which keeps the audit trail.
+    a Workflow code change and without introducing non-determinism. Policy is a
+    function of the tool identity and the requested arguments: promoting a release
+    to a protected environment (prod) requires approval; everything else, including
+    reads and promotions to test or staging, runs immediately.
     """
-    protected = _protected_tools()
-    if input.tool_name in protected:
-        return PolicyDecision(
-            requires_approval=True,
-            reason=f"Tool '{input.tool_name}' is a protected action and requires approval.",
-        )
-
-    amount = input.arguments.get("amount")
-    threshold = float(os.getenv("APPROVAL_AMOUNT_THRESHOLD", "1000"))
-    if isinstance(amount, (int, float)) and float(amount) >= threshold:
-        return PolicyDecision(
-            requires_approval=True,
-            reason=f"Requested amount {amount} is at or above the auto-approval threshold {threshold}.",
-        )
-
+    if input.tool_name == "promote_release":
+        environment = str(input.arguments.get("environment", "")).lower()
+        if environment in _protected_environments():
+            return PolicyDecision(
+                requires_approval=True,
+                reason=f"Promotion to {environment} requires human approval.",
+            )
     return PolicyDecision(requires_approval=False, reason=None)
 
 
 @activity.defn
 def invoke_tool(input: InvokeToolInput) -> dict[str, Any]:
-    """Invoke the downstream protected tool.
+    """Invoke the downstream tool.
 
     Activities have at-least-once semantics, so the idempotency key is passed
-    downstream. A retry after a Worker crash or network blip must not execute the
-    protected action twice. A longer-running tool would also call
-    activity.heartbeat() here; this mock tool returns quickly, so it does not.
+    downstream. A retry after a Worker crash or network blip must not promote a
+    release twice. A longer-running tool would also call activity.heartbeat() here;
+    this mock tool returns quickly, so it does not.
     """
     url = os.getenv("MOCK_TOOL_URL", "http://mock-tool:9000/invoke")
     try:

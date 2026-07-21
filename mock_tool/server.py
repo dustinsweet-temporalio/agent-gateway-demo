@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 
@@ -9,10 +10,71 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-# In-memory idempotency store keyed by the Idempotency-Key header. A replayed
-# activity attempt with the same key returns the original result with a stable
-# executed_at, which shows that at-least-once delivery did not double-execute.
+# Pretend deployment backend. Holds just enough in-memory state to keep the demo
+# story internally consistent: cut releases are remembered, and a promotion moves
+# the target environment to that version so a later read reflects it.
+_deployed: dict[str, str] = {"test": "2.3.0", "staging": "2.2.0", "prod": "2.1.0"}
+_releases: set[tuple[str, str]] = set()
+
+# Idempotency store keyed by the Idempotency-Key header. A replayed activity
+# attempt with the same key returns the original result and does not apply the
+# effect a second time.
 _seen: dict[str, dict] = {}
+
+# Demo knob: cutting this release runs long, which trips the gateway's
+# monitor-and-convert budget and demonstrates the sync-to-async conversion. The
+# delay stays under the invoke Activity's request timeout.
+SLOW_CUT_VERSION = os.getenv("SLOW_CUT_VERSION", "2.3.1")
+SLOW_CUT_DELAY_SECONDS = float(os.getenv("SLOW_CUT_DELAY_SECONDS", "8"))
+
+
+async def _maybe_delay(tool_name: str, arguments: dict) -> None:
+    if (
+        tool_name == "cut_release"
+        and str(arguments.get("version", "")) == SLOW_CUT_VERSION
+    ):
+        await asyncio.sleep(SLOW_CUT_DELAY_SECONDS)
+
+
+def _handle(tool_name: str, arguments: dict) -> dict:
+    if tool_name == "get_deployed_version":
+        env = str(arguments.get("environment", ""))
+        version = _deployed.get(env)
+        return {
+            "environment": env,
+            "deployed_version": version,
+            "message": (
+                f"{version} is currently deployed in {env}"
+                if version
+                else f"no known deployment in {env}"
+            ),
+        }
+
+    if tool_name == "cut_release":
+        service = str(arguments.get("service", ""))
+        version = str(arguments.get("version", ""))
+        _releases.add((service, version))
+        return {
+            "service": service,
+            "version": version,
+            "release": "cut",
+            "message": f"release {version} of {service} is cut and ready to promote",
+        }
+
+    if tool_name == "promote_release":
+        service = str(arguments.get("service", ""))
+        version = str(arguments.get("version", ""))
+        env = str(arguments.get("environment", ""))
+        _deployed[env] = version
+        return {
+            "service": service,
+            "version": version,
+            "environment": env,
+            "promoted": True,
+            "message": f"promoted {service} {version} to {env}",
+        }
+
+    return {"tool_name": tool_name, "message": f"executed {tool_name}"}
 
 
 async def invoke(request: Request) -> JSONResponse:
@@ -24,13 +86,13 @@ async def invoke(request: Request) -> JSONResponse:
         prior["idempotent_replay"] = True
         return JSONResponse(prior)
 
-    result = {
-        "tool_name": body.get("tool_name"),
-        "arguments": body.get("arguments"),
-        "executed_at": time.time(),
-        "message": f"executed {body.get('tool_name')}",
-        "idempotent_replay": False,
-    }
+    tool_name = body.get("tool_name", "")
+    arguments = body.get("arguments", {}) or {}
+    await _maybe_delay(tool_name, arguments)
+
+    result = _handle(tool_name, arguments)
+    result["executed_at"] = time.time()
+    result["idempotent_replay"] = False
     if key:
         _seen[key] = result
     return JSONResponse(result)
