@@ -1,0 +1,21 @@
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install the Temporal CLI, which bundles the local dev server and Web UI.
+RUN curl -sSf https://temporal.download/cli.sh | sh \
+    && cp /root/.temporalio/bin/temporal /usr/local/bin/temporal \
+    && temporal --version
+
+RUN mkdir -p /data
+
+EXPOSE 7233 8233
+
+# start-dev is for development only. --db-filename persists state to the volume so
+# the demo survives container restarts. The Web UI is served on 8233.
+CMD ["temporal", "server", "start-dev", \
+     "--ip", "0.0.0.0", \
+     "--db-filename", "/data/temporal.db", \
+     "--ui-port", "8233"]

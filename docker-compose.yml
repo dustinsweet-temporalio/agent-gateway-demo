@@ -1,0 +1,61 @@
+name: agent-gateway-approval-demo
+
+services:
+  temporal:
+    build:
+      context: .
+      dockerfile: Dockerfile.temporal
+    ports:
+      - "7233:7233"
+      - "8233:8233"
+    volumes:
+      - temporal-data:/data
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "namespace", "describe", "-n", "default", "--address", "127.0.0.1:7233"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  mock-tool:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    command: ["python", "-m", "mock_tool.server"]
+    environment:
+      MOCK_TOOL_PORT: "9000"
+    ports:
+      - "9000:9000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    command: ["python", "worker.py"]
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: "temporal:7233"
+      TASK_QUEUE: "agentic-gateway"
+      MOCK_TOOL_URL: "http://mock-tool:9000/invoke"
+      PROTECTED_TOOLS: "deploy_service,delete_resource,transfer_funds"
+      APPROVAL_AMOUNT_THRESHOLD: "1000"
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    command: ["python", "-m", "gateway.server"]
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: "temporal:7233"
+      TASK_QUEUE: "agentic-gateway"
+      APPROVAL_TIMEOUT_SECONDS: "300"
+      GATEWAY_PORT: "8080"
+    ports:
+      - "8080:8080"
+
+volumes:
+  temporal-data:
