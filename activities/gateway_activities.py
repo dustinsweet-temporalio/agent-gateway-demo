@@ -50,7 +50,7 @@ def invoke_tool(input: InvokeToolInput) -> dict[str, Any]:
             url,
             json={"tool_name": input.tool_name, "arguments": input.arguments},
             headers={"Idempotency-Key": input.idempotency_key},
-            timeout=15,
+            timeout=45,
         )
     except requests.RequestException as err:
         # Transient transport failure: allow Temporal to retry per the retry policy.
