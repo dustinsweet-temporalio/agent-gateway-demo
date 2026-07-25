@@ -15,6 +15,7 @@ from starlette.routing import Route
 # the target environment to that version so a later read reflects it.
 _deployed: dict[str, str] = {"test": "2.3.0", "staging": "2.2.0", "prod": "2.1.0"}
 _releases: set[tuple[str, str]] = set()
+_autonomous_followups: set[str] = set()
 
 # Idempotency store keyed by the Idempotency-Key header. A replayed activity
 # attempt with the same key returns the original result and does not apply the
@@ -72,6 +73,33 @@ def _handle(tool_name: str, arguments: dict) -> dict:
             "environment": env,
             "promoted": True,
             "message": f"promoted {service} {version} to {env}",
+        }
+
+    if tool_name == "release_orchestrator_prepare":
+        return {
+            "checkpointed": True,
+            "service": str(arguments.get("service", "")),
+            "version": str(arguments.get("version", "")),
+            "next_tool": "promote_release",
+            "message": "Tool1 checkpointed before its nested Tool2 call",
+        }
+
+    if tool_name == "release_orchestrator_resume":
+        nested_result = arguments.get("nested_result")
+        return {
+            "resumed": True,
+            "replayed": bool(arguments.get("replay")),
+            "nested_result_received": nested_result is not None,
+            "message": "Tool1 resumed with the durable Tool2 result",
+        }
+
+    if tool_name == "record_autonomous_followup":
+        run_id = str(arguments.get("agent_run_id", ""))
+        _autonomous_followups.add(run_id)
+        return {
+            "agent_run_id": run_id,
+            "followup_recorded": True,
+            "message": "Autonomous dependent action executed after approval",
         }
 
     return {"tool_name": tool_name, "message": f"executed {tool_name}"}

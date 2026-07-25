@@ -59,10 +59,37 @@ services:
       # Static bearer-token to identity map. The gateway sets the approval
       # requester from a matching token, never from anything the agent says.
       # Connect Claude Code with: --header "Authorization: Bearer tok_dustin"
-      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>"}'
+      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo"}'
+      GATEWAY_APPROVERS: "approver@demo"
       GATEWAY_DEBUG: "1"
     ports:
       - "8080:8080"
+
+  adk-agent:
+    profiles: ["adk"]
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    command:
+      [
+        "adk",
+        "web",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "adk_agents",
+      ]
+    depends_on:
+      gateway:
+        condition: service_started
+    environment:
+      AGENT_GATEWAY_MCP_URL: "http://gateway:8080/mcp"
+      AGENT_GATEWAY_TOKEN: "tok_adk"
+      ADK_MODEL: "${ADK_MODEL:-gemini-2.5-flash}"
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+    ports:
+      - "8000:8000"
 
 volumes:
   temporal-data:

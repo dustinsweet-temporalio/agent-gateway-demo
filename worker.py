@@ -8,6 +8,7 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from activities.gateway_activities import evaluate_policy, invoke_tool
+from workflows.autonomous_agent import AutonomousAgentWorkflow
 from workflows.chain import AgenticChainWorkflow
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
@@ -21,7 +22,7 @@ async def main() -> None:
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
-            workflows=[AgenticChainWorkflow],
+            workflows=[AgenticChainWorkflow, AutonomousAgentWorkflow],
             activities=[evaluate_policy, invoke_tool],
             activity_executor=executor,
         )
@@ -30,4 +31,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

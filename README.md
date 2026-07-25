@@ -1,10 +1,13 @@
 # Agent Gateway: durable suspend and resume for agentic tool calls
 
-A runnable demo of CASE-1 from the "Suspend/Resume Primitive for Agentic Work"
-requirements. An MCP server (the Agent Gateway) pauses protected tool calls for
-human approval. The pause is held by a chain-scoped Temporal entity workflow, so
-it survives process restarts, and it resumes exactly where it left off once an
-approver decides.
+A runnable implementation of all three scenarios in the "Suspend/Resume Primitive
+for Agentic Work" requirements. An MCP server (the Agent Gateway) pauses protected
+tool calls for human approval. Temporal holds the chain, nested Tool1 checkpoint,
+autonomous-agent checkpoint, approval deadline, ledger, and recovery handles, so
+execution survives process restarts and resumes from durable state.
+
+For a step-by-step, execution-first guide, use
+[WALKTHROUGH.md](WALKTHROUGH.md).
 
 The demo scenario is a deployment flow. You work in a code session (Claude Code in
 any repo, the repo does not have to be this one) and drive a release through
@@ -15,11 +18,16 @@ gateway pauses it and a human approves or rejects before it proceeds.
 ## Architecture
 
 ```
-Claude Code ---MCP/HTTP---> Agent Gateway ---update-with-start---> Chain Workflow
-                                 ^                                      |
-                                 | approve / reject (Signal)            | invoke (Activity)
-                            Approver UI                                 v
-                                                                   Mock Deploy Backend
+Claude Code / Google ADK agent ---MCP/HTTP---> Agent Gateway
+                                                     |
+                    +--------------------------------+------------------+
+                    |                                                   |
+          Chain entity workflow                           Autonomous-agent workflow
+          (CASE-1 and CASE-2)                              (CASE-3 checkpoint)
+                    |                                                   |
+                    +---------- Activities -> Mock Deploy Backend ------+
+                                                     ^
+                                       approve/reject/cancel Signals
 ```
 
 - One long-lived workflow per agentic chain, keyed by `workflow_id`. Operations
@@ -38,9 +46,33 @@ Claude Code ---MCP/HTTP---> Agent Gateway ---update-with-start---> Chain Workflo
   the tool and its arguments: `promote_release` to prod requires approval.
 - A chain rolls over with Continue-As-New to keep history bounded, and completes
   on its own after an idle window (24 hours) once it has no pending work.
+- Controlled nested Tool1 calls checkpoint before Tool2 and resume with Tool2's
+  durable result. Uncontrolled Tool1 calls fail closed. An approved Tool2 is not
+  executed until the caller explicitly retries, and replay is refused unless
+  Tool1 advertised replay safety.
+- The Google ADK agent connects to the gateway over streamable HTTP MCP with its
+  own bearer identity and a Scenario 3-only tool allowlist. Its Temporal workflow
+  checkpoints the current/next agent step while approval is pending and runs no
+  dependent external side effect until the protected action has completed.
+- Explicit caller-provided workflow IDs are accepted only from authenticated
+  principals. Every workflow records its owner; lifecycle queries and retries
+  must come from that owner.
+- Approver identity is derived from an authenticated gateway token. The approve
+  and reject forms do not accept a caller-supplied approver name.
+- Every MCP tool publishes a concrete output schema as well as its input schema,
+  including the shared status/recovery envelope.
+
+## Requirements scenario mapping
+
+| Scenario | Entry tool | Durable behavior |
+| --- | --- | --- |
+| CASE-1: simple tool | `promote_release` | Policy gate, wait payload, approve/reject/expire/cancel, invoke, poll result |
+| CASE-2: nested Tool1 -> Tool2 | `run_nested_release` | Full call path, child operation, controlled checkpoint/resume, uncontrolled fail-closed/retry |
+| CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run correlation, plan checkpoint, gateway-owned decision, protected action then dependent action |
 
 Services in `docker-compose.yml`: `temporal` (dev server plus Web UI), `worker`,
-`gateway`, and `mock-tool` (the pretend deployment backend).
+`gateway`, and `mock-tool` (the pretend deployment backend). The optional `adk`
+profile adds a real Google ADK Web service for CASE-3.
 
 ## Tools
 
@@ -51,9 +83,20 @@ Services in `docker-compose.yml`: `temporal` (dev server plus Web UI), `worker`,
 - `promote_release(service, version, environment, justification)` requests that an
   environment move to a release. Test and staging run immediately; prod pauses for
   approval. `justification` is optional and is shown to the approver.
+- `run_nested_release(..., tool1_mode, replay_safe)` runs the CASE-2 chain.
+  `tool1_mode=controlled` resumes automatically. `tool1_mode=uncontrolled`
+  returns `blocked_nested_approval`.
+- `resume_nested_release(workflow_id, operation_id)` explicitly retries an
+  approved uncontrolled nested call; it succeeds only when `replay_safe=true`.
+- `start_google_adk_release_run(..., agent_run_id)` starts or recovers CASE-3.
 - Lifecycle tools: `get_operation_status(workflow_id, operation_id)`,
   `get_operation_result(workflow_id, operation_id)`,
-  `get_workflow_status(workflow_id)`.
+  `get_workflow_status(workflow_id)`, `get_workflow_ledger(workflow_id)`, and
+  `cancel_operation(workflow_id, operation_id, reason)`.
+
+All call tools accept an optional caller idempotency key. Reusing it under the same
+authenticated principal and workflow returns the same operation rather than
+opening a duplicate approval gate.
 
 The default service name in the demo is `delivery-matching-service`.
 
@@ -90,6 +133,18 @@ Wait for the worker to log that it is polling and the gateway to start. Then:
 - Approver dashboard: http://localhost:8080
 - Gateway MCP endpoint: http://localhost:8080/mcp
 
+## Test it
+
+Install `requirements-dev.txt` and run:
+
+```
+python3 -m pytest -q
+```
+
+The workflow tests start an ephemeral local Temporal dev server with the installed
+Temporal CLI and exercise all three cases plus rejection, expiry, cancellation,
+deduplication, and the uncontrolled-tool safety boundary.
+
 ## Register the gateway with Claude Code
 
 Project scope (writes `.mcp.json`, one is already included here):
@@ -112,6 +167,31 @@ Confirm it is connected:
 ```
 claude mcp list
 ```
+
+## Run CASE-3 with Google ADK
+
+The agent at `adk_agents/release_approval_agent` uses Google ADK 2.x
+`McpToolset` to discover the dedicated Scenario 3 start and lifecycle tools. It
+authenticates as `release-agent@google-adk`; it cannot see the generic
+`promote_release` entrypoint.
+
+Start it with a Gemini API key:
+
+```
+export GOOGLE_API_KEY="<your Gemini API key>"
+docker compose --profile adk up --build adk-agent
+```
+
+Open http://localhost:8000, select `release_approval_agent`, and ask:
+
+```
+Start Scenario 3 for delivery-matching-service version 2.5.0 to prod.
+Use agent_run_id walkthrough-adk-run-1.
+```
+
+The agent returns the durable `workflow_id` and `operation_id` when approval is
+needed. Decide it at http://localhost:8080, then ask the agent for the operation
+result using those IDs. See [WALKTHROUGH.md](WALKTHROUGH.md) for the exact flow.
 
 ## Chain correlation
 
@@ -151,7 +231,7 @@ gateway exposes; the model maps to them.
    returns `status: processing` with a `workflow_id`, an `operation_id`, and
    `poll_after_seconds`, while the cut keeps running in the workflow. Poll
    `get_operation_result` with those ids; it reads `processing` until the cut
-   finishes (about 8 seconds), then flips to `completed`. Cuts of other versions
+   finishes (about 30 seconds), then flips to `completed`. Cuts of other versions
    are fast and return synchronously without converting.
 
 3. Promote to staging (not gated). Ask it to promote `2.3.1` to staging
@@ -162,7 +242,8 @@ gateway exposes; the model maps to them.
    as "ship the matching latency fix". The response is `status: waiting_for_approval`
    with an `operation_id` and `poll_after_seconds`. Prod has not changed.
 
-5. Approve and resume. Open http://localhost:8080. The waiting row shows the
+5. Approve and resume. Open http://localhost:8080, sign in with the demo approver
+   token `tok_approver`, and review the operation. The waiting row shows the
    requested action, requester, arguments, your justification, the risk reason, the
    submit time, and the deadline. Approve it, then poll `get_operation_result`. The
    status flips to `completed`, reading prod now shows `2.3.1`, and the decision
@@ -211,6 +292,33 @@ gateway exposes; the model maps to them.
     prompt in the same session then starts a fresh chain run under the same
     `workflow_id`.
 
+### CASE-2: nested downstream approval
+
+1. Call `run_nested_release` for prod with `tool1_mode=controlled`. The response
+   contains the child Tool2 `operation_id`, parent Tool1 operation, and call path
+   `ClaudeCode -> release_orchestrator -> promote_release`.
+2. Approve the child. Temporal invokes Tool2, supplies the durable result to the
+   Tool1 checkpoint, and completes Tool1.
+3. Repeat with `tool1_mode=uncontrolled`. The response is
+   `blocked_nested_approval`; approving records `approved_retry_required` but does
+   not invoke Tool2.
+4. With `replay_safe=false`, `resume_nested_release` remains blocked. With
+   `replay_safe=true`, the explicit resume invokes Tool2 idempotently and replays
+   Tool1.
+
+### CASE-3: autonomous Google ADK-style run
+
+1. Call `start_google_adk_release_run` with bearer token `tok_adk`, a stable
+   `agent_run_id`, and a prod target.
+2. The response is `waiting_for_approval`. `get_workflow_status` shows checkpoint
+   `waiting_for_approval`, the next planned step, and both external-side-effect
+   flags as false.
+3. Approve as `tok_approver`. The Temporal run invokes the protected action, then
+   and only then records the dependent autonomous follow-up. Polling returns the
+   combined result.
+4. Rejecting, canceling, or allowing the gate to expire completes the run without
+   either external action.
+
 ## Approval payload
 
 When a prod promotion pauses, the approver sees the full context the requirements
@@ -229,9 +337,9 @@ table record who approved or rejected, when, and the rejection reason.
   once per Claude Code session so all calls in a session share one chain. It acts
   as the running-workflow uniqueness constraint. An explicit `workflow_id`
   overrides the session derivation.
-- Idempotency. Deduplication rides on a content-derived idempotency key carried in
-  workflow state, not on Update IDs, because Update IDs are scoped to one Execution
-  and reset after Continue-As-New.
+- Idempotency. Deduplication rides on a caller-provided or content-derived key
+  carried in workflow state, not on Update IDs, because Update IDs are scoped to
+  one Execution and reset after Continue-As-New.
 - Signals mutate state only. Approve and reject handlers never invoke Activities;
   the main loop reacts to state changes and performs the invocation.
 - Updates return values and may invoke Activities. The tool-call Update returns the
@@ -246,6 +354,12 @@ table record who approved or rejected, when, and the rejection reason.
   through the input dataclass. Approval deadlines and the idle clock are stored as
   absolute times in state rather than as Timers, because Timers do not carry across
   CAN.
+- Autonomous checkpoint. CASE-3 stores the agent's current step, next step, and
+  side-effect flags in workflow state. A worker or gateway restart replays that
+  checkpoint; the caller connection is not the source of liveness.
+- Nested fail-closed boundary. CASE-2 never treats an uncontrolled Tool1 stack as
+  resumable. Approval and execution are separate states, and explicit replay is
+  permitted only with an advertised replay-safe contract.
 
 ## Honest caveats
 
@@ -264,15 +378,16 @@ table record who approved or rejected, when, and the rejection reason.
   starts a fresh chain run under the same `workflow_id` via the default Allow
   Duplicate reuse policy. Prior operations remain in the closed run and are visible
   in the Web UI by Run Id, but the gateway query tools read the latest run.
-- Caller-supplied IDs are trusted as-is. The requirements state that an explicit
-  `workflow_id` must be authorized before use. This demo adopts it without that
-  check; there is a marked seam in `gateway/server.py` where the authorization
-  would go.
 - Session correlation assumes one chain per MCP session on the default stateful
   transport. A stateless deployment, or concurrent sessions that must share a
   chain, would need explicit `workflow_id` propagation instead.
-- The approver dashboard lists operations from Running chains. Decisions on a chain
-  that has since completed are visible in the Temporal Web UI, not the dashboard.
+- The approver dashboard reads operations within Temporal retention. A production
+  UI should page visibility results and export the ledger to the organization's
+  compliance store.
+- ADK Web is included only as a local development surface, not as a production
+  agent deployment. A production deployment should inject the gateway URL and
+  bearer credential from its platform secret store and persist ADK sessions in a
+  supported session service.
 
 ## Configuration
 
@@ -288,7 +403,16 @@ Set via environment in `docker-compose.yml`.
 - `GATEWAY_PRINCIPALS` JSON map of bearer token to requester identity, for
   example `{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>"}`. When unset,
   the requester is reported as `claude-code (unverified)`.
+- `GATEWAY_APPROVERS` comma-separated principal identities authorized to review
+  and decide operations. The compose demo maps `tok_approver` to
+  `approver@demo`.
 - `MOCK_TOOL_URL` Downstream backend endpoint used by the invoke Activity.
+- `AGENT_GATEWAY_MCP_URL` streamable HTTP MCP endpoint used by the ADK agent.
+  The Compose `adk` profile sets it to `http://gateway:8080/mcp`.
+- `AGENT_GATEWAY_TOKEN` bearer identity used by the ADK agent. The local demo
+  defaults to `tok_adk`; production should inject a real secret.
+- `ADK_MODEL` model used by the ADK agent. Default `gemini-2.5-flash`.
+- `GOOGLE_API_KEY` Gemini API credential used by local ADK Web.
 
 The idle timeout is not an environment variable. It is the `IDLE_TIMEOUT_SECONDS`
 constant in `workflows/chain.py`, set to 24 hours, kept in code so every Worker
@@ -308,8 +432,11 @@ agrees on it. Lower it and rebuild the worker to demo the idle close.
 ```
 common/models.py            shared dataclasses and enums
 workflows/chain.py          AgenticChainWorkflow (entity workflow, CAN, idle close)
+workflows/autonomous_agent.py  CASE-3 durable autonomous-agent checkpoint
+adk_agents/release_approval_agent/  real Google ADK MCP client for CASE-3
 activities/gateway_activities.py  evaluate_policy (prod gate), invoke_tool
 worker.py                   registers the workflow and activities
 gateway/server.py           MCP HTTP server, deployment tools, approver UI
 mock_tool/server.py         pretend deploy backend with idempotency and continuity
+tests/                      Temporal scenarios, gateway contract, and ADK agent tests
 ```

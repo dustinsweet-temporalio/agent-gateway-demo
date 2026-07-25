@@ -6,6 +6,7 @@ import html
 import json
 import os
 import uuid
+from http.cookies import SimpleCookie
 from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
@@ -14,7 +15,7 @@ from typing import Any, Optional
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from temporalio.client import (
     Client,
     WithStartWorkflowOperation,
@@ -24,10 +25,20 @@ from temporalio.common import WorkflowIDConflictPolicy
 
 from common.models import (
     ApprovalDecision,
+    AutonomousAgentInput,
+    CancelOperation,
     ChainInput,
     CorrelationContext,
+    LedgerEntry,
+    NestedToolCallRequest,
+    OperationView,
+    ResumeNestedRequest,
     ToolCallRequest,
+    ToolCallResponse,
+    WorkflowLedgerResponse,
+    WorkflowStatusResponse,
 )
+from workflows.autonomous_agent import AutonomousAgentWorkflow
 from workflows.chain import AgenticChainWorkflow
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
@@ -36,17 +47,24 @@ APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "300"))
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8080"))
 
-TERMINAL_STATUSES = {"completed", "rejected", "expired", "failed"}
+TERMINAL_STATUSES = {
+    "completed",
+    "rejected",
+    "expired",
+    "canceled",
+    "blocked",
+    "approved_awaiting_retry",
+    "failed",
+}
 UNVERIFIED_PRINCIPAL = "claude-code (unverified)"
 GATEWAY_DEBUG = bool(os.getenv("GATEWAY_DEBUG"))
 POLL_AFTER_SECONDS = int(os.getenv("POLL_AFTER_SECONDS", "5"))
 
-# Per-tool sync/async handling, annotated in code (design scenarios #1, #2, #3).
-#   "sync"        block to completion, never convert (scenario #1)
-#   "async"       return a poll handle immediately (scenario #2)
+# Per-tool sync/async handling.
+#   "sync"        block to completion, never convert
+#   "async"       return a poll handle immediately
 #   <int> ms      monitor and convert: block up to this budget, then convert to
 #                 async and return a poll handle while the workflow keeps running
-#                 (scenario #3)
 # A tool absent from this map uses _DEFAULT_STRATEGY.
 _TOOL_STRATEGY: dict[str, object] = {
     "get_deployed_version": "sync",
@@ -84,15 +102,22 @@ def _load_principals() -> dict[str, str]:
 
 _PRINCIPALS = _load_principals()
 
+
+def _load_approvers() -> set[str]:
+    raw = os.getenv("GATEWAY_APPROVERS", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+_APPROVERS = _load_approvers()
+
 # The requester is resolved at the ASGI layer (see PrincipalMiddleware) where the
 # raw HTTP headers are reliably available. The bundled mcp SDK does not reliably
 # expose request headers inside a tool, so we do not read them there. The
-# ContextVar carries the per-request principal; the module fallback covers the
-# single-session demo case if the ContextVar does not propagate into the tool task.
+# ContextVar carries the per-request principal. If task context does not propagate,
+# the safe fallback is unverified; never reuse another request's identity.
 _current_principal: ContextVar[Optional[str]] = ContextVar(
     "current_principal", default=None
 )
-_last_principal = UNVERIFIED_PRINCIPAL
 
 # Result-wait tasks that outlived the gateway's sync budget. Kept referenced so the
 # event loop does not garbage collect them mid-flight; discarded on completion.
@@ -123,6 +148,7 @@ class PrincipalMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        context_token = None
         if scope.get("type") == "http":
             token: Optional[str] = None
             for name, value in scope.get("headers", []):
@@ -131,10 +157,17 @@ class PrincipalMiddleware:
                     if raw.lower().startswith("bearer "):
                         token = raw[7:].strip()
                     break
+            if token is None:
+                for name, value in scope.get("headers", []):
+                    if name == b"cookie":
+                        cookie = SimpleCookie()
+                        cookie.load(value.decode("latin-1"))
+                        morsel = cookie.get("gateway_token")
+                        if morsel is not None:
+                            token = morsel.value
+                        break
             principal = _principal_for_token(token)
-            _current_principal.set(principal)
-            global _last_principal
-            _last_principal = principal
+            context_token = _current_principal.set(principal)
             if GATEWAY_DEBUG:
                 path = scope.get("path", "")
                 print(
@@ -142,12 +175,34 @@ class PrincipalMiddleware:
                     f"resolved={principal!r}",
                     flush=True,
                 )
-        await self.app(scope, receive, send)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if context_token is not None:
+                _current_principal.reset(context_token)
 
 
-def _resolve_principal() -> str:
+def _resolve_principal(ctx: Optional[Context] = None) -> str:
+    if ctx is not None:
+        try:
+            request = ctx.request_context.request
+            if request is not None:
+                auth = request.headers.get("authorization", "")
+                token = (
+                    auth[7:].strip()
+                    if auth.lower().startswith("bearer ")
+                    else None
+                )
+                if token:
+                    return _principal_for_token(token)
+        except Exception:
+            pass
     principal = _current_principal.get()
-    return principal if principal is not None else _last_principal
+    return principal if principal is not None else UNVERIFIED_PRINCIPAL
+
+
+def _is_approver(principal: str) -> bool:
+    return principal in _APPROVERS
 
 
 async def get_client() -> Client:
@@ -160,7 +215,13 @@ async def get_client() -> Client:
 
 
 def _as_dict(obj: Any) -> Any:
-    return asdict(obj) if is_dataclass(obj) else obj
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, list):
+        return [_as_dict(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _as_dict(value) for key, value in obj.items()}
+    return obj
 
 
 def _session_key(ctx: Optional[Context]) -> Optional[str]:
@@ -184,13 +245,15 @@ def _resolve_workflow_id(
     explicit: Optional[str], ctx: Optional[Context]
 ) -> tuple[str, str]:
     if explicit:
-        # NOTE: the requirements state caller-supplied IDs must be authorized
-        # before use. This demo trusts an explicit workflow_id as-is.
-        return explicit, "explicit"
+        if _resolve_principal(ctx) == UNVERIFIED_PRINCIPAL:
+            raise PermissionError(
+                "explicit workflow_id requires an authenticated principal"
+            )
+        return explicit, "explicit_authorized"
     key = _session_key(ctx)
     if key is not None:
         wf = _session_chains.setdefault(key, "wf-" + uuid.uuid4().hex[:6])
-        return wf, "mcp_session"
+        return wf, "inferred_from_session"
     return _DEFAULT_CHAIN, "gateway_default"
 
 
@@ -204,20 +267,78 @@ def _derive_idempotency_key(workflow_id: str, tool_name: str, arguments: dict) -
 def _derive_operation_id(idempotency_key: str) -> str:
     # Deterministic from the idempotency key so the gateway knows the id up front
     # and it stays stable across retries and across a sync-to-async conversion.
-    return "op-" + hashlib.sha256(idempotency_key.encode()).hexdigest()[:6]
+    return "op-" + hashlib.sha256(idempotency_key.encode()).hexdigest()[:16]
 
 
-def _async_handle(workflow_id: str, operation_id: str) -> dict:
-    return {
-        "status": "processing",
-        "workflow_id": workflow_id,
-        "operation_id": operation_id,
-        "message": (
+def _caller_idempotency_key(
+    workflow_id: str,
+    tool_name: str,
+    arguments: dict,
+    supplied: Optional[str],
+    principal: Optional[str] = None,
+) -> str:
+    if supplied:
+        resolved_principal = principal or _resolve_principal()
+        payload = f"{resolved_principal}:{workflow_id}:{supplied}"
+        return "idem-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+    return _derive_idempotency_key(workflow_id, tool_name, arguments)
+
+
+_SENSITIVE_KEYS = {
+    "authorization",
+    "api_key",
+    "apikey",
+    "password",
+    "secret",
+    "token",
+}
+
+
+def _safe_arguments(arguments: dict) -> dict:
+    """Redact credential-like values before query, ledger, or UI exposure."""
+
+    def redact(value: Any, key: str = "") -> Any:
+        normalized = key.lower().replace("-", "_")
+        if any(part in normalized for part in _SENSITIVE_KEYS):
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {str(k): redact(v, str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    return redact(arguments)
+
+
+async def _authorized_handle(workflow_id: str, ctx: Optional[Context]):
+    client = await get_client()
+    handle = client.get_workflow_handle(workflow_id)
+    owner = await handle.query("get_workflow_owner", result_type=str)
+    principal = _resolve_principal(ctx)
+    if owner != principal:
+        raise PermissionError("workflow_id is owned by a different principal")
+    if principal == UNVERIFIED_PRINCIPAL:
+        session_workflow_id, _ = _resolve_workflow_id(None, ctx)
+        if session_workflow_id != workflow_id:
+            raise PermissionError(
+                "unverified callers may only access their current MCP session"
+            )
+    return handle
+
+
+def _async_handle(
+    workflow_id: str, operation_id: str
+) -> ToolCallResponse:
+    return ToolCallResponse(
+        status="processing",
+        workflow_id=workflow_id,
+        operation_id=operation_id,
+        message=(
             "The tool call is still running and was converted to async. Poll "
             "get_operation_result with this workflow_id and operation_id."
         ),
-        "poll_after_seconds": POLL_AFTER_SECONDS,
-    }
+        poll_after_seconds=POLL_AFTER_SECONDS,
+    )
 
 
 def _requested_action(tool_name: str, arguments: dict) -> str:
@@ -242,17 +363,29 @@ async def _submit_tool_call(
     explicit_workflow_id: Optional[str],
     justification: Optional[str],
     ctx: Optional[Context],
-) -> dict:
+    supplied_idempotency_key: Optional[str] = None,
+    runtime: str = "ClaudeCode",
+) -> ToolCallResponse:
     client = await get_client()
 
     workflow_id, source = _resolve_workflow_id(explicit_workflow_id, ctx)
-    caller_principal = _resolve_principal()
-    idem = _derive_idempotency_key(workflow_id, tool_name, arguments)
+    caller_principal = _resolve_principal(ctx)
+    idem = _caller_idempotency_key(
+        workflow_id,
+        tool_name,
+        arguments,
+        supplied_idempotency_key,
+        caller_principal,
+    )
     operation_id = _derive_operation_id(idem)
     correlation = CorrelationContext(
         workflow_id=workflow_id,
         workflow_id_source=source,
+        idempotency_key=idem,
+        agent_session_id=_session_key(ctx),
         caller_principal=caller_principal,
+        runtime=runtime,
+        call_path=[runtime, tool_name],
     )
     req = ToolCallRequest(
         tool_name=tool_name,
@@ -263,6 +396,7 @@ async def _submit_tool_call(
         requested_action=_requested_action(tool_name, arguments),
         justification=justification,
         operation_id=operation_id,
+        safe_arguments=_safe_arguments(arguments),
     )
 
     # Deliver the tool call as an Update. wait_for_stage=ACCEPTED returns the handle
@@ -270,7 +404,10 @@ async def _submit_tool_call(
     # long it blocks on the result independently.
     start_op = WithStartWorkflowOperation(
         AgenticChainWorkflow.run,
-        ChainInput(workflow_id=workflow_id),
+        ChainInput(
+            workflow_id=workflow_id,
+            owner_principal=caller_principal,
+        ),
         id=workflow_id,
         task_queue=TASK_QUEUE,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
@@ -285,14 +422,14 @@ async def _submit_tool_call(
     strategy = _TOOL_STRATEGY.get(tool_name, _DEFAULT_STRATEGY)
 
     if strategy == "async":
-        # Scenario #2: hand back a poll handle immediately; the workflow runs on.
+        # Async mode: hand back a poll handle immediately; the workflow runs on.
         return _async_handle(workflow_id, operation_id)
 
     if strategy == "sync":
-        # Scenario #1: block to completion.
-        return _as_dict(await handle.result())
+        # Sync mode: block to completion.
+        return await handle.result()
 
-    # Scenario #3: block up to the budget, then convert to async. asyncio.wait
+    # Convert mode: block up to the budget, then convert to async. asyncio.wait
     # stops blocking WITHOUT cancelling the result poll, so the Temporal SDK does
     # not raise a cancellation error and the workflow is unaffected. The result is
     # recovered later by polling get_operation_result.
@@ -300,7 +437,7 @@ async def _submit_tool_call(
     result_task = asyncio.ensure_future(handle.result())
     done, _pending = await asyncio.wait({result_task}, timeout=budget_seconds)
     if result_task in done:
-        return _as_dict(result_task.result())
+        return result_task.result()
     # Budget elapsed. Detach the still-running wait and hand back a poll handle.
     _BACKGROUND_TASKS.add(result_task)
     result_task.add_done_callback(_discard_background_task)
@@ -316,34 +453,51 @@ async def _submit_tool_call(
 # --------------------------------------------------------------------- MCP tools
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 async def get_deployed_version(
-    environment: str, ctx: Context, workflow_id: str = ""
-) -> dict:
+    environment: str,
+    ctx: Context,
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
     """Return the release version currently deployed in an environment.
 
     environment is one of test, staging, or prod. Read only; never requires approval.
     """
     return await _submit_tool_call(
-        "get_deployed_version", {"environment": environment}, workflow_id or None, None, ctx
+        "get_deployed_version",
+        {"environment": environment},
+        workflow_id or None,
+        None,
+        ctx,
+        idempotency_key or None,
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 async def cut_release(
-    service: str, version: str, ctx: Context, workflow_id: str = ""
-) -> dict:
+    service: str,
+    version: str,
+    ctx: Context,
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
     """Cut a release candidate for a service from an already built artifact.
 
     Registers a promotable release. Changes nothing running, so it never requires
     approval.
     """
     return await _submit_tool_call(
-        "cut_release", {"service": service, "version": version}, workflow_id or None, None, ctx
+        "cut_release",
+        {"service": service, "version": version},
+        workflow_id or None,
+        None,
+        ctx,
+        idempotency_key or None,
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 async def promote_release(
     service: str,
     version: str,
@@ -351,7 +505,8 @@ async def promote_release(
     ctx: Context,
     justification: str = "",
     workflow_id: str = "",
-) -> dict:
+    idempotency_key: str = "",
+) -> ToolCallResponse:
     """Promote a release to an environment.
 
     Promotion to test or staging runs immediately. Promotion to prod requires human
@@ -365,34 +520,318 @@ async def promote_release(
         workflow_id or None,
         justification or None,
         ctx,
+        idempotency_key or None,
     )
 
 
-@mcp.tool()
-async def get_operation_status(workflow_id: str, operation_id: str) -> dict:
+@mcp.tool(structured_output=True)
+async def run_nested_release(
+    service: str,
+    version: str,
+    environment: str,
+    ctx: Context,
+    tool1_mode: str = "controlled",
+    replay_safe: bool = False,
+    justification: str = "",
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
+    """Run Tool1 -> Tool2 where Tool2 is a release promotion.
+
+    A controlled Tool1 checkpoints and resumes automatically after approval.
+    An uncontrolled Tool1 fails closed; approval is recorded, but Tool2 executes
+    only after an explicit retry and only when replay_safe is true.
+    """
+    normalized_mode = tool1_mode.strip().lower()
+    if normalized_mode not in {"controlled", "uncontrolled"}:
+        raise ValueError("tool1_mode must be controlled or uncontrolled")
+
+    client = await get_client()
+    resolved_workflow_id, source = _resolve_workflow_id(
+        workflow_id or None, ctx
+    )
+    principal = _resolve_principal(ctx)
+    tool1_name = "release_orchestrator"
+    tool2_name = "promote_release"
+    tool1_arguments = {
+        "service": service,
+        "version": version,
+        "environment": environment,
+    }
+    tool2_arguments = dict(tool1_arguments)
+    idem = _caller_idempotency_key(
+        resolved_workflow_id,
+        f"{tool1_name}->{tool2_name}",
+        tool1_arguments,
+        idempotency_key or None,
+        principal,
+    )
+    parent_operation_id = _derive_operation_id(f"{idem}:tool1")
+    child_operation_id = _derive_operation_id(f"{idem}:tool2")
+    correlation = CorrelationContext(
+        workflow_id=resolved_workflow_id,
+        workflow_id_source=source,
+        operation_id=child_operation_id,
+        parent_operation_id=parent_operation_id,
+        idempotency_key=idem,
+        agent_session_id=_session_key(ctx),
+        caller_principal=principal,
+        runtime="ClaudeCode",
+        call_path=["ClaudeCode", tool1_name],
+    )
+    request = NestedToolCallRequest(
+        tool1_name=tool1_name,
+        tool1_arguments=tool1_arguments,
+        tool2_name=tool2_name,
+        tool2_arguments=tool2_arguments,
+        idempotency_key=idem,
+        correlation=correlation,
+        approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
+        requested_action=_requested_action(tool2_name, tool2_arguments),
+        justification=justification or None,
+        parent_operation_id=parent_operation_id,
+        nested_operation_id=child_operation_id,
+        controlled_tool1=normalized_mode == "controlled",
+        replay_safe=replay_safe,
+        safe_tool1_arguments=_safe_arguments(tool1_arguments),
+        safe_tool2_arguments=_safe_arguments(tool2_arguments),
+    )
+    start_op = WithStartWorkflowOperation(
+        AgenticChainWorkflow.run,
+        ChainInput(
+            workflow_id=resolved_workflow_id,
+            owner_principal=principal,
+        ),
+        id=resolved_workflow_id,
+        task_queue=TASK_QUEUE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )
+    update = await client.start_update_with_start_workflow(
+        AgenticChainWorkflow.request_nested_tool_call,
+        request,
+        wait_for_stage=WorkflowUpdateStage.ACCEPTED,
+        start_workflow_operation=start_op,
+    )
+    return await update.result()
+
+
+@mcp.tool(structured_output=True)
+async def resume_nested_release(
+    workflow_id: str,
+    operation_id: str,
+    ctx: Context,
+) -> ToolCallResponse:
+    """Explicitly retry an approved uncontrolled nested call.
+
+    Agent Gateway still refuses execution unless Tool1 advertised replay safety.
+    """
+    handle = await _authorized_handle(workflow_id, ctx)
+    response = await handle.execute_update(
+        AgenticChainWorkflow.resume_nested_tool_call,
+        ResumeNestedRequest(
+            operation_id=operation_id,
+            caller_principal=_resolve_principal(ctx),
+        ),
+    )
+    return response
+
+
+@mcp.tool(structured_output=True)
+async def start_google_adk_release_run(
+    service: str,
+    version: str,
+    environment: str,
+    agent_run_id: str,
+    ctx: Context,
+    justification: str = "",
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
+    """Start or recover a durable autonomous Google ADK-style agent run.
+
+    The Temporal workflow checkpoints the agent plan while Agent Gateway owns the
+    approval decision. Dependent external work is executed only after the
+    protected promotion completes.
+    """
+    principal = _resolve_principal(ctx)
+    if principal == UNVERIFIED_PRINCIPAL:
+        raise PermissionError(
+            "autonomous agents must authenticate to Agent Gateway"
+        )
+    if not agent_run_id:
+        raise ValueError("agent_run_id is required")
+    if workflow_id:
+        resolved_workflow_id, source = _resolve_workflow_id(workflow_id, ctx)
+    else:
+        seed = f"{principal}:{agent_run_id}"
+        resolved_workflow_id = (
+            "wf-adk-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+        )
+        source = "inferred_from_agent_run"
+    arguments = {
+        "service": service,
+        "version": version,
+        "environment": environment,
+    }
+    idem = _caller_idempotency_key(
+        resolved_workflow_id,
+        "promote_release",
+        {**arguments, "agent_run_id": agent_run_id},
+        idempotency_key or agent_run_id,
+        principal,
+    )
+    operation_id = _derive_operation_id(idem)
+    correlation = CorrelationContext(
+        workflow_id=resolved_workflow_id,
+        workflow_id_source=source,
+        operation_id=operation_id,
+        idempotency_key=idem,
+        agent_run_id=agent_run_id,
+        caller_service="google-adk-agent",
+        caller_principal=principal,
+        runtime="GoogleADKAgent",
+        call_path=["GoogleADKAgent", "AgentGateway", "promote_release"],
+    )
+    input = AutonomousAgentInput(
+        workflow_id=resolved_workflow_id,
+        operation_id=operation_id,
+        idempotency_key=idem,
+        owner_principal=principal,
+        agent_run_id=agent_run_id,
+        agent_identity=principal,
+        tool_name="promote_release",
+        arguments=arguments,
+        safe_arguments=_safe_arguments(arguments),
+        requested_action=_requested_action("promote_release", arguments),
+        justification=justification or None,
+        correlation=correlation,
+        approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
+    )
+    client = await get_client()
+    handle = await client.start_workflow(
+        AutonomousAgentWorkflow.run,
+        input,
+        id=resolved_workflow_id,
+        task_queue=TASK_QUEUE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )
+    owner = await handle.query(
+        AutonomousAgentWorkflow.get_workflow_owner
+    )
+    if owner != principal:
+        raise PermissionError("workflow_id is owned by a different principal")
+
+    # The first Workflow Task performs policy evaluation. Briefly wait for the
+    # externally useful pause/completion state without tying agent liveness to the
+    # caller connection.
+    for _ in range(100):
+        response = await handle.query(
+            AutonomousAgentWorkflow.get_operation_result,
+            operation_id,
+        )
+        if response.status not in {"processing"}:
+            return response
+        await asyncio.sleep(0.05)
+    return response
+
+
+@mcp.tool(structured_output=True)
+async def get_operation_status(
+    workflow_id: str, operation_id: str, ctx: Context
+) -> ToolCallResponse:
     """Return the current status of one approval-gated operation."""
-    client = await get_client()
-    handle = client.get_workflow_handle(workflow_id)
-    resp = await handle.query(AgenticChainWorkflow.get_operation_status, operation_id)
-    return _as_dict(resp)
+    handle = await _authorized_handle(workflow_id, ctx)
+    resp = await handle.query(
+        "get_operation_status",
+        operation_id,
+        result_type=ToolCallResponse,
+    )
+    return resp
 
 
-@mcp.tool()
-async def get_operation_result(workflow_id: str, operation_id: str) -> dict:
+@mcp.tool(structured_output=True)
+async def get_operation_result(
+    workflow_id: str, operation_id: str, ctx: Context
+) -> ToolCallResponse:
     """Return the result of an operation once it has completed."""
-    client = await get_client()
-    handle = client.get_workflow_handle(workflow_id)
-    resp = await handle.query(AgenticChainWorkflow.get_operation_result, operation_id)
-    return _as_dict(resp)
+    handle = await _authorized_handle(workflow_id, ctx)
+    resp = await handle.query(
+        "get_operation_result",
+        operation_id,
+        result_type=ToolCallResponse,
+    )
+    return resp
 
 
-@mcp.tool()
-async def get_workflow_status(workflow_id: str) -> dict:
+@mcp.tool(structured_output=True)
+async def get_workflow_status(
+    workflow_id: str, ctx: Context
+) -> WorkflowStatusResponse:
     """Return a summary of the whole agentic chain."""
-    client = await get_client()
-    handle = client.get_workflow_handle(workflow_id)
-    summary = await handle.query(AgenticChainWorkflow.get_workflow_status)
-    return _as_dict(summary)
+    handle = await _authorized_handle(workflow_id, ctx)
+    summary = await handle.query("get_workflow_status")
+    raw = _as_dict(summary)
+    return WorkflowStatusResponse(
+        workflow_id=raw["workflow_id"],
+        run_id=raw["run_id"],
+        total_operations=raw["total_operations"],
+        status_counts=raw["status_counts"],
+        operations=[
+            op if isinstance(op, OperationView) else OperationView(**op)
+            for op in raw["operations"]
+        ],
+        closing=raw.get("closing", False),
+        agent_run_id=raw.get("agent_run_id"),
+        agent_identity=raw.get("agent_identity"),
+        checkpoint=raw.get("checkpoint", {}),
+        dependent_action_executed=raw.get(
+            "dependent_action_executed", False
+        ),
+    )
+
+
+@mcp.tool(structured_output=True)
+async def get_workflow_ledger(
+    workflow_id: str, ctx: Context
+) -> WorkflowLedgerResponse:
+    """Return the durable approval and resume ledger for later review."""
+    handle = await _authorized_handle(workflow_id, ctx)
+    entries = await handle.query("get_ledger")
+    raw_entries = _as_dict(entries)
+    return WorkflowLedgerResponse(
+        workflow_id=workflow_id,
+        entries=[
+            entry
+            if isinstance(entry, LedgerEntry)
+            else LedgerEntry(**entry)
+            for entry in raw_entries
+        ],
+    )
+
+
+@mcp.tool(structured_output=True)
+async def cancel_operation(
+    workflow_id: str,
+    operation_id: str,
+    ctx: Context,
+    reason: str = "",
+) -> ToolCallResponse:
+    """Cancel a pending operation without invoking its protected action."""
+    handle = await _authorized_handle(workflow_id, ctx)
+    await handle.signal(
+        "cancel_operation",
+        CancelOperation(
+            operation_id=operation_id,
+            canceled_by=_resolve_principal(ctx),
+            reason=reason or "Canceled by caller",
+        ),
+    )
+    response = await handle.query(
+        "get_operation_status",
+        operation_id,
+        result_type=ToolCallResponse,
+    )
+    return response
 
 
 # ------------------------------------------------------- approver UI and actions
@@ -418,46 +857,92 @@ async def whoami(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "authorization_header_present": bool(auth),
-            "token_seen": token,
             "principals_loaded": len(_PRINCIPALS),
+            "approvers_loaded": len(_APPROVERS),
             "resolved_from_this_request": _principal_for_token(token),
             "resolved_from_middleware_contextvar": _current_principal.get(),
-            "resolved_last_principal": _last_principal,
+            "is_approver": _is_approver(_resolve_principal()),
         }
     )
 
 
+@mcp.custom_route("/login", methods=["GET", "POST"])
+async def login(request: Request) -> Response:
+    if request.method == "GET":
+        return HTMLResponse(_render_login())
+    form = await request.form()
+    token = str(form.get("token") or "")
+    principal = _principal_for_token(token)
+    if not token or not _is_approver(principal):
+        return HTMLResponse(
+            _render_login("That token is not authorized for approvals."),
+            status_code=403,
+        )
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(
+        "gateway_token",
+        token,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+        max_age=8 * 60 * 60,
+    )
+    return response
+
+
+@mcp.custom_route("/logout", methods=["POST"])
+async def logout(request: Request) -> RedirectResponse:
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie("gateway_token")
+    return response
+
+
 @mcp.custom_route("/", methods=["GET"])
 async def dashboard(request: Request) -> HTMLResponse:
+    if not _is_approver(_resolve_principal()):
+        return HTMLResponse(_render_login(), status_code=401)
     client = await get_client()
     pending: list[tuple[str, Any]] = []
     history: list[tuple[str, Any]] = []
-    query = 'WorkflowType = "AgenticChainWorkflow" AND ExecutionStatus = "Running"'
-    async for wf in client.list_workflows(query):
-        handle = client.get_workflow_handle(wf.id)
-        try:
-            summary = await handle.query(AgenticChainWorkflow.get_workflow_status)
-        except Exception:
-            continue
-        for op in summary.operations:
-            if op.status == "waiting_for_approval":
-                pending.append((wf.id, op))
-            elif op.status in TERMINAL_STATUSES:
-                history.append((wf.id, op))
+    queries = [
+        (
+            'WorkflowType = "AgenticChainWorkflow"',
+            AgenticChainWorkflow.get_workflow_status,
+        ),
+        (
+            'WorkflowType = "AutonomousAgentWorkflow"',
+            AutonomousAgentWorkflow.get_workflow_status,
+        ),
+    ]
+    for query, status_query in queries:
+        async for wf in client.list_workflows(query):
+            handle = client.get_workflow_handle(wf.id, run_id=wf.run_id)
+            try:
+                summary = await handle.query(status_query)
+            except Exception:
+                continue
+            for op in summary.operations:
+                if op.status == "waiting_for_approval":
+                    pending.append((wf.id, op))
+                elif op.status in TERMINAL_STATUSES:
+                    history.append((wf.id, op))
     history.sort(key=lambda row: (row[1].decided_iso or ""), reverse=True)
     return HTMLResponse(_render_dashboard(pending, history))
 
 
 @mcp.custom_route("/approve", methods=["POST"])
 async def approve(request: Request) -> RedirectResponse:
+    principal = _resolve_principal()
+    if not _is_approver(principal):
+        return RedirectResponse("/login", status_code=303)
     form = await request.form()
     client = await get_client()
     handle = client.get_workflow_handle(str(form["workflow_id"]))
     await handle.signal(
-        AgenticChainWorkflow.approve_operation,
+        "approve_operation",
         ApprovalDecision(
             operation_id=str(form["operation_id"]),
-            approver=str(form.get("approver") or "approver@demo"),
+            approver=principal,
         ),
     )
     return RedirectResponse("/", status_code=303)
@@ -465,14 +950,17 @@ async def approve(request: Request) -> RedirectResponse:
 
 @mcp.custom_route("/reject", methods=["POST"])
 async def reject(request: Request) -> RedirectResponse:
+    principal = _resolve_principal()
+    if not _is_approver(principal):
+        return RedirectResponse("/login", status_code=303)
     form = await request.form()
     client = await get_client()
     handle = client.get_workflow_handle(str(form["workflow_id"]))
     await handle.signal(
-        AgenticChainWorkflow.reject_operation,
+        "reject_operation",
         ApprovalDecision(
             operation_id=str(form["operation_id"]),
-            approver=str(form.get("approver") or "approver@demo"),
+            approver=principal,
             reason=str(form.get("reason") or "Rejected by approver"),
         ),
     )
@@ -522,13 +1010,14 @@ def _render_pending_row(workflow_id: str, op: Any) -> str:
       <td>{_fmt(op.requester)}</td>
       <td class="mono">{_args_summary(op.arguments)}</td>
       <td>{_fmt(op.justification)}</td>
+      <td>{_fmt(op.risk_reason)}</td>
+      <td class="mono">{html.escape(" -> ".join(op.call_path))}</td>
       <td class="mono">{html.escape(_short_ts(op.created_iso))}</td>
       <td class="mono"><span class="countdown" data-deadline="{deadline}"></span></td>
       <td>
         <form method="post" action="/approve" class="inline">
           <input type="hidden" name="workflow_id" value="{wf}">
           <input type="hidden" name="operation_id" value="{op_id}">
-          <input type="text" name="approver" value="approver@demo">
           <button class="approve" type="submit">Approve</button>
         </form>
         <form method="post" action="/reject" class="inline">
@@ -556,6 +1045,7 @@ def _render_history_row(workflow_id: str, op: Any) -> str:
       <td>{_fmt(op.requester)}</td>
       <td class="mono">{html.escape(op.operation_id)}</td>
       <td class="mono">{html.escape(op.tool_name)}</td>
+      <td class="mono">{html.escape(" -> ".join(op.call_path))}</td>
       <td class="{prot_class}">{prot}</td>
       <td>{_fmt(op.requested_action)}</td>
       <td>{_result_summary(op.result)}</td>
@@ -601,6 +1091,8 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .badge-expired { background: #f59e0b; }
 .badge-failed { background: #6b7280; }
 .filterbar { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.75rem; }
+.login { max-width: 28rem; margin: 12vh auto; padding: 2rem; border: 1px solid var(--border); border-radius: 8px; }
+.login input { width: 100%; box-sizing: border-box; margin: 0.5rem 0 1rem; }
 """
 
 _THEME_BOOT_JS = """
@@ -675,12 +1167,12 @@ def _render_dashboard(
     pending_rows = (
         "".join(_render_pending_row(wf, op) for wf, op in pending)
         if pending
-        else '<tr><td colspan="9" class="empty">No operations are waiting for approval.</td></tr>'
+        else '<tr><td colspan="11" class="empty">No operations are waiting for approval.</td></tr>'
     )
     history_rows = (
         "".join(_render_history_row(wf, op) for wf, op in history)
         if history
-        else '<tr><td colspan="11" class="empty">No tool calls recorded yet.</td></tr>'
+        else '<tr><td colspan="12" class="empty">No tool calls recorded yet.</td></tr>'
     )
     wf_ids = sorted({wf for wf, _ in history})
     options = "".join(f'<option value="{html.escape(w)}">' for w in wf_ids)
@@ -696,7 +1188,13 @@ def _render_dashboard(
 <body>
   <header>
     <h1>Agent Gateway Approvals</h1>
-    <button id="theme-btn" class="toggle" type="button">Light mode</button>
+    <div>
+      <span class="muted">{html.escape(_resolve_principal())}</span>
+      <button id="theme-btn" class="toggle" type="button">Light mode</button>
+      <form method="post" action="/logout" class="inline" style="display:inline">
+        <button class="toggle" type="submit">Log out</button>
+      </form>
+    </div>
   </header>
   <p class="muted">Operations paused pending human approval. Auto-refreshes every 5 seconds while you are not typing.</p>
 
@@ -705,7 +1203,8 @@ def _render_dashboard(
     <thead>
       <tr>
         <th>Workflow</th><th>Operation</th><th>Requested action</th><th>Requester</th>
-        <th>Arguments</th><th>Justification</th><th>Submitted</th><th>Deadline</th><th>Decision</th>
+        <th>Arguments</th><th>Justification</th><th>Risk reason</th><th>Call path</th>
+        <th>Submitted</th><th>Deadline</th><th>Decision</th>
       </tr>
     </thead>
     <tbody>{pending_rows}</tbody>
@@ -720,7 +1219,7 @@ def _render_dashboard(
   <table>
     <thead>
       <tr>
-        <th>Timestamp</th><th>Workflow</th><th>Requester</th><th>Operation</th><th>Tool</th>
+        <th>Timestamp</th><th>Workflow</th><th>Requester</th><th>Operation</th><th>Tool</th><th>Call path</th>
         <th>Protected</th><th>Requested action</th><th>Result</th><th>Outcome</th>
         <th>Approver</th><th>Reason</th>
       </tr>
@@ -729,6 +1228,34 @@ def _render_dashboard(
   </table>
 
   <script>{_MAIN_JS}</script>
+</body>
+</html>"""
+
+
+def _render_login(error: str = "") -> str:
+    message = (
+        f'<p style="color:#ef4444">{html.escape(error)}</p>' if error else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Agent Gateway Approval Login</title>
+  <script>{_THEME_BOOT_JS}</script>
+  <style>{_CSS}</style>
+</head>
+<body>
+  <main class="login">
+    <h1>Approver sign in</h1>
+    <p class="muted">Use a gateway-issued approver token. Decisions are recorded
+    under the identity mapped to the token, not a form-supplied name.</p>
+    {message}
+    <form method="post" action="/login">
+      <label for="token">Approver token</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" required>
+      <button class="approve" type="submit">Sign in</button>
+    </form>
+  </main>
 </body>
 </html>"""
 
