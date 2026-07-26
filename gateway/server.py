@@ -14,6 +14,7 @@ from typing import Any, Optional
 
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from temporalio.client import (
@@ -24,6 +25,10 @@ from temporalio.client import (
 from temporalio.common import WorkflowIDConflictPolicy
 
 from common.models import (
+    ADK_SESSION_ID_HEADER,
+    CALLBACK_RUN_ID_HEADER,
+    CALLBACK_WORKFLOW_ID_HEADER,
+    AdkTemporalSessionCallback,
     ApprovalDecision,
     AutonomousAgentInput,
     CancelOperation,
@@ -46,6 +51,22 @@ TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "300"))
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8080"))
+GATEWAY_MCP_ALLOWED_HOSTS = [
+    item.strip()
+    for item in os.getenv(
+        "GATEWAY_MCP_ALLOWED_HOSTS",
+        "127.0.0.1:*,localhost:*,[::1]:*,gateway:*",
+    ).split(",")
+    if item.strip()
+]
+GATEWAY_MCP_ALLOWED_ORIGINS = [
+    item.strip()
+    for item in os.getenv(
+        "GATEWAY_MCP_ALLOWED_ORIGINS",
+        "http://127.0.0.1:*,http://localhost:*,http://[::1]:*",
+    ).split(",")
+    if item.strip()
+]
 
 TERMINAL_STATUSES = {
     "completed",
@@ -73,9 +94,16 @@ _TOOL_STRATEGY: dict[str, object] = {
 }
 _DEFAULT_STRATEGY: object = 5000
 
-mcp = FastMCP("agent-gateway")
-mcp.settings.host = GATEWAY_HOST
-mcp.settings.port = GATEWAY_PORT
+mcp = FastMCP(
+    "agent-gateway",
+    host=GATEWAY_HOST,
+    port=GATEWAY_PORT,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=GATEWAY_MCP_ALLOWED_HOSTS,
+        allowed_origins=GATEWAY_MCP_ALLOWED_ORIGINS,
+    ),
+)
 
 _client: Optional[Client] = None
 _client_lock = asyncio.Lock()
@@ -118,6 +146,9 @@ _APPROVERS = _load_approvers()
 _current_principal: ContextVar[Optional[str]] = ContextVar(
     "current_principal", default=None
 )
+_current_adk_callback: ContextVar[
+    Optional[AdkTemporalSessionCallback]
+] = ContextVar("current_adk_callback", default=None)
 
 # Result-wait tasks that outlived the gateway's sync budget. Kept referenced so the
 # event loop does not garbage collect them mid-flight; discarded on completion.
@@ -137,6 +168,39 @@ def _principal_for_token(token: Optional[str]) -> str:
     return UNVERIFIED_PRINCIPAL
 
 
+def _adk_callback_from_headers(
+    headers: list[tuple[bytes, bytes]],
+    principal: str,
+) -> AdkTemporalSessionCallback | None:
+    """Resolve a fixed Temporal callback target from authenticated MCP headers."""
+
+    if principal == UNVERIFIED_PRINCIPAL:
+        return None
+    values = {
+        name.decode("latin-1").lower(): value.decode("latin-1").strip()
+        for name, value in headers
+    }
+    workflow_id = values.get(CALLBACK_WORKFLOW_ID_HEADER, "")
+    session_id = values.get(ADK_SESSION_ID_HEADER, "")
+    run_id = values.get(CALLBACK_RUN_ID_HEADER) or None
+    if not workflow_id or not session_id:
+        return None
+    identifiers = [workflow_id, session_id]
+    if run_id:
+        identifiers.append(run_id)
+    if any(
+        len(value) > 255
+        or not all(ch.isalnum() or ch in "-_.:" for ch in value)
+        for value in identifiers
+    ):
+        return None
+    return AdkTemporalSessionCallback(
+        workflow_id=workflow_id,
+        run_id=run_id,
+        session_id=session_id,
+    )
+
+
 class PrincipalMiddleware:
     """Reads the bearer token off each HTTP request and resolves the requester.
 
@@ -149,16 +213,18 @@ class PrincipalMiddleware:
 
     async def __call__(self, scope, receive, send):
         context_token = None
+        callback_token = None
         if scope.get("type") == "http":
+            headers = scope.get("headers", [])
             token: Optional[str] = None
-            for name, value in scope.get("headers", []):
+            for name, value in headers:
                 if name == b"authorization":
                     raw = value.decode("latin-1")
                     if raw.lower().startswith("bearer "):
                         token = raw[7:].strip()
                     break
             if token is None:
-                for name, value in scope.get("headers", []):
+                for name, value in headers:
                     if name == b"cookie":
                         cookie = SimpleCookie()
                         cookie.load(value.decode("latin-1"))
@@ -168,16 +234,21 @@ class PrincipalMiddleware:
                         break
             principal = _principal_for_token(token)
             context_token = _current_principal.set(principal)
+            callback = _adk_callback_from_headers(headers, principal)
+            callback_token = _current_adk_callback.set(callback)
             if GATEWAY_DEBUG:
                 path = scope.get("path", "")
                 print(
                     f"[auth] path={path} header_present={token is not None} "
-                    f"resolved={principal!r}",
+                    f"resolved={principal!r} "
+                    f"adk_callback={callback is not None}",
                     flush=True,
                 )
         try:
             await self.app(scope, receive, send)
         finally:
+            if callback_token is not None:
+                _current_adk_callback.reset(callback_token)
             if context_token is not None:
                 _current_principal.reset(context_token)
 
@@ -654,6 +725,7 @@ async def start_google_adk_release_run(
     protected promotion completes.
     """
     principal = _resolve_principal(ctx)
+    callback = _current_adk_callback.get()
     if principal == UNVERIFIED_PRINCIPAL:
         raise PermissionError(
             "autonomous agents must authenticate to Agent Gateway"
@@ -686,6 +758,9 @@ async def start_google_adk_release_run(
         workflow_id_source=source,
         operation_id=operation_id,
         idempotency_key=idem,
+        agent_session_id=(
+            callback.session_id if callback is not None else _session_key(ctx)
+        ),
         agent_run_id=agent_run_id,
         caller_service="google-adk-agent",
         caller_principal=principal,
@@ -706,6 +781,7 @@ async def start_google_adk_release_run(
         justification=justification or None,
         correlation=correlation,
         approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
+        callback=callback,
     )
     client = await get_client()
     handle = await client.start_workflow(
@@ -715,6 +791,11 @@ async def start_google_adk_release_run(
         task_queue=TASK_QUEUE,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )
+    if callback is not None:
+        await handle.signal(
+            AutonomousAgentWorkflow.register_callback,
+            callback,
+        )
     owner = await handle.query(
         AutonomousAgentWorkflow.get_workflow_owner
     )

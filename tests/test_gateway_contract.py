@@ -2,7 +2,53 @@ from __future__ import annotations
 
 import pytest
 
+from common.models import (
+    ADK_SESSION_ID_HEADER,
+    CALLBACK_RUN_ID_HEADER,
+    CALLBACK_WORKFLOW_ID_HEADER,
+)
 from gateway import server
+
+
+def test_mcp_transport_allows_local_and_compose_hosts() -> None:
+    transport_security = server.mcp.settings.transport_security
+
+    assert transport_security is not None
+    assert transport_security.enable_dns_rebinding_protection is True
+    assert "localhost:*" in transport_security.allowed_hosts
+    assert "gateway:*" in transport_security.allowed_hosts
+
+
+def test_authenticated_adk_callback_headers_are_resolved() -> None:
+    callback = server._adk_callback_from_headers(
+        [
+            (
+                CALLBACK_WORKFLOW_ID_HEADER.encode(),
+                b"adk-session-workflow",
+            ),
+            (CALLBACK_RUN_ID_HEADER.encode(), b"adk-session-run"),
+            (ADK_SESSION_ID_HEADER.encode(), b"adk-session-123"),
+        ],
+        "release-agent@google-adk",
+    )
+
+    assert callback is not None
+    assert callback.workflow_id == "adk-session-workflow"
+    assert callback.run_id == "adk-session-run"
+    assert callback.session_id == "adk-session-123"
+    assert (
+        server._adk_callback_from_headers(
+            [
+                (
+                    CALLBACK_WORKFLOW_ID_HEADER.encode(),
+                    b"adk-session-workflow",
+                ),
+                (ADK_SESSION_ID_HEADER.encode(), b"adk-session-123"),
+            ],
+            server.UNVERIFIED_PRINCIPAL,
+        )
+        is None
+    )
 
 
 def test_mcp_exposes_all_required_scenario_and_recovery_tools() -> None:

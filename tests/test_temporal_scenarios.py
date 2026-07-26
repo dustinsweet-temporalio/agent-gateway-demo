@@ -4,13 +4,16 @@ import asyncio
 import shutil
 import uuid
 
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.client import WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 from common.models import (
+    AGENT_GATEWAY_APPROVAL_SIGNAL,
+    AdkTemporalSessionCallback,
     ApprovalDecision,
+    ApprovalResolution,
     AutonomousAgentInput,
     CancelOperation,
     ChainInput,
@@ -29,6 +32,25 @@ from workflows.chain import AgenticChainWorkflow
 
 TASK_QUEUE = "test-agent-gateway"
 ACTIVITY_CALLS: list[tuple[str, dict]] = []
+
+
+@workflow.defn
+class ApprovalCallbackReceiverWorkflow:
+    @workflow.init
+    def __init__(self, session_id: str) -> None:
+        self._session_id = session_id
+        self._resolution: ApprovalResolution | None = None
+
+    @workflow.run
+    async def run(self, session_id: str) -> ApprovalResolution:
+        await workflow.wait_condition(lambda: self._resolution is not None)
+        assert self._resolution is not None
+        return self._resolution
+
+    @workflow.signal(name=AGENT_GATEWAY_APPROVAL_SIGNAL)
+    def approval_resolved(self, resolution: ApprovalResolution) -> None:
+        if resolution.adk_session_id == self._session_id:
+            self._resolution = resolution
 
 
 @activity.defn(name="evaluate_policy")
@@ -504,13 +526,34 @@ def test_case3_autonomous_checkpoint_resume_reject_and_expire() -> None:
             async with Worker(
                 env.client,
                 task_queue=TASK_QUEUE,
-                workflows=[AutonomousAgentWorkflow],
+                workflows=[
+                    AutonomousAgentWorkflow,
+                    ApprovalCallbackReceiverWorkflow,
+                ],
                 activities=[fake_evaluate_policy, fake_invoke_tool],
             ):
+                callback_workflow_id = (
+                    f"wf-adk-session-{uuid.uuid4().hex[:8]}"
+                )
+                callback_handle = await env.client.start_workflow(
+                    ApprovalCallbackReceiverWorkflow.run,
+                    "adk-session-approved",
+                    id=callback_workflow_id,
+                    task_queue=TASK_QUEUE,
+                )
                 workflow_id = f"wf-case3-{uuid.uuid4().hex[:8]}"
+                approved_input = _autonomous_input(
+                    workflow_id,
+                    "op-agent-approved",
+                )
+                approved_input.callback = AdkTemporalSessionCallback(
+                    workflow_id=callback_workflow_id,
+                    run_id=callback_handle.run_id,
+                    session_id="adk-session-approved",
+                )
                 handle = await env.client.start_workflow(
                     AutonomousAgentWorkflow.run,
-                    _autonomous_input(workflow_id, "op-agent-approved"),
+                    approved_input,
                     id=workflow_id,
                     task_queue=TASK_QUEUE,
                 )
@@ -541,6 +584,15 @@ def test_case3_autonomous_checkpoint_resume_reject_and_expire() -> None:
                     "promote_release",
                     "record_autonomous_followup",
                 ]
+                callback = await asyncio.wait_for(
+                    callback_handle.result(),
+                    timeout=5,
+                )
+                assert callback.gateway_workflow_id == workflow_id
+                assert callback.operation_id == "op-agent-approved"
+                assert callback.status == "completed"
+                assert callback.adk_session_id == "adk-session-approved"
+                assert callback.result == completed.operations[0].result
 
                 ACTIVITY_CALLS.clear()
                 rejected_id = f"wf-case3-reject-{uuid.uuid4().hex[:8]}"

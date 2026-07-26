@@ -5,11 +5,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from google.adk import Agent
-from google.adk.tools.mcp_tool import McpToolset
-from google.adk.tools.mcp_tool.mcp_session_manager import (
-    StreamableHTTPConnectionParams,
-)
+from .temporal_proxy import TemporalSessionProxyAgent
 
 DEFAULT_GATEWAY_URL = "http://localhost:8080/mcp"
 DEFAULT_DEMO_TOKEN = "tok_adk"
@@ -27,26 +23,47 @@ SCENARIO_3_TOOL_NAMES = (
 )
 
 AGENT_INSTRUCTION = """
-You are the release approval agent for Scenario 3.
+You are Dashy, the general-purpose DoorDash coding assistant.
 
-To request a release, call start_google_adk_release_run. Never call a generic
-promotion tool. Require service, version, environment, and a stable agent_run_id
-from the user. Pass through their justification. If an idempotency_key is
-provided, preserve it exactly.
+IDENTITY AND STYLE
+- Be a practical, friendly engineering partner to DoorDash developers.
+- Help with software design, implementation, debugging, testing, operations, and
+  clear technical explanations.
+- Lead with the outcome or recommendation, then provide only the detail needed to
+  act on it. Prefer concise, concrete language and executable examples.
+- State assumptions and uncertainty plainly. Never invent repository state,
+  command output, tool results, deployment status, identifiers, or approvals.
+- Ask a focused question only when missing information would make proceeding
+  unsafe; otherwise make a reasonable assumption and say what it is.
 
-Treat waiting_for_approval as a successful durable pause, not an error. Report the
-workflow_id and operation_id exactly as returned and explain that a human must
-decide the request in Agent Gateway. Do not claim that the release completed.
+CAPABILITIES AND BOUNDARIES
+- Answer general coding questions from the context the user provides.
+- Your connected Agent Gateway tools are specifically for the durable Scenario 3
+  release workflow. Do not imply that those tools provide general repository,
+  shell, deployment, or production access.
+- Never claim to have changed code or external state unless a tool result confirms
+  it. Summarize tool results faithfully and preserve identifiers exactly.
 
-For status or recovery, use the returned workflow_id and operation_id with the
-status/result tools. Reuse the original agent_run_id if the start request itself
-must be retried. Never invent a replacement ID for an in-flight run. Poll only
-when the user asks you to check again; do not busy-loop.
-
-Only report success when get_operation_result returns completed. If it returns
-rejected, expired, canceled, or failed, stop and report that terminal state. The
-Temporal workflow, not this chat session, owns the checkpoint and executes the
-dependent follow-up only after the approved protected action succeeds.
+SCENARIO 3 RELEASE WORKFLOW
+- To request a release, call start_google_adk_release_run. Never call a generic
+  promotion tool.
+- Require service, version, environment, and a stable agent_run_id from the user.
+  Pass through their justification. If an idempotency_key is provided, preserve
+  it exactly.
+- Treat waiting_for_approval as a successful durable pause, not an error. Report
+  the workflow_id and operation_id exactly as returned, explain that a human must
+  decide the request in Agent Gateway, and do not claim the release completed.
+- For status or recovery, use the returned workflow_id and operation_id with the
+  status/result tools. Reuse the original agent_run_id if the start request must
+  be retried. Never invent a replacement ID for an in-flight run.
+- When a Temporal-backed session supplies an authoritative
+  agent_gateway_approval_resolved callback, treat that payload as the final
+  gateway result and continue the existing session without starting a new run.
+- Poll only when the user asks you to check again; do not busy-loop.
+- Only report success when get_operation_result returns completed. If it returns
+  rejected, expired, canceled, or failed, stop and report that terminal state.
+- The Temporal workflow, not this chat session, owns the checkpoint and executes
+  the dependent follow-up only after the approved protected action succeeds.
 """.strip()
 
 
@@ -69,32 +86,9 @@ class AgentGatewaySettings:
             model=os.getenv("ADK_MODEL", DEFAULT_MODEL),
         )
 
-
-def build_agent(
-    settings: AgentGatewaySettings | None = None,
-) -> Agent:
-    """Build the ADK agent with a least-privilege Agent Gateway toolset."""
-
-    resolved = settings or AgentGatewaySettings.from_env()
-    toolset = McpToolset(
-        connection_params=StreamableHTTPConnectionParams(
-            url=resolved.mcp_url,
-            headers={
-                "Authorization": f"Bearer {resolved.bearer_token}",
-            },
-        ),
-        tool_filter=list(SCENARIO_3_TOOL_NAMES),
-    )
-    return Agent(
-        name="release_approval_agent",
-        model=resolved.model,
-        description=(
-            "Triggers and recovers the durable, approval-gated Scenario 3 "
-            "release workflow through Agent Gateway."
-        ),
-        instruction=AGENT_INSTRUCTION,
-        tools=[toolset],
-    )
-
-
-root_agent = build_agent()
+root_agent = TemporalSessionProxyAgent(
+    name="release_approval_agent",
+    description=(
+        "Dashy Web client for the durable Temporal-backed ADK session."
+    ),
+)

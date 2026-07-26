@@ -277,28 +277,34 @@ Tool2 action, and completes the replayed Tool1 call.
 ## 8. CASE-3: trigger it with the Google ADK agent
 
 This step uses the real Google ADK agent in
-`adk_agents/release_approval_agent`. It reaches Agent Gateway over MCP with the
+`adk_agents/release_approval_agent`. Each ADK Web session owns one durable
+`TemporalAdkSessionWorkflow`; later user turns are Updates on that same workflow
+and reuse its ADK runner and conversation history. The worker runs Gemini and
+Agent Gateway MCP calls as Temporal Activities. Those MCP calls use the
 `tok_adk` demo identity and can see only the Scenario 3 start and recovery tools.
 
 ### A. Start ADK Web
 
-In a second terminal, provide a Gemini API key and start the optional Compose
-profile:
+Copy the environment template, add a Gemini API key, and recreate the worker and
+ADK Web services:
 
 ```bash
-export GOOGLE_API_KEY="<your Gemini API key>"
-docker compose --profile adk up --build adk-agent
+cp .env.example .env
+# Edit .env and replace the GOOGLE_API_KEY placeholder.
+docker compose up --build worker adk-agent
 ```
 
 Open http://localhost:8000 and select `release_approval_agent`.
 
-If you prefer the terminal, install the requirements and run:
+The key and `ADK_MODEL` are injected into the worker at container startup; they
+are not baked into an image or passed to ADK Web.
+
+If you prefer a terminal client, start the same Temporal execution model with:
 
 ```bash
-export GOOGLE_API_KEY="<your Gemini API key>"
-export AGENT_GATEWAY_MCP_URL="http://localhost:8080/mcp"
-export AGENT_GATEWAY_TOKEN="tok_adk"
-.venv/bin/adk run adk_agents/release_approval_agent
+docker compose exec worker python -m adk_agents.run_temporal_session \
+  --session-id walkthrough-temporal-adk-1 \
+  --prompt 'Start Scenario 3 for delivery-matching-service version 2.5.0 to prod. Use agent_run_id walkthrough-adk-run-1 and justification "autonomous walkthrough".'
 ```
 
 ### B. Trigger Scenario 3
@@ -323,15 +329,7 @@ The `agent_run_id` is the durable run key. When no separate idempotency key is
 given, Agent Gateway also uses it as the caller key. Repeating this exact request
 recovers the same run; use `walkthrough-adk-run-2` for a new run.
 
-### C. Inspect the durable pause
-
-Ask the same ADK agent:
-
-```text
-Get the workflow status for <workflow_id>.
-```
-
-Confirm the checkpoint shows:
+The autonomous workflow checkpoint in Temporal shows:
 
 ```text
 step: waiting_for_approval
@@ -340,14 +338,12 @@ protected_action_executed: false
 dependent_action_executed: false
 ```
 
-### D. Approve and recover
+### C. Approve and watch Dashy resume
 
-Approve the operation in the Agent Gateway dashboard. Then ask the ADK agent:
-
-```text
-Get the operation result for workflow <workflow_id> and operation
-<operation_id>.
-```
+Leave the ADK turn open and approve the operation in the Agent Gateway dashboard.
+The gateway sends `agent_gateway_approval_resolved` to the originating
+`TemporalAdkSessionWorkflow`. That workflow sends Dashy an internal resume/status
+user turn and the final answer appears automatically in the same ADK conversation.
 
 Expected result:
 
@@ -360,8 +356,14 @@ result:
 ```
 
 The dependent action runs only after the approved production action succeeds.
-Stopping ADK Web while the request waits does not lose it; restart ADK and poll
-using the same returned IDs.
+
+If the browser disconnects, reopen the same ADK Web session and send `resume` or
+`check the status`. The proxy uses the workflow and active turn Update IDs saved
+in ADK session state and reattaches without starting another release run. A later
+normal prompt becomes another Update on the same workflow. If that workflow is no
+longer running, the proxy creates and saves a new workflow ID. `docker compose
+restart adk-agent` preserves the local demo session database; removing or
+recreating the container does not.
 
 ## 9. Inspect the audit trail
 

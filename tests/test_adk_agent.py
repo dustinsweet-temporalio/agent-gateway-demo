@@ -1,37 +1,46 @@
 from __future__ import annotations
 
+from temporalio.contrib.google_adk_agents import (
+    TemporalMcpToolSet,
+    TemporalModel,
+)
+
 from adk_agents.release_approval_agent.agent import (
     AGENT_INSTRUCTION,
     DEFAULT_DEMO_TOKEN,
     DEFAULT_GATEWAY_URL,
     SCENARIO_3_TOOL_NAMES,
     AgentGatewaySettings,
-    build_agent,
+    root_agent,
+)
+from adk_agents.release_approval_agent.temporal_integration import (
+    build_temporal_agent,
+    gateway_toolset_factory,
+)
+from adk_agents.release_approval_agent.temporal_proxy import (
+    TemporalSessionProxyAgent,
+)
+from common.models import (
+    ADK_SESSION_ID_HEADER,
+    CALLBACK_RUN_ID_HEADER,
+    CALLBACK_WORKFLOW_ID_HEADER,
+    AdkTemporalSessionCallback,
 )
 
 
-def test_adk_agent_uses_scenario_3_only_tool_allowlist() -> None:
-    agent = build_agent(
-        AgentGatewaySettings(
-            mcp_url="http://gateway.test/mcp",
-            bearer_token="test-agent-token",
-            model="gemini-test",
-        )
-    )
-
-    assert agent.name == "release_approval_agent"
-    assert agent.model == "gemini-test"
-    assert len(agent.tools) == 1
-    toolset = agent.tools[0]
-    assert tuple(toolset.tool_filter) == SCENARIO_3_TOOL_NAMES
-    assert toolset._connection_params.url == "http://gateway.test/mcp"
-    assert toolset._connection_params.headers == {
-        "Authorization": "Bearer test-agent-token"
-    }
-    assert "promote_release" not in SCENARIO_3_TOOL_NAMES
+def test_adk_web_root_is_only_a_temporal_session_proxy() -> None:
+    assert isinstance(root_agent, TemporalSessionProxyAgent)
+    assert root_agent.name == "release_approval_agent"
+    assert root_agent.sub_agents == []
 
 
 def test_adk_agent_has_durable_pause_and_recovery_instructions() -> None:
+    assert (
+        "You are Dashy, the general-purpose DoorDash coding assistant."
+        in AGENT_INSTRUCTION
+    )
+    assert "software design, implementation, debugging" in AGENT_INSTRUCTION
+    assert "Never claim to have changed code or external state" in AGENT_INSTRUCTION
     assert "start_google_adk_release_run" in AGENT_INSTRUCTION
     assert "waiting_for_approval" in AGENT_INSTRUCTION
     assert "workflow_id and operation_id" in AGENT_INSTRUCTION
@@ -65,3 +74,45 @@ def test_adk_settings_have_local_demo_defaults(monkeypatch) -> None:
 
     assert settings.mcp_url == DEFAULT_GATEWAY_URL
     assert settings.bearer_token == DEFAULT_DEMO_TOKEN
+
+
+def test_temporal_toolset_propagates_session_callback_headers(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "AGENT_GATEWAY_MCP_URL",
+        "http://gateway.test/mcp",
+    )
+    monkeypatch.setenv("AGENT_GATEWAY_TOKEN", "runtime-token")
+    callback = AdkTemporalSessionCallback(
+        workflow_id="adk-session-workflow",
+        run_id="adk-session-run",
+        session_id="adk-session-123",
+    )
+
+    toolset = gateway_toolset_factory(callback)
+
+    assert tuple(toolset.tool_filter) == SCENARIO_3_TOOL_NAMES
+    assert toolset._connection_params.headers == {
+        "Authorization": "Bearer runtime-token",
+        CALLBACK_WORKFLOW_ID_HEADER: "adk-session-workflow",
+        CALLBACK_RUN_ID_HEADER: "adk-session-run",
+        ADK_SESSION_ID_HEADER: "adk-session-123",
+    }
+
+
+def test_temporal_agent_routes_model_and_mcp_calls_through_plugin() -> None:
+    callback = AdkTemporalSessionCallback(
+        workflow_id="adk-session-workflow",
+        run_id="adk-session-run",
+        session_id="adk-session-123",
+    )
+
+    agent = build_temporal_agent(
+        model="gemini-test",
+        callback=callback,
+    )
+
+    assert isinstance(agent.model, TemporalModel)
+    assert len(agent.tools) == 1
+    assert isinstance(agent.tools[0], TemporalMcpToolSet)

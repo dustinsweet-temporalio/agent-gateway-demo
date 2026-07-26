@@ -10,8 +10,11 @@ from temporalio.exceptions import ActivityError
 with workflow.unsafe.imports_passed_through():
     from activities.gateway_activities import evaluate_policy, invoke_tool
     from common.models import (
+        AGENT_GATEWAY_APPROVAL_SIGNAL,
+        AdkTemporalSessionCallback,
         AgentRunSummary,
         ApprovalDecision,
+        ApprovalResolution,
         AutonomousAgentInput,
         CancelOperation,
         EvaluatePolicyInput,
@@ -65,6 +68,8 @@ class AutonomousAgentWorkflow:
         }
         self._dependent_action_executed = False
         self._protected_result = None
+        self._callback = input.callback
+        self._callback_notified = False
 
     @workflow.run
     async def run(self, input: AutonomousAgentInput) -> AgentRunSummary:
@@ -89,7 +94,7 @@ class AutonomousAgentWorkflow:
             )
         except ActivityError as err:
             self._fail(f"policy evaluation failed: {err}", "policy_failed")
-            return self._summary()
+            return await self._finish()
 
         self._operation.risk_reason = decision.reason
         self._operation.protected = decision.requires_approval
@@ -147,13 +152,35 @@ class AutonomousAgentWorkflow:
                 OperationStatus.EXPIRED,
                 OperationStatus.CANCELED,
             }:
-                return self._summary()
+                return await self._finish()
 
         await self._invoke_protected_action()
         if self._operation.status == OperationStatus.FAILED:
-            return self._summary()
+            return await self._finish()
         await self._run_dependent_action()
-        return self._summary()
+        return await self._finish()
+
+    @workflow.signal
+    def register_callback(
+        self,
+        callback: AdkTemporalSessionCallback,
+    ) -> None:
+        """Attach a callback to an existing idempotent agent run."""
+
+        if self._callback is None:
+            self._callback = callback
+            self._log(
+                "adk_session_callback_registered",
+                {
+                    "workflow_id": callback.workflow_id,
+                    "session_id": callback.session_id,
+                },
+            )
+        elif self._callback != callback:
+            self._log(
+                "adk_session_callback_registration_ignored",
+                {"reason": "callback_already_registered"},
+            )
 
     @workflow.signal
     def approve_operation(self, decision: ApprovalDecision) -> None:
@@ -338,6 +365,57 @@ class AutonomousAgentWorkflow:
             "dependent_action_executed": True,
         }
         self._log("agent_run_completed")
+
+    async def _finish(self) -> AgentRunSummary:
+        await self._notify_callback()
+        return self._summary()
+
+    async def _notify_callback(self) -> None:
+        if (
+            not self._operation.protected
+            or self._operation.status
+            not in {
+                OperationStatus.COMPLETED,
+                OperationStatus.REJECTED,
+                OperationStatus.EXPIRED,
+                OperationStatus.CANCELED,
+                OperationStatus.FAILED,
+            }
+        ):
+            return
+        response = self._response()
+        callback = self._callback
+        if callback is not None and not self._callback_notified:
+            await workflow.get_external_workflow_handle(
+                callback.workflow_id,
+                run_id=callback.run_id,
+            ).signal(
+                AGENT_GATEWAY_APPROVAL_SIGNAL,
+                ApprovalResolution(
+                    gateway_workflow_id=self._input.workflow_id,
+                    operation_id=self._operation.operation_id,
+                    status=response.status,
+                    adk_session_id=callback.session_id,
+                    agent_run_id=self._input.agent_run_id,
+                    result=response.result,
+                    reason=response.reason,
+                    message=response.message,
+                ),
+            )
+            self._callback_notified = True
+            self._checkpoint = {
+                **self._checkpoint,
+                "callback_notified": True,
+                "callback_session_id": callback.session_id,
+            }
+            self._log(
+                "adk_session_callback_notified",
+                {
+                    "workflow_id": callback.workflow_id,
+                    "session_id": callback.session_id,
+                    "status": response.status,
+                },
+            )
 
     def _fail(self, error: str, event: str) -> None:
         self._operation.status = OperationStatus.FAILED

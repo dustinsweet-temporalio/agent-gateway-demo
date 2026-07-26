@@ -5,6 +5,12 @@ from enum import Enum
 from typing import Any, Optional
 
 
+AGENT_GATEWAY_APPROVAL_SIGNAL = "agent_gateway_approval_resolved"
+CALLBACK_WORKFLOW_ID_HEADER = "x-agent-gateway-callback-workflow-id"
+CALLBACK_RUN_ID_HEADER = "x-agent-gateway-callback-run-id"
+ADK_SESSION_ID_HEADER = "x-agent-gateway-adk-session-id"
+
+
 class OperationStatus(str, Enum):
     """Lifecycle states for a single approval-gated operation."""
 
@@ -50,6 +56,29 @@ class CorrelationContext:
     target_resource: Optional[str] = None
     runtime: str = "mcp"
     call_path: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AdkTemporalSessionCallback:
+    """Durable callback target for an ADK session running in Temporal."""
+
+    workflow_id: str
+    run_id: Optional[str]
+    session_id: str
+
+
+@dataclass
+class ApprovalResolution:
+    """Terminal Agent Gateway result signaled back to an ADK session workflow."""
+
+    gateway_workflow_id: str
+    operation_id: str
+    status: str
+    adk_session_id: str
+    agent_run_id: Optional[str] = None
+    result: Optional[Any] = None
+    reason: Optional[str] = None
+    message: Optional[str] = None
 
 
 @dataclass
@@ -286,6 +315,37 @@ class AutonomousAgentInput:
     justification: Optional[str]
     correlation: CorrelationContext
     approval_timeout_seconds: int = 300
+    callback: Optional[AdkTemporalSessionCallback] = None
+
+
+@dataclass
+class AdkSessionWorkflowInput:
+    """Configuration for one long-lived Temporal-backed ADK session."""
+
+    user_id: str = "user"
+    session_id: str = ""
+    model: str = "gemini-2.5-flash"
+
+
+@dataclass
+class AdkSessionTurnInput:
+    """One user turn submitted to a running ADK session workflow."""
+
+    turn_id: str
+    prompt: str
+
+
+@dataclass
+class AdkSessionWorkflowResult:
+    """Current or completed result for one turn in the ADK session."""
+
+    workflow_id: str
+    session_id: str
+    turn_id: str = ""
+    initial_response: str = ""
+    resumed_response: Optional[str] = None
+    approval: Optional[ApprovalResolution] = None
+    complete: bool = False
 
 
 @dataclass
