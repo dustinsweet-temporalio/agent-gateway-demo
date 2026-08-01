@@ -128,6 +128,49 @@ SCAN_CAPABILITY_TOOL = "get_security_scan_status"
 # every CASE-2a run with no scan in play, and every CASE-3 run.
 CALLER_SERVICE_APPROVER_TEAMS = {"security": "security"}
 
+# The company-wide mandate: while it is in effect, no engineering team promotes
+# its own service to production on its own say-so, so every production promotion
+# needs the Security team behind it whoever asked for it. The toggle itself lives
+# in the gateway process and rides in on the request (see
+# ToolCallRequest.security_mandate); these two constants are the only thing the
+# Workflow knows about it.
+#
+# "production" is accepted alongside "prod" because PROTECTED_ENVIRONMENTS names
+# both, and a mandate that silently did not apply to one spelling would be worse
+# than useless. Listed as a constant rather than read from the environment for
+# the usual reason: every Worker replaying this Workflow must agree.
+MANDATE_ENVIRONMENTS = ("prod", "production")
+MANDATE_APPROVER_TEAM = "security"
+
+
+def _required_approver_team_for(
+    caller_service: str | None,
+    environment: str,
+    security_mandate: bool,
+) -> str | None:
+    """Which Porticour team, if any, must be the one to approve this operation.
+
+    Two independent reasons an operation can be team-restricted, checked in the
+    order they were introduced:
+
+    1. Which team's check produced it. A promotion the Security team's own
+       pre-prod scan asked for is theirs to stand behind, and that is true
+       whether or not any mandate is in force.
+    2. The company-wide security mandate. While it is on, a production promotion
+       is Security's call no matter who asked, including the Waypoint team asking
+       for its own service.
+
+    Everything else is unrestricted and stays approvable by anyone in
+    GATEWAY_APPROVERS, which is every staging promotion, every read, and every
+    production promotion made before the mandate landed.
+    """
+    team = CALLER_SERVICE_APPROVER_TEAMS.get(str(caller_service or "").lower())
+    if team:
+        return team
+    if security_mandate and environment.strip().lower() in MANDATE_ENVIRONMENTS:
+        return MANDATE_APPROVER_TEAM
+    return None
+
 # Executing a tool step raises one of these depending on whether the step is an
 # Activity or a Child Workflow. Callers care that the step failed, not which
 # shape it had, so they catch the pair.
@@ -1778,6 +1821,15 @@ class AgenticChainWorkflow:
             or [req.correlation.runtime, req.tool_name],
             safe_arguments=req.safe_arguments or req.arguments,
             workflow_id_source=req.correlation.workflow_id_source,
+            # A single-step call has no Tool1 above it, so the only thing that
+            # can restrict it is the mandate. Before the mandate lands this is
+            # None for every CASE-1 call, which is exactly how CASE-1 behaved
+            # when it was demoed.
+            required_approver_team=_required_approver_team_for(
+                req.correlation.caller_service,
+                str(req.arguments.get("environment", "")),
+                req.security_mandate,
+            ),
         )
 
     def _new_nested_parent(self, req: NestedToolCallRequest) -> Operation:
@@ -1863,9 +1915,16 @@ class AgenticChainWorkflow:
             # approve it. A promotion the Security team's scan asked for may only
             # be approved by the Security team; a pipeline the Waypoint team ran
             # for itself carries no restriction and stays approvable by anyone in
-            # GATEWAY_APPROVERS, exactly as before.
-            required_approver_team=CALLER_SERVICE_APPROVER_TEAMS.get(
-                str(req.correlation.caller_service or "").lower()
+            # GATEWAY_APPROVERS -- unless the security mandate is in force, which
+            # makes every production promotion Security's call whoever asked.
+            #
+            # The environment comes from Tool2's own arguments, because Tool2 is
+            # the operation being restricted: the pipeline's earlier staging
+            # promotion is not a mandate-covered action and never appears here.
+            required_approver_team=_required_approver_team_for(
+                req.correlation.caller_service,
+                str(tool2_arguments.get("environment", "")),
+                req.security_mandate,
             ),
         )
 

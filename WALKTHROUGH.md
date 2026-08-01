@@ -19,7 +19,7 @@ worker started, polling task queue 'agentic-gateway'
 
 The `nexus-endpoints` service runs once and exits, having registered the two
 Nexus Endpoints the two teams call each other on. Its log ends with a listing of
-both; if it is missing, step 7 will fail with an operation timeout.
+both; if it is missing, step 6's Act Two will fail with an operation timeout.
 
 Keep this terminal open. The useful endpoints are:
 
@@ -29,8 +29,9 @@ Keep this terminal open. The useful endpoints are:
 - MCP endpoint: http://localhost:8080/mcp
 
 One service deliberately does **not** start: `security-scan-worker`, the Security
-team's pre-prod scanning platform. It belongs to step 7, and starting it early
-gives away the CASE-2b reveal. If you have run this walkthrough before, check with
+team's pre-prod scanning platform. It belongs to step 6's Act Two, and starting
+it early gives away the reveal -- Act One is the mandate landing *before* that
+team has adopted Temporal. If you have run this walkthrough before, check with
 `docker compose ps` and stop it before you begin.
 
 If you have changed any code since you last ran this, build with the profile or
@@ -87,7 +88,7 @@ production there is a quality gate card, and it is empty: dashed, muted, reading
 "no candidate staged yet". That is the honest state at container startup, and it
 is worth pointing at, because the card being *present* and empty is the claim.
 Gates here are standing infrastructure that react to anything reaching staging,
-not something the pipeline in step 6 invokes.
+not something a release pipeline invokes.
 
 ### A. Run an unprotected action
 
@@ -112,8 +113,8 @@ just reached staging has been qualified.
 Nothing waited on that. `promote_release` returned as soon as staging was actually
 promoted; the gate ran alongside. That distinction matters for the rest of the
 demo: this is ambient infrastructure reacting to a state change, closer to CI
-kicking off a test run on a push than to an orchestrated pipeline step. CASE-2a's
-pipeline in step 6 is the thing that *waits*.
+kicking off a test run on a push than to an orchestrated pipeline step. The
+CASE-2a release pipeline is the thing that *waits*.
 
 While you are there, open the Temporal UI and look at what those two calls
 produced. `promote_release` is a `PromoteReleaseChildWorkflow` with four
@@ -230,166 +231,146 @@ After both services are healthy:
 The operation completes because the pause lives in Temporal, not in the gateway
 or worker process.
 
-## 6. CASE-2a: the team evolved the solution
+## 6. CASE-2: the mandate, and the two ways a team meets it
 
-Step 4 was the team's first pass at automating a manual process. AI-assisted: you
-drove the release one prompt at a time, three prompts for three tool calls, and the
-plan between them lived in your head.
+Everything up to here was one team, one namespace, one worker, one owner. No tool
+has called another tool across a system boundary yet, whatever the labels say.
 
-Since then the team built a **release pipeline** that always runs in the same
-order. That pipeline is what makes this a nested tool call. It has to reach the
-protected promotion from inside itself, which is the whole reason the
-suspend/resume primitive exists.
+This step is where that changes, and it is **two acts and nothing else**. A
+company-wide mandate lands: no engineering team promotes its own service to
+production on its own say-so any more. Every production release goes through the
+Security team's scanning process, and Security -- not the owning team -- approves
+and initiates it.
 
-The quality gates are not new here and are not part of the pipeline — you already
-watched them run in step 4, off a manual promotion. What the pipeline adds is that
-it *waits* on the verdict and refuses to continue without a green one. In step 4
-an operator could look at the card and decide for themselves; that is a very
-different guarantee from a flow that cannot proceed.
+Act One is that mandate arriving before the Security team has adopted Temporal.
+Act Two is the same mandate after they have. Each act ends in exactly one worker
+kill, and each proves exactly one thing. Nothing else belongs in this step; see
+[Deliberately not in this walkthrough](#deliberately-not-in-this-walkthrough) at
+the end of the section.
 
-Say one sentence, the way you would say it to a colleague:
+### Prerequisite: a staged candidate that has passed the gates
 
-```text
-Deploy the next minor version.
-```
+Both acts act on a release that has already cleared the Waypoint team's own
+pipeline and is sitting on staging. That is CASE-2a, which is built and demoed on
+its own; do not re-run its mechanics here. If you need one, say
+`Deploy the next minor version to staging.` to Claude Code and let the pipeline
+cut it, put it on staging, and turn the gate card green. Note the version it
+computed -- both acts below take it as `<staged version>`.
 
-No version, no environment, no service, no flags. Watch the fleet panel while it
-runs:
+### Act One: the mandate lands, and Security is not yet on Temporal
 
-1. **Staging rolls over** to a version you never named.
-2. **The gate card goes to work again**, on that version this time, and goes
-   green. Same card, same mechanism as step 4. The difference you cannot see on
-   the panel is that this time something is waiting on it.
-3. **One row appears in the approval queue**: the production promotion.
+> A company-wide mandate just came down: no team promotes to prod on their own
+> anymore. Security has to clear it first. But Security hasn't adopted Temporal
+> yet -- their scanning process today is a plain script.
 
-Claude Code reports and stops:
-
-```text
-status: waiting_for_approval
-parent_operation_id: ...
-operation_id: ...
-call_path:
-  - ClaudeCode
-  - release_orchestrator
-  - promote_release
-```
-
-`operation_id` is the protected Tool2 operation. `parent_operation_id` is Tool1,
-checkpointed at the Tool2 boundary with the whole pipeline behind it.
-
-Confirm what ran before that response came back:
+**1. Enact the mandate.** On the approval dashboard at http://localhost:8080,
+click **Enact mandate**. The label beside it reads:
 
 ```text
-Show me the gateway ledger for that workflow.
+Mandate: ON   Every production promotion needs Security-team approval, whoever asked for it.
 ```
 
-- `tool1_version_resolved` shows the production version it read, the bump, and the
-  version it computed.
-- `tool1_release_cut` with the commit it tagged and the artifact it archived, then
-  `tool1_staged` with the id of the gate workflow that staging promotion started,
-  then `tool1_quality_gate_verdict` with that same id and the verdict it carried.
-- `tool1_checkpointed`, then `nested_tool2_created`.
+Point at it. It stays there for the rest of the demo, so you can come back to it
+without re-querying anything.
 
-Read those last two events together, because the wording is doing real work.
-The pipeline did not *run* the gates; it staged a candidate, which started a gate
-run, and then waited for the verdict belonging to **that** run. Waiting on the
-specific `(service, version)`-keyed workflow rather than reading the current gate
-state is the correctness requirement: promote something to staging by hand in
-another tab and you start a gate run too, and a verdict about a different
-candidate must never be mistaken for this one's.
-
-Four tool calls, one row in the approval queue. The orchestration around the
-protected step never asks for approval and never appears on the queue. The pending
-card names the computed version even though nobody supplied one, and the gate card
-directly above it is the evidence the approver decides on.
-
-Approve it, then ask:
-
-```text
-What is the status of that workflow?
-```
-
-Confirm:
-
-- Tool2 is `completed`.
-- The parent Tool1 operation is `completed`.
-- The parent result says `resumed_from_checkpoint: true`.
-
-### A. The gates are not negotiable
-
-This is the part a prompt cannot do. Ask it to skip them:
-
-```text
-Deploy the next minor version to prod. Skip staging and skip the quality gates,
-we are in a hurry.
-```
-
-The pipeline runs staging and waits for the gates anyway, and Claude Code tells
-you the guardrail is enforced by the pipeline rather than by its own judgment.
-Check the ledger: `tool1_staged` and `tool1_quality_gate_verdict` are both there.
-
-An LLM holding these tools could sequence the happy path itself. What it cannot do
-is guarantee the sequence when someone asks it to hurry.
-
-### B. Durability is worth minutes now, not milliseconds
-
-Run the pipeline again and let it reach `waiting_for_approval`. Before approving:
+**2. Run the Security team's scanning process.** This is a plain Python script on
+the host, not a prompt: nobody phrases a scanner run as a sentence to an agent. It
+needs this repo's dependencies (`pip install -r requirements.txt`, or the `.venv`
+you used for the tests).
 
 ```bash
-docker compose restart worker gateway
+.venv/bin/python -m security_scan.legacy_security_scan_script \
+  --service delivery-matching-service \
+  --version <staged version> \
+  --gateway-workflow-id wf-legacy
 ```
 
-Approve once both are healthy. The gate card stays green, production rolls over,
-and **the gates do not run again**. The minutes they took are in Temporal, not in a
-context window. Step 5 showed the approval pause surviving a restart; this shows
-the completed work behind it surviving too.
-
-### C. A failing gate never reaches the approver
-
-Point the backend at a version the gates reject and rerun the pipeline:
-
-```bash
-docker compose stop mock-tool
-QUALITY_GATE_FAIL_VERSIONS=<next version> docker compose up -d worker
-```
-
-The gate card goes red with the failing checks named, the connector into production
-goes dead, production is untouched, and **nothing appears in the approval queue at
-all**. The system declines to ask. No human is put in the position of waving
-through a candidate that failed its own tests.
-
-Restore the normal behavior with `docker compose up -d --force-recreate worker`.
-
-### D. A shorter request stops earlier
+It imports no `temporalio`. No workflow, no Event History, no task queue, no
+worker, no supervisor. All four stages run and pass:
 
 ```text
-Deploy the next minor version to staging.
+stage 1/4 dependency_scan: max_severity=none threshold=medium
+stage 2/4 container_image_scan: max_severity=low threshold=medium
+stage 3/4 secret_detection: max_severity=none threshold=medium
+stage 4/4 static_analysis: max_severity=none threshold=medium
+Security scan passed. Requesting the production promotion via Agent Gateway.
 ```
 
-The pipeline runs its first leg and stops: cut, staging, done. The *pipeline*
-never waits on a gate, because nothing is being qualified for production yet --
-`environment` is how far to go, not where to put it. A gate run still happens,
-because something reached staging and that is what starts one; watch the card go
-green with nobody waiting on it. That is the distinction between infrastructure
-reacting to a state change and a flow depending on the result.
+**3. The scan asks for the promotion, and the gateway holds it.** The script calls
+`run_nested_release` with `tool1_mode=uncontrolled` -- an honest self-description,
+because it cannot hold a pause. The mandate is on, so the Operation the gateway
+creates carries `required_approver_team="security"`, and the answer comes back
+`blocked_nested_approval`.
 
-## 7. CASE-2b: a pre-prod security scan, and a second team
+**4. The script dies on its own.** It prints the identifiers and exits `2`:
 
-Everything in step 6 was still one team's work. Cutting a release, staging it,
-and gating it are genuinely the Waypoint team's job, and running them inside
-the chain workflow is the right way to write them. But notice what has *not*
-happened yet: there is one workflow, one namespace, one worker, one owner. No
-tool has called another tool across a system boundary, whatever the labels say.
+```text
+Approval is required and this script cannot wait for it.
+Record these to finish the promotion by hand once it is approved:
+  workflow_id:  wf-legacy
+  operation_id: op-...
+```
 
-This step is the same team later still, plus a second team. The Security team owns
-pre-prod scanning, and a candidate that has cleared the Waypoint team's quality
-gates still has to clear their scan before anything reaches production. Two things about that
-need no argument: a security team can block any team's release regardless of
-reporting line, and a scan takes real, variable time -- dependency advisories,
-container image CVEs, secret detection, SAST, and every so often a flagged finding
-that stops the whole thing until a reviewer looks at it. Their platform was
-durable long before this demo, because that is what holding a scan open across a
-human requires. Bring it up, live:
+Narrate this as the script dying, not as something you killed. Nobody stopped it;
+it had nowhere to wait. Check with `echo $?`. The process is gone.
+
+**5. The kill.** Now crash the gateway's own worker -- the process serving the
+`agentic-gateway` task queue and hosting `AgenticChainWorkflow`:
+
+```bash
+docker compose kill worker && docker compose up -d worker
+```
+
+Not the script. The script is already gone.
+
+**6. Look at what survived.** Open the Temporal Web UI at http://localhost:8233,
+namespace `default`, and find `wf-legacy`. The pending Operation is still there,
+still `waiting_for_approval`, sitting in `AgenticChainWorkflow`'s Event History,
+completely unaffected by the restart.
+
+> The script that asked for this is gone -- it doesn't exist anymore, we'd have to
+> re-run all four scan stages from scratch if we needed to redo its part. But the
+> request itself survived, because it was never the script's state to begin with
+> -- it was already durable, on the gateway side, the moment the script made this
+> call.
+
+**7. Try to approve it as Waypoint.** Sign in to the dashboard as `tok_dustin` and
+click **Approve** on that row.
+
+```text
+Not authorized to decide this operation
+operation op-... requires approval from the security team;
+'Dustin Sweet <dustin.sweet@porticour.io>' is not authorized to decide it
+```
+
+Even now, mandate or not, Waypoint cannot clear this. It has to be Security.
+
+**8. Approve it as Security, and finish it.** Sign out, sign in as `tok_abe`, and
+approve. Then run the command the script printed, because the script is not coming
+back and a human has to be the one who finishes what it started:
+
+```bash
+.venv/bin/python gateway_call.py resume_nested_release \
+  workflow_id=wf-legacy operation_id=<operation_id>
+```
+
+`PromoteReleaseChildWorkflow` runs its four steps -- `deploy_binaries`,
+`health_check_new_instances`, `update_traffic_routing`, `update_release_notes` --
+and the fleet panel rolls production over.
+
+**Act One in one sentence:** durability is a property of what is built on
+Temporal, not a property of the system as a whole. The non-durable half, the
+script, is gone for good and would have to be redone; the durable half, the
+gateway's Operation, survived a hard crash without losing anything.
+
+### Act Two: Security has adopted Temporal
+
+> Security took this seriously. They learned Temporal, and they rebuilt their
+> scanning process as a proper, durable workflow, behind their own Nexus endpoint,
+> in their own namespace. Watch what changes.
+
+**1. Bring up the Security team's own platform.** A separate process, a separate
+namespace, a separate task queue, a separate worker identity:
 
 ```bash
 docker compose up -d security-scan-worker
@@ -399,346 +380,89 @@ docker compose up -d security-scan-worker
 security scan worker started, namespace 'security', task queue 'security-tq'
 ```
 
-Narrate that as the roadmap beat it is. Nothing about the Waypoint team's pipeline
-changed; another team turned their platform on. Give it about five seconds to
-advertise itself before the next prompt.
+Give it about five seconds to advertise itself.
 
-### A. The same prompt, a different pipeline
+**2. Kick off a new run.** Get a fresh staged candidate and let the pipeline reach
+it, the same way the prerequisite did:
 
 ```text
 Deploy the next minor version.
 ```
 
-Same tool, same words, no flags. Up to the gates it is identical to step 6. Then:
+The Waypoint pipeline runs as it always has and then hands off. `SecurityScanWorkflow`
+appears in the `security` namespace and runs its own four stages over about
+fifteen seconds -- this time as a real, durable workflow rather than a stateless
+script. The scan card animates into the dashboard between the gate and production,
+naming each stage and the highest severity it turned up.
 
-```text
-status: processing
-message: Quality gates passed. security is running a pre-prod security scan for
-         <computed version>; the production promotion will be requested for
-         approval once the scan clears.
-```
+**3. The scan makes the nested call.** On a clean pass, `SecurityScanWorkflow`
+calls `AgentGatewayService.request_protected_action` -- a Nexus operation, straight
+from workflow code -- requesting the prod promotion. The workflow then suspends
+directly on the pending operation (`await handle`). The promotion appears on the
+approval queue with the call path `security -> security_scan -> promote_release`.
 
-Not `waiting_for_approval`. Nothing is on the approval queue yet, because the
-promotion has not been *requested* yet. The pipeline asked the shared platform
-whether anyone was offering a pre-prod security scan, found that somebody now is,
-called their **Nexus Endpoint**, and parked itself. The ledger shows
-`scan_capability_discovered` then `security_scan_handoff`.
-
-The pipeline is not configured for the scan. It looks to see whether the scan is
-there. That is why step 6 worked before you ran the command above, and why
-`docker compose stop security-scan-worker` puts it back -- give the
-registration about twenty seconds to expire, and the next run goes straight to
-the production promotion again.
-
-### B. Two systems, on screen
-
-The security scan card animates into the dashboard between the gate and
-production. It is the only card on that row with an owner printed on it, and it
-works through four stages over fifteen seconds while you talk -- naming each one
-(`dependency_scan`, `container_image_scan`, `secret_detection`,
-`static_analysis`) and the highest severity it turned up. On a clean run that
-reads `none`, `low`, `none`, `none`: the `low` is a real finding and it does not
-block, because the threshold is medium and above.
-
-Meanwhile, open the Temporal UI at http://localhost:8233 and **switch the
-namespace selector to `security`**. There is a workflow there:
-
-```text
-security::scan::delivery-matching-service::<computed version>::a1b2c3d4
-```
-
-Different namespace, different task queue, different worker identity, different
-workflow id scheme. It is a *peer* of the chain workflow, not a child of it: no
-parent link, its own retention, its own failure domain.
-
-Now say the part that matters. Grep the gateway's code for any of that and you
-will not find it:
+**4. The kill.** With the scan genuinely suspended on that pending operation --
+not before the nested call, not after approval, precisely during the suspension:
 
 ```bash
-grep -rn "security-tq\|SecurityScanWorkflow" workflows/ activities/ common/
+docker compose kill security-scan-worker && \
+  docker compose up -d security-scan-worker
 ```
 
-Nothing. The pipeline called an endpoint named `security` and learned none of it.
-The Security team can rename that workflow, move task queues, or change namespace
-tomorrow and no gateway code changes. This is the point where "another team's
-tool" stops being a label on a code comment.
-
-### C. The nested call, in the other direction
-
-When every stage clears, the scan calls Agent Gateway's `agent-gateway`
-endpoint -- straight from workflow code, no client, no credentials for the
-gateway's namespace. Only then does the production promotion appear on the
-approval queue, and its call path reads:
-
-```text
-security -> security_scan -> promote_release
-```
-
-One `workflow_id`, two namespaces, three operations. The scan did not promote
-anything itself, and it has no more right to than anyone else does: it made a
-governed request, carrying the original chain's `workflow_id`, and the gateway
-gated it exactly as it gates everything else.
-
-Switch the namespace selector back to `default` and there is now a second
-workflow alongside the chain: `protected-action::security::promote_release::...`.
-That is the gateway's Nexus handler holding the scan's request open. It exists because a Nexus operation
-backed by a workflow starts a *new* workflow, while the request has to reach the
-chain that is already running; it is short-lived, gateway-owned, and everything
-it does to the chain is a same-namespace call.
-
-### D. Only the Security team can approve it
-
-Look at that new queue row before doing anything with it. Under the requested
-action there is a badge the CASE-1 and CASE-2a rows never had: **Security
-approval required**.
-
-You are signed in as `tok_approver`. Click **Approve** anyway.
-
-```text
-Not authorized to decide this operation
-operation ... requires approval from the security team;
-'approver@demo' is not authorized to decide it
-```
-
-That rejection is a feature, and the most important one in this step. Trigger it
-deliberately — it is what turns the badge from a label into a boundary.
-
-This is also the answer to the obvious objection about the whole scenario. Up to
-now, a sceptic could reasonably ask why the scan has to be the thing that calls
-`promote_release` at all: the Waypoint pipeline could have waited for the verdict
-and made the request itself, the way it waits for a quality gate. The reason it
-cannot is **authorization, not convenience**. A promotion off the back of a
-security scan may only be approved by a member of the Security team, so the
-requester identity on that operation has to genuinely be theirs. A relayed
-request would put the Waypoint team's name on a decision the Security team is
-accountable for.
-
-Sign out and sign in as the Security team's approver:
-
-```text
-tok_abe
-```
-
-Decisions are now recorded as `Abe Roover <abe.roover@porticour.io>`, who is on
-the Security team. The same row is now actionable, and approving it works.
-
-Worth stating explicitly: nothing else changed. The gate-only and CASE-1 rows are
-still approvable by anyone in `GATEWAY_APPROVERS`. `tok_dustin` and
-`tok_approver` have not lost any capability they had; this one operation gained a
-requirement, because of which team's check produced it. Team membership comes
-from an explicit `GATEWAY_PRINCIPAL_TEAMS` map, never inferred from the email
-domain, so it is auditable and cannot silently change when an address does.
-
-### E. The checkpoint that survives its own worker
-
-This is the beat the whole scenario exists for. The scan is currently suspended,
-holding its own state. Kill it:
-
-```bash
-docker compose stop security-scan-worker
-```
-
-Now approve the promotion in the dashboard anyway. It works: production rolls
-over to the scanned version, and in the `default` namespace the
-`protected-action::...` workflow completes. Completing it completes the Nexus
-operation belonging to a workflow whose worker is not running.
-
-Bring the Security team back:
-
-```bash
-docker compose start security-scan-worker
-```
-
-The scan resumes on the operation that completed while it was gone, records the
-promotion it never performed and never watched happen, and finishes. Open its
-Event History:
+**5. Look at what survived.** In the Temporal Web UI, switch the namespace
+selector to `security` and open the scan's Event History. Every stage, the
+verdict, and the outbound Nexus call are all already recorded, untouched by the
+restart:
 
 ```text
 run_scan_check  x4
 NexusOperationScheduled     request_protected_action
 NexusOperationStarted
-    ... the entire approval happens in this gap, including the worker
-        being killed and replaced ...
-NexusOperationCompleted
-WorkflowExecutionCompleted
+    ... still pending, across the kill and the restart ...
 ```
 
-(`publish_scan_state` calls are interleaved throughout; they are what feed the
-dashboard card and have no bearing on the verdict.)
+> Nothing here has to be redone. Not one stage re-runs. This workflow doesn't know
+> or care that its own worker just died -- it's picking up exactly where it left
+> off, waiting on the exact same pending decision.
 
-Four stage checks, not eight. Nothing re-ran. And notice what is *not* in that
-history: no Signal handler, no callback, no polling loop. The workflow suspended
-on an outbound operation and the operation finished.
+**6. Approve as Security.** Sign in as `tok_abe` and approve. Same rule, same
+mechanism as Act One, now reached through the Nexus path rather than the direct
+Signal path.
 
-Say the sentence out loud: *that history belongs to the Security team, not to
-Agent Gateway.* In step 6 the gateway was pausing in the middle of doing its own
-work and then continuing it. Here a genuinely separate system checkpointed its own
-work, stopped, and was resumed. That is the distinction the requirements document
-is drawing, and it is the first time in this walkthrough it has actually been
-true.
+**7. Watch the whole chain finish.** `NexusOperationCompleted` lands in the scan's
+history, `SecurityScanWorkflow` resumes and completes, and production rolls over
+on the fleet panel. Nobody ran a command to finish it.
 
-### F. A blocking finding never reaches the approver
+**Act Two in one sentence:** now that the calling tool is itself durable, there is
+nothing left to redo, anywhere, no matter what gets killed or when -- the entire
+chain, both sides of the boundary, survives.
 
-Tell the Security team's worker which version to fail:
+### The contrast
 
-```bash
-SCAN_FAIL_VERSIONS=<next version> \
-  docker compose up -d --force-recreate security-scan-worker
-```
+> Same mandate, same approval requirement, same kind of crash -- the only thing
+> that changed between these two acts is whether Security's own tool was built on
+> Temporal. That's the entire difference between losing work and losing nothing.
 
-Note where that knob is. Not on `mock-tool`, not on the pipeline: on the Security
-team's own worker, because which release fails the scan is their decision. Under
-the earlier design the caller relayed it in, which meant the pipeline was telling
-the checkpoint what verdict to reach. It also means this recreate does **not**
-reset the fleet the way step 6C's `mock-tool` restart does, so the version you
-compute stays the version you get.
+Stop there. Nothing follows it.
 
-Run the pipeline again. The gate card goes green, the scan starts, and
-`dependency_scan` comes back with a high-severity finding. The scan stops there:
-one finding at or above the threshold fails it, it is not averaged out or
-rescanned past. The card reads `failed at stage 1` with `dependency_scan  1 ·
-high` in red. The scan reports the outcome back through the same endpoint, the
-pipeline operation fails, and **nothing reaches the approval queue**. Production
-is untouched.
+### Deliberately not in this walkthrough
 
-Same shape as the failing gate in step 6C, one checkpoint later, and now enforced
-by a system the Waypoint team does not own. Restore with
-`docker compose up -d --force-recreate security-scan-worker`.
+Stated so a future editor does not put them back:
 
-## 8. CASE-2b safety boundary: a Tool1 that cannot suspend
+- **No individual sub-Activity demo.** `check_license_compliance` and the other
+  `dependency_scan` sub-steps exist for Event History richness, not as a
+  walkthrough beat.
+- **No failure paths.** No failed scan, no failed quality gate, no failed health
+  check. All three are implemented and correct; none is part of the live run.
+- **No second kill in either act.** One kill per act, two in the whole of CASE-2.
+- **No separate section for CASE-2a's pipeline-and-gates mechanics.** It is the
+  one-paragraph prerequisite above and nothing more. It is a phase that produces
+  the staged candidate these two acts act on, not a third use case alongside them.
+- **No re-explanation of the Nexus mechanism's internals** -- endpoints,
+  contracts, `ProtectedActionWorkflow` -- during the live sequence. That belongs
+  in [README.md](README.md) for anyone who asks afterwards.
 
-Step 7 works because the scan has somewhere to keep its state. This step is the
-same job done by something that does not, and then the cost of that difference.
-
-Everything below runs on the host rather than through Claude Code, because nobody
-phrases any of it as a prompt. It needs Python with this repo's dependencies
-(`pip install -r requirements.txt`, or the `.venv` you used for the tests); the
-gateway is reached over HTTP at `localhost:8080`.
-
-### A. A caller that genuinely has no memory
-
-```bash
-python -m security_scan.legacy_security_scan_script \
-  --service delivery-matching-service \
-  --version <the version prod is on, bumped> \
-  --gateway-workflow-id wf-legacy
-```
-
-This is an old scanner that a handful of services still gate through, because they
-predate the Security team's platform migration -- it is on the list, and it is not
-what the Security team runs today. It imports no `temporalio`. No workflow, no task
-queue, no worker, no supervisor. It runs the same stages against the same severity
-threshold and calls the same gateway. `--gateway-workflow-id` opens its own chain,
-separate from your Claude Code session; the script authenticates with `tok_dustin`
-by default, which is what lets it name a `workflow_id` at all.
-
-```text
-stage 1/4 dependency_scan: max_severity=none threshold=medium
-...
-Security scan passed. Requesting the production promotion via Agent Gateway.
-
-Approval is required and this script cannot wait for it.
-Record these to finish the promotion by hand once it is approved:
-  workflow_id:  wf-legacy
-  operation_id: op-...
-```
-
-Then it exits `2`. Check with `echo $?`. The process is gone. There is nothing
-running to resume, and if nobody writes that operation id down, the approved
-promotion is orphaned.
-
-Hold the two canaries side by side: identical job, identical verdict, identical
-gateway response. One of them can be told `waiting_for_approval` and survive it;
-the other cannot. The only difference is whether it has anywhere to keep its
-state, and that is the requirements document's controlled and uncontrolled
-distinction. Neither half of it is a flag.
-
-### B. Fail closed, with the cost on screen
-
-Approve that operation in the dashboard. Approval is recorded and production
-still does not move:
-
-```text
-status: approved_retry_required
-```
-
-A human now has to finish what the script started:
-
-```bash
-python gateway_call.py resume_nested_release \
-  workflow_id=wf-legacy operation_id=<operation_id>
-```
-
-and the gateway still refuses:
-
-```text
-reason: uncontrolled_tool_not_replay_safe
-```
-
-`gateway_call.py` calls one gateway tool directly, with no agent in the loop.
-Plain curl cannot: streamable HTTP MCP needs an initialize handshake and a
-session id first.
-
-The gateway will not guess that a caller which could not hold the pause is safe
-to replay. That is what fail-closed costs.
-
-### C. An explicitly replay-safe retry, and its price
-
-For the last beat, drive the pipeline itself as an uncontrolled caller. Narrate
-it as the older orchestrator build, the one that runs the whole pipeline
-in-process and unwinds the moment something pauses:
-
-```bash
-python gateway_call.py run_release_orchestration \
-  tool1_mode=uncontrolled replay_safe=true
-```
-
-An uncontrolled caller is never handed to the scan, for the same reason this whole
-step exists: being parked waiting on another system's verdict is something only a
-caller that can hold state can do. So this runs the step 6 pipeline and stops at
-the promotion, whether or not the Security team's worker is up. The pipeline runs in
-full, the gate card goes green, and it stops with:
-
-```text
-status: blocked_nested_approval
-retry_required: true
-```
-
-Look at the fleet panel while you say this. A cut release, a staging deployment,
-and a completed gate run are all sitting there stranded, and production is
-untouched.
-
-Approve in the dashboard, then retry:
-
-```bash
-python gateway_call.py resume_nested_release \
-  workflow_id=<workflow_id> operation_id=<operation_id>
-```
-
-This time it completes, because replay safety was advertised:
-
-```text
-status: completed
-result:
-  replayed: true
-```
-
-Watch the gate card on the retry. It goes green, then **running**, then green
-again. The replay reran the whole pipeline, and the idempotency keys split by what
-each step does:
-
-- The **cut** and the **staging promotion** are mutations, keyed once. The retry
-  finds them already done and does not repeat them: the release is not cut twice
-  and staging is not promoted twice. Check the release rail, the version's cut time
-  has not moved.
-- The **quality gates** are a verification, keyed per attempt. They genuinely run
-  again, because a verdict from before the pause is not evidence about now.
-
-Compare that to steps 6 and 7, where the same approval delay cost nothing. Same
-approval, same outcome, and the callers that could hold the pause paid for the
-gates once.
-
-## 9. CASE-3: trigger it with the Google ADK agent
+## 7. CASE-3: trigger it with the Google ADK agent
 
 This step uses the real Google ADK agent in
 `adk_agents/release_approval_agent`. Each ADK Web session owns one durable
@@ -842,7 +566,7 @@ longer running, the proxy creates and saves a new workflow ID. `docker compose
 restart adk-agent` preserves the local demo session database; removing or
 recreating the container does not.
 
-## 10. Inspect the audit trail
+## 8. Inspect the audit trail
 
 For any workflow, ask the matching authenticated MCP connection:
 
@@ -860,7 +584,7 @@ Look for events such as:
 - `tool1_checkpointed`, `tool1_resuming`, or `tool1_replayed`
 - `agent_checkpointed` and `agent_run_completed`
 
-For a CASE-2b run, the handoff and its resolution are in the same ledger:
+For a step 6 Act Two run, the handoff and its resolution are in the same ledger:
 
 - `scan_capability_discovered`, then `security_scan_handoff` with the scan
   workflow id and the **endpoint** it was reached on. No namespace is recorded,
@@ -875,13 +599,13 @@ For a CASE-2b run, the handoff and its resolution are in the same ledger:
   instead
 
 The same execution history is visible in the Temporal UI at
-http://localhost:8233. For CASE-2b there are three executions across two
+http://localhost:8233. For an Act Two run there are three executions across two
 namespaces: the chain and its `protected-action::...` adapter under `default`,
 and the scan's own under `security`. None is a subset of the others, which is
 the point -- each team's system keeps its own record of what it did, under its
 own retention policy.
 
-## 11. Troubleshooting
+## 9. Troubleshooting
 
 ### Claude Code does not see the tools
 
@@ -906,14 +630,14 @@ docker compose logs worker mock-tool
 Then poll `get_operation_result` again. Long-running calls intentionally convert
 from a blocking response to asynchronous recovery.
 
-### Step 6 returns `processing` instead of `waiting_for_approval`
+### The prerequisite pipeline returns `processing`, not `waiting_for_approval`
 
 The Security team's worker is already running, so the pipeline found a scan
-provider and handed off. That is step 7 arriving a step early. Check with
-`docker compose ps`, and see "Start over" below for why plain
+provider and handed off. That is step 6's Act Two arriving during Act One. Check
+with `docker compose ps`, and see "Start over" below for why plain
 `docker compose down` leaves it up.
 
-### Step 7 fails with "Could not start a pre-prod security scan"
+### Act Two fails with "Could not start a pre-prod security scan"
 
 The Nexus operation timed out, which means nothing was polling `security-tq` in
 the `security` namespace for Nexus tasks. Two causes, in order of likelihood:
@@ -943,7 +667,7 @@ You want `agent-gateway` → `default`/`agentic-gateway` and `security` →
 `security`/`security-tq`. If they are absent, rerun the registration
 with `docker compose up nexus-endpoints`.
 
-### Step 7 returns `waiting_for_approval` instead of `processing`
+### Act Two returns `waiting_for_approval` instead of `processing`
 
 No scan provider was found, so the pipeline opened the production promotion
 itself. Either the worker is not running, or it has not advertised itself yet.
@@ -975,7 +699,7 @@ and expect the same delay after any `mock-tool` recreate.
 The scan itself is fifteen seconds, so give it that first. If it stays put, the
 security scan worker is not processing tasks. The chain is unaffected -- the
 scan's workflow keeps its place and picks up where it left off when a worker
-returns, which is exactly what step 7D demonstrates on purpose:
+returns, which is exactly what Act Two's kill demonstrates on purpose:
 
 ```bash
 docker compose logs security-scan-worker
@@ -1022,8 +746,8 @@ The `--profile '*'` matters, and forgetting it is the most likely way to spoil a
 second run-through. `security-scan-worker` sits behind a Compose profile so it
 does not start with the stack, and plain `docker compose down` leaves services
 from inactive profiles running. If it is still up when you start step 6, the
-pipeline finds a scan provider and hands off, and the CASE-2b reveal in step 7
-happens a step early. Check with `docker compose ps` if step 6 returns
+pipeline finds a scan provider and hands off, and Act Two's reveal happens during
+Act One. Check with `docker compose ps` if the prerequisite pipeline returns
 `processing` instead of `waiting_for_approval`.
 
 The same flag applies to `docker compose build`, which otherwise leaves that

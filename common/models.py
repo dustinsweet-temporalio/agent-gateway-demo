@@ -100,6 +100,13 @@ class ToolCallRequest:
     # workflow responds).
     operation_id: str = ""
     safe_arguments: dict[str, Any] = field(default_factory=dict)
+    # Whether the company-wide security mandate was in effect when this call
+    # arrived. Read from the gateway's runtime toggle at the trust boundary and
+    # carried on the request, for the same reason approver_team is: it is
+    # process state outside the Workflow, and Workflow code must not read it.
+    # Carrying it makes the value part of Event History, so a replay reaches the
+    # same answer even if the toggle has been flipped since.
+    security_mandate: bool = False
 
 
 @dataclass
@@ -183,6 +190,11 @@ class NestedToolCallRequest:
     # resolve. CASE-2b sets it to the release pipeline's own operation, which
     # handed off to the security scan and is parked until the promotion lands.
     origin_operation_id: str = ""
+    # As on ToolCallRequest: the gateway's security-mandate toggle, snapshotted
+    # at the boundary. Only the gateway's own MCP surface sets it; a nested call
+    # that arrives over Nexus from the Security team already carries its own team
+    # restriction through caller_service and does not need it.
+    security_mandate: bool = False
 
 
 @dataclass

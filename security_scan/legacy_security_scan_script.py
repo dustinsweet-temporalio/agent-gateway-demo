@@ -98,6 +98,7 @@ async def request_promotion(
     version: str,
     environment: str,
     gateway_workflow_id: str,
+    replay_safe: bool,
 ) -> dict:
     async with streamablehttp_client(
         url, headers={"Authorization": f"Bearer {token}"}
@@ -113,6 +114,12 @@ async def request_promotion(
                     # Honest self-description. This caller cannot hold a pause,
                     # so it says so, and Agent Gateway fails closed accordingly.
                     "tool1_mode": "uncontrolled",
+                    # Also honest, and a separate question from the first. A scan
+                    # is a read: running it twice is safe, it just costs all four
+                    # stages again. Saying so is what lets a human finish the
+                    # promotion by hand after the approval, which is the only way
+                    # this run can ever finish once the process is gone.
+                    "replay_safe": replay_safe,
                     "workflow_id": gateway_workflow_id,
                     "justification": (
                         f"Legacy security scan passed for {service} {version}"
@@ -132,6 +139,17 @@ def main() -> None:
     parser.add_argument("--environment", default="prod")
     parser.add_argument("--scripted-outcome", default="pass", choices=sorted(SCHEDULE))
     parser.add_argument("--gateway-workflow-id", required=True)
+    parser.add_argument(
+        "--replay-safe",
+        dest="replay_safe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "whether re-running this scan is safe. True by default, because it "
+            "is: pass --no-replay-safe to watch the gateway refuse the manual "
+            "retry outright."
+        ),
+    )
     parser.add_argument("--check-seconds", type=int, default=5)
     parser.add_argument("--stage-count", type=int, default=4)
     parser.add_argument("--url", default=GATEWAY_MCP_URL)
@@ -154,6 +172,7 @@ def main() -> None:
             args.version,
             args.environment,
             args.gateway_workflow_id,
+            args.replay_safe,
         )
     )
 

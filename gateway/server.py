@@ -192,6 +192,39 @@ def _load_principal_teams() -> dict[str, str]:
 _PRINCIPAL_TEAMS = _load_principal_teams()
 
 
+class _MandateToggle:
+    """The company-wide security mandate, on or off, for this gateway process.
+
+    In-story: no engineering team promotes its own service to production on its
+    own say-so any more, so while this is on, every production promotion needs
+    the Security team's approval whoever asked for it.
+
+    Deliberately just a flag in memory. It is not a Signal, not a Search
+    Attribute, and not anything workflow-durable, because it is not domain state:
+    it is a property of the gateway's configuration at the moment a call arrives,
+    the same kind of thing GATEWAY_APPROVERS is. What ends up durable is its
+    effect -- the value is snapshotted onto each request and recorded in Event
+    History, so an operation decided under the mandate keeps its restriction even
+    if the toggle is flipped off a second later.
+
+    It does not survive a gateway restart, and does not need to: flipping it live
+    is the demo beat, and flipping it again costs one click.
+    """
+
+    def __init__(self, on: bool = False) -> None:
+        self._on = on
+
+    def is_on(self) -> bool:
+        return self._on
+
+    def set(self, on: bool) -> bool:
+        self._on = bool(on)
+        return self._on
+
+
+MANDATE_TOGGLE = _MandateToggle()
+
+
 def _team_for_principal(principal: str) -> Optional[str]:
     """The team this principal belongs to, or None if it has no mapping.
 
@@ -559,6 +592,10 @@ async def _submit_tool_call(
         justification=justification,
         operation_id=operation_id,
         safe_arguments=_safe_arguments(arguments),
+        # Read here, at the boundary, exactly like the approver's team is. The
+        # Workflow decides what the mandate means; it does not get to look up
+        # whether it is on.
+        security_mandate=MANDATE_TOGGLE.is_on(),
     )
 
     # Deliver the tool call as an Update. wait_for_stage=ACCEPTED returns the handle
@@ -786,6 +823,7 @@ async def _submit_nested_release(
         replay_safe=replay_safe,
         safe_tool1_arguments=_safe_arguments(tool1_arguments),
         safe_tool2_arguments=_safe_arguments(tool2_arguments),
+        security_mandate=MANDATE_TOGGLE.is_on(),
     )
     start_op = WithStartWorkflowOperation(
         AgenticChainWorkflow.run,
@@ -1225,7 +1263,25 @@ async def dashboard(request: Request) -> HTMLResponse:
                 elif op.status in TERMINAL_STATUSES:
                     history.append((wf.id, op))
     history.sort(key=lambda row: (row[1].decided_iso or ""), reverse=True)
-    return HTMLResponse(_render_dashboard(pending, history))
+    return HTMLResponse(
+        _render_dashboard(pending, history, MANDATE_TOGGLE.is_on())
+    )
+
+
+@mcp.custom_route("/mandate", methods=["POST"])
+async def mandate(request: Request) -> Response:
+    """Turn the company-wide security mandate on or off.
+
+    Gated on approver identity like every other mutating route here. Nothing is
+    signalled and nothing durable is written: the next call the gateway accepts
+    reads the new value, and calls already in the queue keep whatever restriction
+    they were created with.
+    """
+    if not _is_approver(_resolve_principal()):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    MANDATE_TOGGLE.set(str(form.get("state") or "").lower() == "on")
+    return RedirectResponse("/", status_code=303)
 
 
 def _fetch_fleet_state() -> dict:
@@ -1498,6 +1554,18 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .team-req { display: inline-block; margin-top: 0.3rem; padding: 0.12rem 0.45rem;
         border: 1px solid var(--protect); border-radius: 999px; color: var(--protect);
         font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; }
+/* Company-wide security mandate. Sits on the approval queue's heading row
+   because that is the only thing it changes: who may decide a production
+   promotion. Persistent by design -- the state has to still be readable minutes
+   after it was flipped. */
+.policybar { display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap; }
+.mandate { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
+.mandate-chip { padding: 0.12rem 0.5rem; border-radius: 999px; font-size: 0.66rem;
+        font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em;
+        border: 1px solid currentColor; }
+.mandate-on { color: var(--protect); }
+.mandate-off { color: var(--muted); }
+.mandate-note { font-size: 0.78rem; }
 .forbidden { max-width: 34rem; margin: 12vh auto; padding: 2rem;
         border: 1px solid #ef4444; border-radius: 8px; }
 .forbidden h1 { color: #ef4444; }
@@ -2338,8 +2406,39 @@ _MAIN_JS = """
 """
 
 
+def _render_mandate_bar(mandate_on: bool) -> str:
+    """The mandate's state, readable at a glance for as long as it is set.
+
+    A persistent label rather than a confirmation toast, because the whole point
+    of the control during a demo is being able to point at it and say "notice
+    this is on" several minutes after flipping it.
+    """
+    state = "ON" if mandate_on else "OFF"
+    cls = "mandate-on" if mandate_on else "mandate-off"
+    action = "off" if mandate_on else "on"
+    button = "Lift mandate" if mandate_on else "Enact mandate"
+    note = (
+        "Every production promotion needs Security-team approval, whoever "
+        "asked for it."
+        if mandate_on
+        else "Production promotions are approvable by any approver."
+    )
+    return f"""
+    <div class="mandate">
+      <span class="mandate-chip {cls}">Mandate: {state}</span>
+      <span class="muted mandate-note">{note}</span>
+      <form method="post" action="/mandate" class="inline" style="display:inline">
+        <input type="hidden" name="state" value="{action}">
+        <button class="toggle" type="submit">{button}</button>
+      </form>
+    </div>
+    """
+
+
 def _render_dashboard(
-    pending: list[tuple[str, Any]], history: list[tuple[str, Any]]
+    pending: list[tuple[str, Any]],
+    history: list[tuple[str, Any]],
+    mandate_on: bool = False,
 ) -> str:
     pending_rows = (
         "".join(_render_pending_row(wf, op) for wf, op in pending)
@@ -2396,7 +2495,10 @@ def _render_dashboard(
 
   <hr class="divider">
 
-  <h2 class="queue-head">Waiting for approval</h2>
+  <div class="queue-head policybar">
+    <h2>Waiting for approval</h2>
+    {_render_mandate_bar(mandate_on)}
+  </div>
   <table>
     <thead>
       <tr>
@@ -2449,10 +2551,11 @@ def _render_forbidden(message: str) -> str:
   <main class="forbidden">
     <h1>Not authorized to decide this operation</h1>
     <p>{html.escape(message)}</p>
-    <p class="muted">This promotion was requested by another Porticour team's
-    pre-prod security scan, so a member of that team has to be the one who
-    approves or rejects it. Sign in with that team's approver token and the
-    entry becomes actionable.</p>
+    <p class="muted">This operation is restricted to one Porticour team's
+    approvers, either because that team's own pre-prod check produced it or
+    because the company-wide security mandate is in effect. A member of that
+    team has to be the one who approves or rejects it. Sign in with their
+    approver token and the entry becomes actionable.</p>
     <p><a href="/">Back to the queue</a></p>
   </main>
 </body>
