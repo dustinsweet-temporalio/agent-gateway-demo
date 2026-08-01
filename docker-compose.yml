@@ -159,8 +159,8 @@ services:
       # Static bearer-token to identity map. The gateway sets the approval
       # requester from a matching token, never from anything the agent says.
       # Connect Claude Code with: --header "Authorization: Bearer tok_dustin"
-      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@quickmeals.com>","tok_abe":"Abe Roover <abe.roover@quickmeals.com>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo","tok_legacy_scanner":"legacy-scanner@security"}'
-      GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@quickmeals.com>,Abe Roover <abe.roover@quickmeals.com>"
+      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@quickmeals.com>","tok_sam":"Sam Ingbar <sam.ingbar@quickmeals.com>","tok_abe":"Abe Roover <abe.roover@quickmeals.com>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo","tok_legacy_scanner":"legacy-scanner@security"}'
+      GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@quickmeals.com>,Sam Ingbar <sam.ingbar@quickmeals.com>,Abe Roover <abe.roover@quickmeals.com>"
       # Which service, if any, a principal is calling on behalf of. Read from the
       # token the same way the principal itself is, and for the same reason: a
       # caller does not get to name its own service. The Security team's legacy
@@ -177,7 +177,7 @@ services:
       # a persona's address changed. Keys may be the full principal string or
       # just the address inside it; anything absent has no team and therefore
       # cannot approve a team-restricted Operation.
-      GATEWAY_PRINCIPAL_TEAMS: '{"dustin.sweet@quickmeals.com":"waypoint","abe.roover@quickmeals.com":"security"}'
+      GATEWAY_PRINCIPAL_TEAMS: '{"dustin.sweet@quickmeals.com":"waypoint","sam.ingbar@quickmeals.com":"waypoint","abe.roover@quickmeals.com":"security"}'
       GATEWAY_DEBUG: "1"
     ports:
       - "8080:8080"
