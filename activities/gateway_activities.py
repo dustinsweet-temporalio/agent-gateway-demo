@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import os
+import time
 from typing import Any
 
 import requests
@@ -10,15 +12,26 @@ from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 
 from common.models import (
+    ArchiveArtifactsInput,
+    AwaitQualityGateInput,
+    CalculateHashesInput,
     CorrelationContext,
+    DeployBinariesInput,
     EvaluatePolicyInput,
     GatewayOperationResolution,
+    HealthCheckInput,
     InvokeToolInput,
     NestedToolCallRequest,
     PolicyDecision,
+    PublishQualityGateInput,
+    QualityCheckInput,
+    QualityGateResult,
     SignalOperationCallbackInput,
     SubmitNestedToolCallInput,
+    TagCommitInput,
     ToolCallResponse,
+    UpdateReleaseNotesInput,
+    UpdateRoutingInput,
 )
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
@@ -86,6 +99,332 @@ def invoke_tool(input: InvokeToolInput) -> dict[str, Any]:
     return resp.json()
 
 
+# ------------------------------------------------ release steps (CASE-1, 2a)
+#
+# The individual steps inside CutReleaseChildWorkflow, PromoteReleaseChildWorkflow
+# and QualityGateChildWorkflow. Each is its own Activity function, not a shared
+# invoke_tool call with a different tool_name, because the point of the Child
+# Workflows is that Event History names what actually happened: an operator
+# looking at a stalled release sees archive_artifacts, not a fourth invoke_tool.
+#
+# Every one of them is a mock. Nothing here talks to real source control, a real
+# artifact store, or a real test runner; each sleeps for a plausible interval and
+# returns a synthetic payload derived deterministically from its input, so the
+# same demo run reads the same way twice. The one exception is
+# update_traffic_routing, which really does move the deployment backend's state,
+# because that is the step that makes a version live.
+
+
+def _mock_digest(*parts: str) -> str:
+    """A stable synthetic digest for a set of inputs.
+
+    Deterministic so the same release reports the same hash on every run and in
+    the Web UI, rather than a fresh random value that would make two views of
+    the same release disagree.
+    """
+    return hashlib.sha256("::".join(parts).encode()).hexdigest()
+
+
+def _post_tool(tool_name: str, arguments: dict, idempotency_key: str = "") -> dict:
+    """Call the deployment backend the same way invoke_tool does."""
+    url = os.getenv("MOCK_TOOL_URL", "http://mock-tool:9000/invoke")
+    headers = {"Idempotency-Key": idempotency_key} if idempotency_key else {}
+    resp = requests.post(
+        url,
+        json={"tool_name": tool_name, "arguments": arguments},
+        headers=headers,
+        timeout=45,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _fail_versions(name: str) -> set[str]:
+    return {item.strip() for item in os.getenv(name, "").split(",") if item.strip()}
+
+
+@activity.defn
+def tag_commit_in_source_control(input: TagCommitInput) -> dict[str, Any]:
+    """Tag the commit this release is cut from. First step of a cut."""
+    time.sleep(1.0)
+    commit_sha = input.commit_sha or _mock_digest(
+        "commit", input.service, input.version
+    )[:10]
+    tag = f"v{input.version}"
+    activity.logger.info(
+        "tagged %s at %s as %s", input.service, commit_sha, tag
+    )
+    return {
+        "service": input.service,
+        "version": input.version,
+        "commit_sha": commit_sha,
+        "tag": tag,
+        "message": f"tagged {commit_sha} as {tag}",
+    }
+
+
+@activity.defn
+def archive_artifacts(input: ArchiveArtifactsInput) -> dict[str, Any]:
+    """Archive the built artifact. The longest step of a cut, as in real life.
+
+    Also the step at which the release becomes a real, promotable thing, so this
+    is where the deployment backend learns about it and the dashboard's "Ready
+    for release" rail picks it up. Archiving is the honest place for that: before
+    it, there is a tag and nothing to deploy.
+    """
+    time.sleep(2.0)
+    artifact_ref = (
+        f"s3://porticour-artifacts/{input.service}/{input.version}/"
+        f"{input.service}-{input.version}.tar.zst"
+    )
+    # Derived from the digest rather than random, so it does not change between
+    # a run and its replay. Roughly 40-90 MB, which is a believable service.
+    digest = _mock_digest("size", input.service, input.version)
+    artifact_bytes = 40_000_000 + int(digest[:6], 16) % 50_000_000
+    registered = _post_tool(
+        "cut_release",
+        {"service": input.service, "version": input.version},
+        input.idempotency_key,
+    )
+    return {
+        "service": input.service,
+        "version": input.version,
+        "artifact_ref": artifact_ref,
+        "artifact_bytes": artifact_bytes,
+        "already_cut": bool(registered.get("already_cut")),
+        "message": f"archived {artifact_bytes} bytes to {artifact_ref}",
+    }
+
+
+@activity.defn
+def calculate_integrity_hashes(input: CalculateHashesInput) -> dict[str, Any]:
+    """Hash the archived artifact. Depends on the archive existing first."""
+    time.sleep(1.0)
+    sha256 = _mock_digest("artifact", input.artifact_ref)
+    return {
+        "service": input.service,
+        "version": input.version,
+        "artifact_ref": input.artifact_ref,
+        "sha256": sha256,
+        "message": f"sha256 {sha256[:16]}...",
+    }
+
+
+@activity.defn
+def deploy_binaries(input: DeployBinariesInput) -> dict[str, Any]:
+    """Place the new binaries on fresh instances. Nothing is serving yet."""
+    time.sleep(2.0)
+    seed = _mock_digest("instances", input.service, input.version, input.environment)
+    instance_ids = [
+        f"i-{seed[index * 8 : index * 8 + 8]}" for index in range(3)
+    ]
+    return {
+        "service": input.service,
+        "version": input.version,
+        "environment": input.environment,
+        "instance_ids": instance_ids,
+        "message": (
+            f"deployed {input.version} to {len(instance_ids)} instances in "
+            f"{input.environment}"
+        ),
+    }
+
+
+@activity.defn
+def health_check_new_instances(input: HealthCheckInput) -> dict[str, Any]:
+    """Check the new instances before any traffic is pointed at them.
+
+    Scripted healthy by default. HEALTH_CHECK_FAIL_VERSIONS is the demo knob for
+    the failure branch, which is implemented and correct but deliberately not
+    part of the default scripted run: a promotion whose instances fail this must
+    not go on to flip traffic onto them.
+    """
+    time.sleep(1.5)
+    healthy = input.version not in _fail_versions("HEALTH_CHECK_FAIL_VERSIONS")
+    return {
+        "service": input.service,
+        "version": input.version,
+        "environment": input.environment,
+        "instance_ids": list(input.instance_ids),
+        "healthy": healthy,
+        "message": (
+            f"{len(input.instance_ids)} instances healthy"
+            if healthy
+            else f"{len(input.instance_ids)} instances failed their health check"
+        ),
+    }
+
+
+@activity.defn
+def update_traffic_routing(input: UpdateRoutingInput) -> dict[str, Any]:
+    """Point the environment at the new version. This is the step that goes live.
+
+    The only step in either release Child Workflow that touches real state: it
+    moves the deployment backend's pointer for this environment, which is what
+    get_deployed_version reads and what the dashboard's fleet panel renders. The
+    idempotency key is threaded down from the operation, so a retried promotion
+    finds the move already applied instead of applying it twice.
+    """
+    time.sleep(1.0)
+    result = _post_tool(
+        "promote_release",
+        {
+            "service": input.service,
+            "version": input.version,
+            "environment": input.environment,
+        },
+        input.idempotency_key,
+    )
+    activity.logger.info(
+        "%s is now serving %s (was %s)",
+        input.environment,
+        input.version,
+        result.get("previous_version"),
+    )
+    return result
+
+
+@activity.defn
+def update_release_notes(input: UpdateReleaseNotesInput) -> dict[str, Any]:
+    """Append a changelog entry. Cosmetic, and after the version is already live."""
+    time.sleep(1.0)
+    return {
+        "service": input.service,
+        "version": input.version,
+        "environment": input.environment,
+        "entry": (
+            f"{input.service} {input.version} promoted to {input.environment}"
+        ),
+        "message": f"release notes updated for {input.version}",
+    }
+
+
+# --------------------------------------------------------------- quality gates
+
+
+@activity.defn
+def run_quality_check(input: QualityCheckInput) -> dict[str, Any]:
+    """Run one of the four quality checks against the staged candidate.
+
+    One Activity reused for all four names rather than four near-identical
+    functions. The check name is still visible per-attempt in Event History,
+    because it is in the input payload.
+
+    Duration is fixed per check name rather than random, so every demo run takes
+    the same time and the four cards finish in the same order twice running. The
+    values differ slightly between checks, so they visibly complete one at a time
+    instead of in lockstep.
+    """
+    time.sleep(_QUALITY_CHECK_SECONDS.get(input.check_name, 1.75))
+    passed = input.scripted_outcome != "fail" and input.version not in _fail_versions(
+        "QUALITY_GATE_FAIL_VERSIONS"
+    )
+    result = {
+        "check_name": input.check_name,
+        "passed": passed,
+        "detail": _QUALITY_CHECK_DETAIL[passed].get(input.check_name, ""),
+    }
+    activity.logger.info(
+        "quality check %s for %s %s: %s",
+        input.check_name,
+        input.service,
+        input.version,
+        "passed" if passed else "failed",
+    )
+    return result
+
+
+_QUALITY_CHECK_SECONDS = {
+    "e2e_tests": 2.0,
+    "user_acceptance_tests": 1.5,
+    "performance_tests": 1.9,
+    "accessibility_tests": 1.6,
+}
+
+# Fixed evidence strings. The point is that an approver has something concrete
+# in front of them, not that the numbers are measured.
+_QUALITY_CHECK_DETAIL = {
+    True: {
+        "e2e_tests": "412 passed",
+        "user_acceptance_tests": "38 scenarios passed",
+        "performance_tests": "p99 180ms, within budget",
+        "accessibility_tests": "no WCAG AA violations",
+    },
+    False: {
+        "e2e_tests": "9 failed",
+        "user_acceptance_tests": "3 scenarios failed",
+        "performance_tests": "p99 940ms, over budget",
+        "accessibility_tests": "4 WCAG AA violations",
+    },
+}
+
+
+@activity.defn
+def publish_quality_gate_state(input: PublishQualityGateInput) -> dict[str, Any]:
+    """Push gate progress to the shared observability backend.
+
+    Visibility only, the same contract the security scan's publish step has: the
+    verdict is already durable in the gate workflow's own history, so a publish
+    failure changes nothing about what the gates found.
+    """
+    return _post_tool(
+        "record_quality_gate_state",
+        {
+            "service": input.service,
+            "version": input.version,
+            "environment": input.environment,
+            "status": input.status,
+            "checks_completed": input.checks_completed,
+            "check_count": input.check_count,
+            "checks": input.checks,
+            "gate_workflow_id": input.gate_workflow_id,
+        },
+    )
+
+
+@activity.defn
+async def await_quality_gate(input: AwaitQualityGateInput) -> dict[str, Any]:
+    """Wait for one specific gate workflow's verdict, and check it is the right one.
+
+    The release pipeline cannot read "the current gate state": a gate workflow
+    starts on every staging promotion from any source, including a CASE-1 manual
+    one the operator made a moment ago, so the newest verdict is not necessarily
+    about the version this pipeline just staged. This waits on the workflow id
+    the promotion handed back and then refuses a result that is not for the
+    expected (service, version) pair, so a stale or crossed verdict fails the
+    pipeline rather than being promoted on.
+
+    An Activity because the gate workflow was started by, and abandoned from,
+    PromoteReleaseChildWorkflow, so the chain has no child handle for it and
+    workflow code cannot hold a client.
+    """
+    client = await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
+    handle = client.get_workflow_handle(
+        input.gate_workflow_id, result_type=QualityGateResult
+    )
+    result: QualityGateResult = await handle.result()
+    if result.service != input.service or result.version != input.version:
+        raise ApplicationError(
+            f"quality gate {input.gate_workflow_id} reported on "
+            f"{result.service} {result.version}, but the pipeline staged "
+            f"{input.service} {input.version}",
+            non_retryable=True,
+        )
+    activity.logger.info(
+        "quality gate %s for %s %s: %s",
+        input.gate_workflow_id,
+        result.service,
+        result.version,
+        result.status,
+    )
+    return {
+        "gate_workflow_id": input.gate_workflow_id,
+        "service": result.service,
+        "version": result.version,
+        "status": result.status,
+        "passed": result.status == "passed",
+        "checks": list(result.checks),
+    }
 
 
 # ------------------------------------------------- serving an external caller

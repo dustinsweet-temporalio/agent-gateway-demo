@@ -1,6 +1,7 @@
 """Legacy pre-prod scanner, for services that predate the Security team's platform.
 
-A handful of Waypoint services still gate through this old scanner rather than
+A handful of services owned by the Waypoint team still gate through this old
+scanner rather than
 the workflow next door. It is on the list to be migrated and it is not what the
 Security team runs today; it is here because comparing the two at the pause is
 the entire point of this file.

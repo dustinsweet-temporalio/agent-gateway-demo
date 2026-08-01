@@ -66,7 +66,7 @@ curl -s \
 The resolved identity should be:
 
 ```text
-Dustin Sweet <dustin.sweet@temporal.io>
+Dustin Sweet <dustin.sweet@porticour.io>
 ```
 
 ## 3. Sign in as the approver
@@ -82,6 +82,13 @@ in a browser tab.
 
 ## 4. CASE-1: simple approval-gated tool
 
+Before you run anything, look at the **Release fleet** panel. Between staging and
+production there is a quality gate card, and it is empty: dashed, muted, reading
+"no candidate staged yet". That is the honest state at container startup, and it
+is worth pointing at, because the card being *present* and empty is the claim.
+Gates here are standing infrastructure that react to anything reaching staging,
+not something the pipeline in step 6 invokes.
+
 ### A. Run an unprotected action
 
 Ask Claude Code:
@@ -96,7 +103,24 @@ Expected result:
 status: completed
 ```
 
-Staging actions do not require approval.
+Staging actions do not require approval. Now watch the gate card, without touching
+anything else: within a second or two it goes to `running`, counts its four checks
+off as they finish concurrently, and lands on `passed` after roughly seven
+seconds. One manual CASE-1 tool call, no pipeline anywhere, and the candidate that
+just reached staging has been qualified.
+
+Nothing waited on that. `promote_release` returned as soon as staging was actually
+promoted; the gate ran alongside. That distinction matters for the rest of the
+demo: this is ambient infrastructure reacting to a state change, closer to CI
+kicking off a test run on a push than to an orchestrated pipeline step. CASE-2a's
+pipeline in step 6 is the thing that *waits*.
+
+While you are there, open the Temporal UI and look at what those two calls
+produced. `promote_release` is a `PromoteReleaseChildWorkflow` with four
+Activities in sequence -- `deploy_binaries`, `health_check_new_instances`,
+`update_traffic_routing`, `update_release_notes` -- each with its own elapsed
+time, and the gate is a separate `QualityGateChildWorkflow` whose id names the
+service and version it is about. Not two flat tool calls.
 
 ### B. Request a protected production action
 
@@ -142,6 +166,13 @@ Confirm the waiting row shows:
 - approval deadline
 
 ### D. Approve and recover the result
+
+The gate card above the queue is showing `passed` for the exact version in the
+pending row, which is a beat worth taking: the approver is not deciding on a
+sentence, they have the four checks in front of them. Nothing forces them to look
+— CASE-1 blocks on nothing, and you can approve or reject this row whatever the
+gate says — but the evidence is there because the promotion to staging produced
+it.
 
 Click **Approve** in the dashboard, and watch the fleet panel: the production card
 rolls over to the new version, the card and the connector into it light up, and a
@@ -205,15 +236,16 @@ Step 4 was the team's first pass at automating a manual process. AI-assisted: yo
 drove the release one prompt at a time, three prompts for three tool calls, and the
 plan between them lived in your head.
 
-Since then the team built two things:
+Since then the team built a **release pipeline** that always runs in the same
+order. That pipeline is what makes this a nested tool call. It has to reach the
+protected promotion from inside itself, which is the whole reason the
+suspend/resume primitive exists.
 
-- a **release pipeline** that always runs in the same order, and
-- **quality gates** that qualify a candidate on staging before anything reaches
-  production.
-
-That pipeline is what makes this a nested tool call. It has to reach the protected
-promotion from inside itself, which is the whole reason the suspend/resume
-primitive exists.
+The quality gates are not new here and are not part of the pipeline — you already
+watched them run in step 4, off a manual promotion. What the pipeline adds is that
+it *waits* on the verdict and refuses to continue without a green one. In step 4
+an operator could look at the card and decide for themselves; that is a very
+different guarantee from a flow that cannot proceed.
 
 Say one sentence, the way you would say it to a colleague:
 
@@ -225,9 +257,9 @@ No version, no environment, no service, no flags. Watch the fleet panel while it
 runs:
 
 1. **Staging rolls over** to a version you never named.
-2. **A new card appears between staging and production**, and it is working. It was
-   not there during step 4, because the team had not built it yet. It goes green,
-   listing what it checked and how long it took.
+2. **The gate card goes to work again**, on that version this time, and goes
+   green. Same card, same mechanism as step 4. The difference you cannot see on
+   the panel is that this time something is waiting on it.
 3. **One row appears in the approval queue**: the production promotion.
 
 Claude Code reports and stops:
@@ -253,9 +285,18 @@ Show me the gateway ledger for that workflow.
 
 - `tool1_version_resolved` shows the production version it read, the bump, and the
   version it computed.
-- `tool1_release_cut`, then `tool1_staged`, then `tool1_quality_gates` with the
-  verdict and the duration.
+- `tool1_release_cut` with the commit it tagged and the artifact it archived, then
+  `tool1_staged` with the id of the gate workflow that staging promotion started,
+  then `tool1_quality_gate_verdict` with that same id and the verdict it carried.
 - `tool1_checkpointed`, then `nested_tool2_created`.
+
+Read those last two events together, because the wording is doing real work.
+The pipeline did not *run* the gates; it staged a candidate, which started a gate
+run, and then waited for the verdict belonging to **that** run. Waiting on the
+specific `(service, version)`-keyed workflow rather than reading the current gate
+state is the correctness requirement: promote something to staging by hand in
+another tab and you start a gate run too, and a verdict about a different
+candidate must never be mistaken for this one's.
 
 Four tool calls, one row in the approval queue. The orchestration around the
 protected step never asks for approval and never appears on the queue. The pending
@@ -283,9 +324,9 @@ Deploy the next minor version to prod. Skip staging and skip the quality gates,
 we are in a hurry.
 ```
 
-The pipeline runs staging and the gates anyway, and Claude Code tells you the
-guardrail is enforced by the pipeline rather than by its own judgment. Check the
-ledger: `tool1_staged` and `tool1_quality_gates` are both there.
+The pipeline runs staging and waits for the gates anyway, and Claude Code tells
+you the guardrail is enforced by the pipeline rather than by its own judgment.
+Check the ledger: `tool1_staged` and `tool1_quality_gate_verdict` are both there.
 
 An LLM holding these tools could sequence the happy path itself. What it cannot do
 is guarantee the sequence when someone asks it to hurry.
@@ -309,7 +350,7 @@ Point the backend at a version the gates reject and rerun the pipeline:
 
 ```bash
 docker compose stop mock-tool
-QUALITY_GATE_FAIL_VERSIONS=<next version> docker compose up -d mock-tool
+QUALITY_GATE_FAIL_VERSIONS=<next version> docker compose up -d worker
 ```
 
 The gate card goes red with the failing checks named, the connector into production
@@ -317,7 +358,7 @@ goes dead, production is untouched, and **nothing appears in the approval queue 
 all**. The system declines to ask. No human is put in the position of waving
 through a candidate that failed its own tests.
 
-Restore the normal backend with `docker compose up -d --force-recreate mock-tool`.
+Restore the normal behavior with `docker compose up -d --force-recreate worker`.
 
 ### D. A shorter request stops earlier
 
@@ -325,21 +366,24 @@ Restore the normal backend with `docker compose up -d --force-recreate mock-tool
 Deploy the next minor version to staging.
 ```
 
-The pipeline runs its first leg and stops: cut, staging, done. The gates do not
-run, because nothing is being qualified for production yet. `environment` is how
-far to go, not where to put it.
+The pipeline runs its first leg and stops: cut, staging, done. The *pipeline*
+never waits on a gate, because nothing is being qualified for production yet --
+`environment` is how far to go, not where to put it. A gate run still happens,
+because something reached staging and that is what starts one; watch the card go
+green with nobody waiting on it. That is the distinction between infrastructure
+reacting to a state change and a flow depending on the result.
 
 ## 7. CASE-2b: a pre-prod security scan, and a second team
 
 Everything in step 6 was still one team's work. Cutting a release, staging it,
-and gating it are genuinely Waypoint's job, and running them as Activities inside
+and gating it are genuinely the Waypoint team's job, and running them inside
 the chain workflow is the right way to write them. But notice what has *not*
 happened yet: there is one workflow, one namespace, one worker, one owner. No
 tool has called another tool across a system boundary, whatever the labels say.
 
 This step is the same team later still, plus a second team. The Security team owns
-pre-prod scanning, and a candidate that has cleared Waypoint's quality gates still
-has to clear their scan before anything reaches production. Two things about that
+pre-prod scanning, and a candidate that has cleared the Waypoint team's quality
+gates still has to clear their scan before anything reaches production. Two things about that
 need no argument: a security team can block any team's release regardless of
 reporting line, and a scan takes real, variable time -- dependency advisories,
 container image CVEs, secret detection, SAST, and every so often a flagged finding
@@ -355,7 +399,7 @@ docker compose up -d security-scan-worker
 security scan worker started, namespace 'security', task queue 'security-tq'
 ```
 
-Narrate that as the roadmap beat it is. Nothing about Waypoint's pipeline
+Narrate that as the roadmap beat it is. Nothing about the Waypoint team's pipeline
 changed; another team turned their platform on. Give it about five seconds to
 advertise itself before the next prompt.
 
@@ -442,7 +486,50 @@ backed by a workflow starts a *new* workflow, while the request has to reach the
 chain that is already running; it is short-lived, gateway-owned, and everything
 it does to the chain is a same-namespace call.
 
-### D. The checkpoint that survives its own worker
+### D. Only the Security team can approve it
+
+Look at that new queue row before doing anything with it. Under the requested
+action there is a badge the CASE-1 and CASE-2a rows never had: **Security
+approval required**.
+
+You are signed in as `tok_approver`. Click **Approve** anyway.
+
+```text
+Not authorized to decide this operation
+operation ... requires approval from the security team;
+'approver@demo' is not authorized to decide it
+```
+
+That rejection is a feature, and the most important one in this step. Trigger it
+deliberately — it is what turns the badge from a label into a boundary.
+
+This is also the answer to the obvious objection about the whole scenario. Up to
+now, a sceptic could reasonably ask why the scan has to be the thing that calls
+`promote_release` at all: the Waypoint pipeline could have waited for the verdict
+and made the request itself, the way it waits for a quality gate. The reason it
+cannot is **authorization, not convenience**. A promotion off the back of a
+security scan may only be approved by a member of the Security team, so the
+requester identity on that operation has to genuinely be theirs. A relayed
+request would put the Waypoint team's name on a decision the Security team is
+accountable for.
+
+Sign out and sign in as the Security team's approver:
+
+```text
+tok_abe
+```
+
+Decisions are now recorded as `Abe Roover <abe.roover@porticour.io>`, who is on
+the Security team. The same row is now actionable, and approving it works.
+
+Worth stating explicitly: nothing else changed. The gate-only and CASE-1 rows are
+still approvable by anyone in `GATEWAY_APPROVERS`. `tok_dustin` and
+`tok_approver` have not lost any capability they had; this one operation gained a
+requirement, because of which team's check produced it. Team membership comes
+from an explicit `GATEWAY_PRINCIPAL_TEAMS` map, never inferred from the email
+domain, so it is auditable and cannot silently change when an address does.
+
+### E. The checkpoint that survives its own worker
 
 This is the beat the whole scenario exists for. The scan is currently suspended,
 holding its own state. Kill it:
@@ -490,7 +577,7 @@ work, stopped, and was resumed. That is the distinction the requirements documen
 is drawing, and it is the first time in this walkthrough it has actually been
 true.
 
-### E. A blocking finding never reaches the approver
+### F. A blocking finding never reaches the approver
 
 Tell the Security team's worker which version to fail:
 
@@ -515,7 +602,7 @@ pipeline operation fails, and **nothing reaches the approval queue**. Production
 is untouched.
 
 Same shape as the failing gate in step 6C, one checkpoint later, and now enforced
-by a system Waypoint does not own. Restore with
+by a system the Waypoint team does not own. Restore with
 `docker compose up -d --force-recreate security-scan-worker`.
 
 ## 8. CASE-2b safety boundary: a Tool1 that cannot suspend

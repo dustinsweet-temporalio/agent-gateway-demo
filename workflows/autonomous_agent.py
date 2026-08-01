@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import timedelta, timezone, datetime
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, ChildWorkflowError
 
 with workflow.unsafe.imports_passed_through():
     from activities.gateway_activities import evaluate_policy, invoke_tool
@@ -23,12 +24,15 @@ with workflow.unsafe.imports_passed_through():
         Operation,
         OperationStatus,
         OperationView,
+        PromoteReleaseInput,
         ToolCallResponse,
     )
+    from workflows.release_children import PromoteReleaseChildWorkflow
 
 
 POLICY_TIMEOUT = timedelta(seconds=10)
 INVOKE_TIMEOUT = timedelta(seconds=60)
+RELEASE_CHILD_TIMEOUT = timedelta(minutes=5)
 
 
 @workflow.defn
@@ -295,6 +299,23 @@ class AutonomousAgentWorkflow:
     def get_workflow_owner(self) -> str:
         return self._input.owner_principal
 
+    @workflow.query
+    def get_required_approver_team(self, operation_id: str) -> str:
+        """No team restriction ever applies to an autonomous agent run.
+
+        Declared so the gateway can ask any workflow behind an approval queue
+        entry the same question without first working out which type it is. A
+        CASE-3 run promotes directly and is never gated by another Porticour
+        team's check, so there is no team whose approval it specifically needs;
+        the ordinary GATEWAY_APPROVERS membership check is the whole rule here.
+
+        Note this is about who may APPROVE. The ADK release agent
+        (release-agent@google-adk) is a requester and only ever a requester: it
+        is not in GATEWAY_APPROVERS, so it cannot approve anything, its own runs
+        included.
+        """
+        return ""
+
     async def _invoke_protected_action(self) -> None:
         if self._operation.status in {
             OperationStatus.REJECTED,
@@ -310,18 +331,20 @@ class AutonomousAgentWorkflow:
         }
         self._log("invoking")
         try:
-            result = await workflow.execute_activity(
-                invoke_tool,
-                InvokeToolInput(
-                    tool_name=self._operation.tool_name,
-                    arguments=self._operation.arguments,
-                    idempotency_key=self._operation.idempotency_key,
-                ),
-                start_to_close_timeout=INVOKE_TIMEOUT,
-                retry_policy=RetryPolicy(maximum_attempts=5),
-            )
-        except ActivityError as err:
+            result = await self._execute_protected_step()
+        except (ActivityError, ChildWorkflowError) as err:
             self._fail(str(err), "protected_action_failed")
+            return
+        # A promotion whose new instances failed their health check comes back
+        # as a completed workflow reporting a failed status rather than as a
+        # thrown error, because the promotion machinery worked: it declined to
+        # route traffic. The run still has to fail, or the dependent action
+        # would run off the back of a promotion that never went live.
+        if isinstance(result, dict) and result.get("status") == "failed":
+            self._fail(
+                str(result.get("reason") or result.get("message") or "step failed"),
+                "protected_action_failed",
+            )
             return
         self._protected_result = result
         self._operation.result = {"protected_action": result}
@@ -332,6 +355,52 @@ class AutonomousAgentWorkflow:
             "protected_action_executed": True,
         }
         self._log("protected_action_completed")
+
+    async def _execute_protected_step(self) -> dict:
+        """Run the approved action, in whichever shape that action has.
+
+        A promotion is a Child Workflow here for the same reason it is one in the
+        chain: it is four real steps -- deploy, health check, route, note -- and
+        an operator watching an autonomous run stall wants to see which one. The
+        same workflow type as CASE-1 and CASE-2a use, so a promotion means the
+        same thing however it was requested.
+
+        Nothing about the gate machinery follows from this. A CASE-3 run promotes
+        to production directly, never to staging, so it starts no quality gate
+        run and never waits on one, and nothing in this workflow consults a gate
+        verdict for any candidate.
+        """
+        if self._operation.tool_name == "promote_release":
+            promotion = await workflow.execute_child_workflow(
+                PromoteReleaseChildWorkflow.run,
+                PromoteReleaseInput(
+                    service=str(self._operation.arguments.get("service", "")),
+                    version=str(self._operation.arguments.get("version", "")),
+                    environment=str(
+                        self._operation.arguments.get("environment", "")
+                    ),
+                    idempotency_key=self._operation.idempotency_key,
+                ),
+                id=(
+                    f"promote-release::"
+                    f"{self._operation.arguments.get('service', '')}::"
+                    f"{self._operation.arguments.get('version', '')}::"
+                    f"{self._operation.arguments.get('environment', '')}::"
+                    f"{workflow.uuid4().hex[:8]}"
+                ),
+                execution_timeout=RELEASE_CHILD_TIMEOUT,
+            )
+            return dataclasses.asdict(promotion)
+        return await workflow.execute_activity(
+            invoke_tool,
+            InvokeToolInput(
+                tool_name=self._operation.tool_name,
+                arguments=self._operation.arguments,
+                idempotency_key=self._operation.idempotency_key,
+            ),
+            start_to_close_timeout=INVOKE_TIMEOUT,
+            retry_policy=RetryPolicy(maximum_attempts=5),
+        )
 
     async def _run_dependent_action(self) -> None:
         try:

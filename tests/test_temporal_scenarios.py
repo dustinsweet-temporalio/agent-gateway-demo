@@ -18,16 +18,26 @@ from common.models import (
     CancelOperation,
     ChainInput,
     CorrelationContext,
+    DeployBinariesInput,
     EvaluatePolicyInput,
+    HealthCheckInput,
     InvokeToolInput,
     NestedToolCallRequest,
     PolicyDecision,
+    PublishQualityGateInput,
+    QualityCheckInput,
     ResumeNestedRequest,
     ToolCallRequest,
     ToolCallResponse,
+    UpdateReleaseNotesInput,
+    UpdateRoutingInput,
 )
 from workflows.autonomous_agent import AutonomousAgentWorkflow
 from workflows.chain import AgenticChainWorkflow
+from workflows.release_children import (
+    PromoteReleaseChildWorkflow,
+    QualityGateChildWorkflow,
+)
 
 
 TASK_QUEUE = "test-agent-gateway"
@@ -77,6 +87,75 @@ async def fake_invoke_tool(input: InvokeToolInput) -> dict:
         "arguments": input.arguments,
         "executed": True,
     }
+
+
+# A promotion is a Child Workflow, so what used to be one invoke_tool call is
+# four Activities. These stand in for them: no HTTP, no demo-paced sleeps, and
+# the one step that actually makes a version live records itself as the logical
+# promote_release so the ACTIVITY_CALLS assertions below still read as a
+# sequence of tools rather than of implementation details.
+#
+# Nothing here starts a quality gate: these scenarios only ever promote to prod
+# or, in CASE-1's first beat, to staging, and the gate the staging landing
+# starts is a separate abandoned workflow that no assertion in this file waits
+# on. QualityGateChildWorkflow is registered anyway so that start succeeds.
+
+
+@activity.defn(name="deploy_binaries")
+async def fake_deploy_binaries(input: DeployBinariesInput) -> dict:
+    return {
+        "service": input.service,
+        "version": input.version,
+        "environment": input.environment,
+        "instance_ids": ["i-aaa", "i-bbb"],
+    }
+
+
+@activity.defn(name="health_check_new_instances")
+async def fake_health_check(input: HealthCheckInput) -> dict:
+    return {"healthy": True, "message": "healthy"}
+
+
+@activity.defn(name="update_traffic_routing")
+async def fake_update_traffic_routing(input: UpdateRoutingInput) -> dict:
+    arguments = {
+        "service": input.service,
+        "version": input.version,
+        "environment": input.environment,
+    }
+    ACTIVITY_CALLS.append(("promote_release", arguments))
+    return {
+        "tool_name": "promote_release",
+        "arguments": arguments,
+        "executed": True,
+        "previous_version": None,
+    }
+
+
+@activity.defn(name="update_release_notes")
+async def fake_update_release_notes(input: UpdateReleaseNotesInput) -> dict:
+    return {"message": "notes updated"}
+
+
+@activity.defn(name="run_quality_check")
+async def fake_run_quality_check(input: QualityCheckInput) -> dict:
+    return {"check_name": input.check_name, "passed": True}
+
+
+@activity.defn(name="publish_quality_gate_state")
+async def fake_publish_quality_gate_state(input: PublishQualityGateInput) -> dict:
+    return {"recorded": True}
+
+
+PROMOTION_ACTIVITIES = [
+    fake_deploy_binaries,
+    fake_health_check,
+    fake_update_traffic_routing,
+    fake_update_release_notes,
+    fake_run_quality_check,
+    fake_publish_quality_gate_state,
+]
+PROMOTION_WORKFLOWS = [PromoteReleaseChildWorkflow, QualityGateChildWorkflow]
 
 
 async def _environment() -> WorkflowEnvironment:
@@ -149,8 +228,12 @@ def test_case1_simple_approval_rejection_timeout_cancel_and_dedup() -> None:
             async with Worker(
                 env.client,
                 task_queue=TASK_QUEUE,
-                workflows=[AgenticChainWorkflow],
-                activities=[fake_evaluate_policy, fake_invoke_tool],
+                workflows=[AgenticChainWorkflow, *PROMOTION_WORKFLOWS],
+                activities=[
+                    fake_evaluate_policy,
+                    fake_invoke_tool,
+                    *PROMOTION_ACTIVITIES,
+                ],
             ):
                 workflow_id = f"wf-case1-{uuid.uuid4().hex[:8]}"
                 handle = await env.client.start_workflow(
@@ -224,7 +307,7 @@ def test_case1_simple_approval_rejection_timeout_cancel_and_dedup() -> None:
                 approved = await _wait_for_status(
                     handle, "op-approved", "completed"
                 )
-                assert approved.result["executed"] is True
+                assert approved.result["status"] == "completed"
                 assert [name for name, _ in ACTIVITY_CALLS] == [
                     "promote_release"
                 ]
@@ -345,8 +428,12 @@ def test_case2_controlled_resume_and_uncontrolled_fail_closed() -> None:
             async with Worker(
                 env.client,
                 task_queue=TASK_QUEUE,
-                workflows=[AgenticChainWorkflow],
-                activities=[fake_evaluate_policy, fake_invoke_tool],
+                workflows=[AgenticChainWorkflow, *PROMOTION_WORKFLOWS],
+                activities=[
+                    fake_evaluate_policy,
+                    fake_invoke_tool,
+                    *PROMOTION_ACTIVITIES,
+                ],
             ):
                 workflow_id = f"wf-case2-{uuid.uuid4().hex[:8]}"
                 handle = await env.client.start_workflow(
@@ -529,8 +616,13 @@ def test_case3_autonomous_checkpoint_resume_reject_and_expire() -> None:
                 workflows=[
                     AutonomousAgentWorkflow,
                     ApprovalCallbackReceiverWorkflow,
+                    *PROMOTION_WORKFLOWS,
                 ],
-                activities=[fake_evaluate_policy, fake_invoke_tool],
+                activities=[
+                    fake_evaluate_policy,
+                    fake_invoke_tool,
+                    *PROMOTION_ACTIVITIES,
+                ],
             ):
                 callback_workflow_id = (
                     f"wf-adk-session-{uuid.uuid4().hex[:8]}"

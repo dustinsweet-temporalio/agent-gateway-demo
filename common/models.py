@@ -124,11 +124,20 @@ class ToolCallResponse:
 
 @dataclass
 class ApprovalDecision:
-    """An approve or reject decision delivered to the chain workflow as a Signal."""
+    """An approve or reject decision delivered to the chain workflow as a Signal.
+
+    approver_team is resolved by the gateway from the validated bearer token at
+    the same moment the approver identity is, and carried here rather than
+    looked up in the Workflow, because team membership is environment-driven
+    configuration and Workflow code must not read it. The Workflow's job is to
+    enforce the match against Operation.required_approver_team, not to decide
+    who is on which team.
+    """
 
     operation_id: str
     approver: str
     reason: Optional[str] = None
+    approver_team: str = ""
 
 
 @dataclass
@@ -264,6 +273,216 @@ class ScanVerdict:
     detail: dict[str, Any] = field(default_factory=dict)
 
 
+# --------------------------------------------------------------------------
+# The Waypoint team's own release steps (CASE-1 and CASE-2a).
+#
+# cut_release and promote_release are Child Workflows rather than single
+# Activities, and the reason is not "organize code" or "reduce cost", both of
+# which would be bad reasons. Each is a distinct unit of work with several
+# genuinely separate steps, and running it as a child gives it its own Event
+# History, its own independently retryable steps, and its own workflow id in
+# the Web UI. That is what an operator actually wants to look at when a release
+# stalls: which step, not which tool call.
+#
+# These are the OPPOSITE case from SecurityScanWorkflow. That one is a peer in
+# another namespace because another Porticour team owns it. These are the
+# Waypoint team's own tooling, invoked by the Waypoint team's own gateway
+# workflow, in the same namespace on the same task queue. Same team, same
+# infrastructure, more depth.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class CutReleaseInput:
+    service: str
+    version: str
+    commit_sha: str = ""
+    # Threaded down to the sub-steps so a retried cut is deduplicated by the
+    # deployment backend rather than repeated.
+    idempotency_key: str = ""
+
+
+@dataclass
+class CutReleaseResult:
+    service: str
+    version: str
+    commit_sha: str = ""
+    tag: str = ""
+    artifact_ref: str = ""
+    artifact_bytes: int = 0
+    sha256: str = ""
+    message: str = ""
+
+
+@dataclass
+class TagCommitInput:
+    service: str
+    version: str
+    commit_sha: str = ""
+
+
+@dataclass
+class ArchiveArtifactsInput:
+    service: str
+    version: str
+    idempotency_key: str = ""
+
+
+@dataclass
+class CalculateHashesInput:
+    service: str
+    version: str
+    artifact_ref: str
+
+
+@dataclass
+class PromoteReleaseInput:
+    service: str
+    version: str
+    environment: str
+    idempotency_key: str = ""
+
+
+@dataclass
+class PromoteReleaseResult:
+    service: str
+    version: str
+    environment: str
+    status: str = "completed"
+    previous_version: Optional[str] = None
+    instance_ids: list[str] = field(default_factory=list)
+    reason: Optional[str] = None
+    message: str = ""
+    # Set only for a successful staging promotion. Whatever reached staging is
+    # evaluated by a quality gate workflow started from inside the promotion,
+    # and the caller needs its id to be able to wait on that specific
+    # (service, version) verdict rather than reading whatever the gate card
+    # happens to show. See QualityGateChildWorkflow.
+    quality_gate_workflow_id: str = ""
+
+
+@dataclass
+class DeployBinariesInput:
+    service: str
+    version: str
+    environment: str
+
+
+@dataclass
+class HealthCheckInput:
+    service: str
+    version: str
+    environment: str
+    instance_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class UpdateRoutingInput:
+    service: str
+    version: str
+    environment: str
+    instance_ids: list[str] = field(default_factory=list)
+    idempotency_key: str = ""
+
+
+@dataclass
+class UpdateReleaseNotesInput:
+    service: str
+    version: str
+    environment: str
+
+
+# --------------------------------------------------------------------------
+# Quality gates (Section 4 of the demo-ability addendum).
+#
+# A gate run is not part of the release pipeline's own sequence any more. It is
+# ambient infrastructure: whenever anything reaches staging, by any route, the
+# candidate that just landed there gets evaluated. Closer to a CI system
+# kicking off a test run on a push than to a pipeline step. CASE-1 benefits
+# from it without invoking, sequencing, or waiting on it; CASE-2a's pipeline
+# explicitly waits on the verdict for the exact version it staged.
+# --------------------------------------------------------------------------
+
+QUALITY_GATE_CHECKS = [
+    "e2e_tests",
+    "user_acceptance_tests",
+    "performance_tests",
+    "accessibility_tests",
+]
+
+
+@dataclass
+class QualityGateInput:
+    service: str
+    version: str
+    environment: str = "staging"
+    # "pass" | "fail". No third variant: the four checks run concurrently, so
+    # there is no meaningful "first stage versus later stage" distinction of the
+    # kind the security scan's sequential stages have.
+    scripted_outcome: str = "pass"
+
+
+@dataclass
+class QualityCheckInput:
+    service: str
+    version: str
+    check_name: str
+    scripted_outcome: str = "pass"
+
+
+@dataclass
+class QualityGateState:
+    status: str = "running"
+    service: str = ""
+    version: str = ""
+    environment: str = "staging"
+    checks: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class QualityGateResult:
+    service: str
+    version: str
+    status: str
+    environment: str = "staging"
+    checks: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class PublishQualityGateInput:
+    """Publish gate progress to the shared observability backend.
+
+    Visibility only, exactly like the security scan's own publish step: the
+    verdict does not depend on this landing, so a publish failure must never
+    fail a gate run.
+    """
+
+    service: str
+    version: str
+    environment: str
+    status: str
+    checks_completed: int
+    check_count: int
+    checks: list[dict[str, Any]] = field(default_factory=list)
+    gate_workflow_id: str = ""
+
+
+@dataclass
+class AwaitQualityGateInput:
+    """Wait for one specific (service, version) gate workflow's verdict.
+
+    The pipeline cannot read "whatever the gate card currently shows": a gate
+    workflow starts on every staging promotion from any source, so the card may
+    be showing an older candidate, or a newer one. This carries the workflow id
+    the promotion handed back plus the pair it must be about, and the Activity
+    refuses a verdict that does not match.
+    """
+
+    gate_workflow_id: str
+    service: str
+    version: str
+
+
 @dataclass
 class EvaluatePolicyInput:
     tool_name: str
@@ -328,6 +547,14 @@ class Operation:
     callback_workflow_id: str = ""
     callback_notified: bool = False
     origin_operation_id: str = ""
+    # The Porticour engineering team a human must belong to in order to approve
+    # this operation, or None for no team restriction. Set at creation time from
+    # which check gated the promotion: an Operation the Security team's scan
+    # asked for may only be approved by the Security team. Everything else --
+    # CASE-1's ordinary prod promotions, CASE-2a with no scan in play, CASE-3 --
+    # leaves this None and is approvable by any principal in GATEWAY_APPROVERS,
+    # exactly as before.
+    required_approver_team: Optional[str] = None
 
 
 @dataclass
@@ -359,6 +586,10 @@ class OperationView:
     controlled_tool: bool = True
     replay_safe: bool = False
     checkpoint: dict[str, Any] = field(default_factory=dict)
+    # Surfaced so the approval queue can label an entry a non-Security approver
+    # is not allowed to act on, rather than letting them find out by being
+    # refused.
+    required_approver_team: Optional[str] = None
 
 
 @dataclass

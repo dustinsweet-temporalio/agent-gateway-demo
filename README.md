@@ -32,6 +32,11 @@ Google ADK Web -> TemporalAdkSessionWorkflow -> MCP Activity
          Chain entity workflow            Autonomous-agent workflow
       (CASE-1, CASE-2a, CASE-2b)             (CASE-3 checkpoint)
                    |                                 |
+    child workflows, same namespace, same task queue:
+      CutReleaseChildWorkflow      tag / archive / hash
+      PromoteReleaseChildWorkflow  deploy / health / route / notes
+      QualityGateChildWorkflow     4 checks, started on any staging landing
+                   |                                 |
                    |  Nexus: start_security_scan     |
                    |  (endpoint "security")          |
                    +-------------------------------> SecurityScanWorkflow
@@ -75,6 +80,44 @@ target namespace and task queue; callers address it by name and learn neither.
   durable result. Uncontrolled Tool1 calls fail closed. An approved Tool2 is not
   executed until the caller explicitly retries, and replay is refused unless
   Tool1 advertised replay safety.
+- Porticour is the company; **Waypoint is one engineering team inside it**, the
+  one that owns the delivery-matching service and the release tooling in this
+  repo. The Security team is a peer. Every persona is `@porticour.io`, and which
+  team a persona belongs to is what decides who may approve what.
+- `cut_release` and `promote_release` are **Child Workflows**, in the same
+  namespace and on the same task queue as the chain that starts them, and this is
+  the deliberate contrast with the security scan below. A Child Workflow is the
+  right primitive here for the reasons that actually justify one: each of these is
+  several genuinely distinct steps (tag, archive, hash; deploy, health check,
+  route traffic, update notes), and running each as a child gives it its own Event
+  History, its own independently retryable steps, and its own id in the Web UI, so
+  a stalled release names the step rather than the tool call. Not "to organize
+  code" and not "to reduce cost", which would be bad reasons. Same team, same
+  infrastructure, more depth. `PromoteReleaseChildWorkflow` is
+  environment-agnostic and contains no approval-flavored step: whether a promotion
+  needs a human, and which human, stays a policy question at the gateway layer
+  above it.
+- **Quality gates are ambient, not a pipeline step.** Whenever a promotion lands
+  on staging, from any phase, `PromoteReleaseChildWorkflow` starts a
+  `QualityGateChildWorkflow` for whatever just landed there and abandons it, so
+  the promotion returns immediately and the gate runs alongside. Closer to CI
+  kicking off a test run on a push than to an orchestrated step. This is the one
+  place CASE-1 gains new machinery, and it is deliberately not sequencing: nothing
+  in CASE-1 blocks on the gate or acts on its result, an operator just has real
+  evidence on the dashboard before deciding. CASE-2a's pipeline does wait, on the
+  specific `(service, version)`-keyed gate workflow its own staging promotion
+  started, so a different candidate's verdict can never be read as its own.
+- **An operation gated by a Security scan may only be approved by the Security
+  team.** The operation carries `required_approver_team`, set at creation from the
+  caller service that asked for it, and the gateway refuses a decision from anyone
+  else with a 403 before the Signal is ever sent — the workflow enforces the same
+  rule again on the durable side, so a Signal sent directly cannot walk around the
+  UI. This is what makes CASE-2b's nested call load-bearing rather than
+  incidental: the Security team's own workflow is the only correct caller because
+  the requester identity on the operation has to genuinely reflect who is
+  accountable, not a decision relayed on their behalf. Everything else — CASE-1's
+  ordinary prod promotions, CASE-2a with no scan in play, CASE-3 — carries no team
+  restriction and is decided by any principal in `GATEWAY_APPROVERS`, unchanged.
 - The pre-prod security scan (CASE-2b) is a second, independently owned system,
   not a module. `SecurityScanWorkflow` runs in the `security` namespace, on the
   `security-tq` task queue, in a worker the gateway team does not deploy, from a
@@ -196,14 +239,18 @@ again.
   optional: `bump` defaults to `minor`, `service` to the demo service, and
   `environment` means how far to go rather than where to put it, defaulting to the
   full pipeline. Tool1 reads the version deployed in production, computes the next
-  one, cuts it, promotes it to staging, runs quality gates there, and only then
-  reaches the production promotion. If the gates fail the pipeline stops and no
-  approval is ever requested. Same nested-approval mechanics, flags, and statuses
-  as `run_nested_release`.
-- `run_quality_gates(service, version, environment)` qualifies a candidate on
-  staging. Deliberately **not** exposed as an MCP tool: the pipeline calls it
-  internally, so an agent cannot run the gates itself and then promote around
-  them. Its last result is what the dashboard's gate card renders.
+  one, cuts it, promotes it to staging, waits for the quality gate verdict on that
+  exact candidate, and only then reaches the production promotion. If the gates
+  fail the pipeline stops and no approval is ever requested. Same nested-approval
+  mechanics, flags, and statuses as `run_nested_release`.
+- Quality gates have no MCP tool and are not a pipeline step. Reaching staging is
+  what starts a gate run, from any phase, and `QualityGateChildWorkflow` evaluates
+  whatever just landed there. An agent cannot run the gates itself and then
+  promote around them, because there is nothing for it to call: the gate reacts to
+  the staging promotion rather than being invoked. What the pipeline does is wait
+  for the verdict belonging to the version it staged, keyed by
+  `(service, version)` so an unrelated candidate's result can never be mistaken
+  for its own.
 - The security scan has no MCP tool at all, and could not have one: it is not
   Agent Gateway's capability to expose. It is started by the pipeline in another
   team's namespace, and the only thing that surfaces on the MCP side is the
@@ -493,18 +540,31 @@ AI-assisted, one step at a time, three prompts for three tool calls, with the pl
 between them living in the operator's head.
 
 CASE-2 is the same team later. They built a release pipeline that always runs in
-the same order, and quality gates that qualify a candidate on staging before
-anything reaches production. That pipeline is what makes this a nested tool call:
-it has to reach the protected promotion from inside itself.
+the same order. That pipeline is what makes this a nested tool call: it has to
+reach the protected promotion from inside itself.
+
+The quality gates are not part of the pipeline and are not new here. They already
+ran in CASE-1, because they run whenever anything reaches staging. What CASE-2
+adds is a flow that *waits* on the verdict and refuses to continue without a green
+one — an operator in CASE-1 can look at the gate card and decide for themselves,
+which is a very different guarantee.
 
 1. Say `Deploy the next minor version.` No version, no environment, no service, no
    flags. Claude Code makes one call, to `run_release_orchestration`.
 2. Inside Tool1 the workflow reads the production version, computes the next one,
-   cuts it, promotes it to staging, and runs quality gates against staging. Every
-   step is an Activity, so the ledger shows `tool1_version_resolved`,
-   `tool1_release_cut`, `tool1_staged`, and `tool1_quality_gates`, and a Worker
-   restart mid-flow resumes rather than starting over. No prompting happens
-   between them.
+   cuts it, promotes it to staging, and waits for the gate verdict on that exact
+   candidate. The ledger shows `tool1_version_resolved`, `tool1_release_cut`,
+   `tool1_staged`, and `tool1_quality_gate_verdict`, and a Worker restart mid-flow
+   resumes rather than starting over. No prompting happens between them.
+
+   Note what the last of those events says. The pipeline did not run the gates;
+   promoting to staging started a gate run, the way it does for any staging
+   promotion from any phase, and the pipeline waited for the verdict belonging to
+   the version it just staged. Waiting on that specific run rather than reading
+   the current gate state is the correctness requirement: an operator promoting
+   something else by hand in another tab starts a gate run too, and a verdict
+   about a different candidate must never be mistaken for this one's. The gate
+   workflow id encodes `(service, version)` and the wait refuses a mismatch.
 3. Only once the candidate is green does the child `promote_release` operation
    appear. It is the only protected step and the only row on the approval queue:
    four tool calls, one decision. The approval card names the computed version,
@@ -520,25 +580,29 @@ it has to reach the protected promotion from inside itself.
 7. With `environment=staging` the pipeline runs its first leg and stops, skipping
    the gates because nothing is being qualified for production yet.
 8. With `tool1_mode=uncontrolled` the fail-closed and replay-safe retry behavior is
-   unchanged, but the cost is now visible. The replay finds the cut and the staging
-   promotion already done, because mutations are keyed once, and reruns the quality
-   gates, because a verdict from before the pause is not evidence about now.
+   unchanged, but the cost is now visible. The replay finds the cut already done,
+   because mutations are keyed once, and its staging promotion starts a fresh gate
+   run that it then waits on, because a verdict from before the pause is not
+   evidence about now.
 
-The dashboard's quality gate card is keyed on whether gate state exists, so it is
-absent for the whole of CASE-1 and appears the first time the pipeline reaches it.
-Restarting `mock-tool` restores that "before" state for the next run-through.
+The dashboard's quality gate card is on the page from the moment the containers
+start, in `idle` state, reading "no candidate staged yet". It is not a CASE-2
+capability that appears partway through: gates are standing infrastructure that
+react whenever anything reaches staging, so the very first CASE-1
+`promote_release(..., staging)` moves the card `idle -> running -> passed` on its
+own, with no pipeline involved.
 
 ### CASE-2b: a pre-prod security scan, owned by a different team
 
 Everything above is still one team's work. Cutting a release, staging it, and
-gating it are genuinely Waypoint's own job, and modelling those steps as ordinary
-Activities inside the chain workflow is the honest way to write them. Nothing so
-far is a nested call between two systems, whatever the labels say: there is one
-workflow, one namespace, one worker, one owner.
+gating it are genuinely the Waypoint team's own job, and modelling those steps as
+workflows inside the Waypoint team's own namespace is the honest way to write
+them. Nothing so far is a nested call between two systems, whatever the labels
+say: one namespace, one worker, one owner, whatever the depth.
 
 CASE-2b is the same team later still, plus a second team. The Security team owns
-pre-prod scanning, and a candidate that has cleared Waypoint's own quality gates
-still has to clear their scan before Agent Gateway will promote it. Two things
+pre-prod scanning, and a candidate that has cleared the Waypoint team's own
+quality gates still has to clear their scan before Agent Gateway will promote it. Two things
 about that need no argument from anyone: a security team can block any team's
 release regardless of reporting line, and a scan takes real, variable time --
 dependency advisories, container image CVEs, secret detection, SAST, and every so
@@ -660,6 +724,23 @@ docker compose up --build worker adk-agent
    cancel, or let the request expire. Dashy reports that terminal state
    automatically and neither external action is reported as successful.
 
+CASE-3 and the two additions above, stated explicitly rather than assumed:
+
+- **Quality gates do not apply.** A CASE-3 run promotes straight to production
+  and never touches staging, so it starts no gate run and waits on no verdict.
+  The version-keyed wait CASE-2a needs cannot leak a stale verdict into this path
+  because this path never reads one. The agent's tool allowlist also excludes the
+  pipeline tools entirely (`start_google_adk_release_run` and lifecycle reads
+  only), so it cannot reach `run_release_orchestration` even indirectly.
+- **The promotion is still a Child Workflow.** `AutonomousAgentWorkflow` runs its
+  approved `promote_release` through `PromoteReleaseChildWorkflow`, the same type
+  CASE-1 and CASE-2a use, so a promotion means the same four steps however it was
+  requested.
+- **`release-agent@google-adk` is a requester, never an approver.** It is not in
+  `GATEWAY_APPROVERS`, so it cannot decide anything, its own runs included, and
+  CASE-3 operations carry no `required_approver_team` for it or anyone else to
+  satisfy.
+
 If the browser disconnects while waiting, reopen the same ADK session and send
 `resume` or `check the status`; the web proxy reattaches to its saved Temporal
 workflow. See
@@ -690,14 +771,18 @@ rolls over, the card and the inbound connector light up, and a promotion into a
 protected environment also raises a toast. The rest of the page still refreshes on
 its five second reload, which pauses while a transition is playing.
 
-Two cards on that path exist only once the capability behind them has run. The
-quality gate card appears the first time the pipeline reaches its gates, and the
-security scan card appears the first time the Security team scans something, each
-animating into place between staging and production. Neither is a display toggle:
-the panel keys on whether the backend holds any state for them, so "the team has
-not built this yet" and "the team built it" are the same code path with different
-state. That is what lets one live run tell the roadmap in order. The security scan
-card is the only one that names an owner, because it is the only one that has a
+The two checkpoint cards on that path behave differently from each other, and the
+difference is the point. The quality gate card is always there, from container
+startup, showing `idle` until something reaches staging and then moving through
+`running` to `passed` or `failed` — gates are the Waypoint team's own standing
+infrastructure, and an empty card saying "no candidate staged yet" is the accurate
+picture rather than something to hide. The security scan card genuinely does not
+exist until the Security team scans something, and animates into place between the
+gate and production the first time they do. Not a display toggle: the panel keys
+on whether the backend holds any scan state, so "that team has not onboarded us
+yet" and "they have" are the same code path with different state. That is what
+lets one live run tell the roadmap in order. The security scan card is the only
+one that names an owner, because it is the only one that has a
 different one. Restarting `mock-tool` restores the "before" picture for both.
 
 `GET /fleet` is a read only projection of the same in-memory state the tools
@@ -844,11 +929,19 @@ Set via environment in `docker-compose.yml`.
 - `GATEWAY_MCP_ALLOWED_ORIGINS` comma-separated browser origins accepted by MCP
   DNS-rebinding protection. Defaults include local browser origins.
 - `GATEWAY_PRINCIPALS` JSON map of bearer token to requester identity, for
-  example `{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>"}`. When unset,
+  example `{"tok_dustin":"Dustin Sweet <dustin.sweet@porticour.io>"}`. When unset,
   the requester is reported as `claude-code (unverified)`.
 - `GATEWAY_APPROVERS` comma-separated principal identities authorized to review
   and decide operations. The compose demo authorizes `tok_approver`
   (`approver@demo`), `tok_dustin`, and `tok_abe`.
+- `GATEWAY_PRINCIPAL_TEAMS` JSON map of principal to Porticour engineering team,
+  for example `{"abe.roover@porticour.io":"security"}`. Keys may be the full
+  principal string or just the address inside it. Consulted only for an operation
+  that carries a required approver team, which today means an operation a
+  Security scan asked for; everything else is decided by any principal in
+  `GATEWAY_APPROVERS`. Explicit rather than inferred from the email domain on
+  purpose: an implicit rule would break silently the first time a persona's
+  address changed.
 - `MOCK_TOOL_URL` Downstream backend endpoint used by the invoke Activity.
 - `AGENT_GATEWAY_MCP_URL` streamable HTTP MCP endpoint used by the worker's
   Temporal MCP Activities. Compose sets it to `http://gateway:8080/mcp`.
@@ -908,15 +1001,24 @@ workflows/adk_session.py     long-lived ADK session, turn Updates, callback rece
 workflows/nexus_handlers.py  the gateway's Nexus front door for other teams
 workflows/protected_action.py  short-lived adapter: holds one external tool's
                             request open until a human decides
+workflows/release_children.py  the Waypoint team's own release steps as Child
+                            Workflows: CutReleaseChildWorkflow,
+                            PromoteReleaseChildWorkflow, and the always-visible
+                            QualityGateChildWorkflow a staging landing starts
 adk_agents/release_approval_agent/  Dashy agent, Temporal integration, Web proxy
 adk_agents/run_temporal_session.py  CLI client for the same ADK session workflow
-activities/gateway_activities.py  evaluate_policy, invoke_tool, and the two
-                            Activities that serve another team's Nexus request,
-                            both inside the gateway's own namespace
+activities/gateway_activities.py  evaluate_policy, invoke_tool, the individual
+                            steps inside the release Child Workflows, the
+                            version-keyed gate wait, and the two Activities that
+                            serve another team's Nexus request -- all inside the
+                            gateway's own namespace
 worker.py                   registers the workflow and activities
 gateway/server.py           MCP HTTP server, deployment tools, approver UI
 mock_tool/server.py         pretend deploy backend with idempotency and continuity
-tests/                      Temporal scenarios, gateway contract, and ADK agent tests
+tests/                      Temporal scenarios, gateway contract, and ADK agent
+                            tests. release_step_fakes.py stands in for the
+                            release Child Workflows' leaf steps so the suite
+                            keeps the orchestration and drops the sleeps.
 
 security_scan/              the Security team's pre-prod scanning platform. A
                             separate package, a separate namespace, a separate
@@ -927,8 +1029,9 @@ security_scan/              the Security team's pre-prod scanning platform. A
   nexus_handlers.py         their Nexus front door: start_security_scan
   security_scan_workflow.py SecurityScanWorkflow: the stages, the nested call,
                             and the suspension that outlives their worker
-  security_scan_activities.py  one scan stage, and reporting progress for the
-                            dashboard
+  security_scan_activities.py  one scan stage, the three sub-steps
+                            dependency_scan is made of, and reporting progress
+                            for the dashboard
   worker.py                 security-tq worker and its capability heartbeat
   legacy_security_scan_script.py  the uncontrolled Tool1: a plain process, no
                             temporalio

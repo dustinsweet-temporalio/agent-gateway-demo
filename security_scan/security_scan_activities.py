@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import os
+import time
 from typing import Any
 
 import requests
@@ -9,6 +11,9 @@ from temporalio.exceptions import ApplicationError
 
 from security_scan.models import (
     SCAN_FINDING_SEVERITY_THRESHOLD,
+    CheckCveInput,
+    CheckLicenseInput,
+    GenerateSbomInput,
     PublishScanStateInput,
     ScanCheckInput,
     severity_at_or_above,
@@ -52,18 +57,15 @@ def run_scan_check(input: ScanCheckInput) -> dict[str, Any]:
     """Run one scan stage and judge it against the severity threshold.
 
     Deterministic and scripted, because a demo that runs a real scanner cannot be
-    rehearsed. In a real Security platform this is where the dependency, image,
-    secret, and SAST scanners get invoked; the shape of the result is the same
-    either way, and so is everything the workflow does with it.
+    rehearsed. In a real Security platform this is where the image, secret, and
+    SAST scanners get invoked; the shape of the result is the same either way,
+    and so is everything the workflow does with it.
+
+    Stage 1, dependency_scan, does not come through here: it has internal
+    structure of its own (see generate_sbom, check_cve_database and
+    check_license_compliance) and is sequenced directly by the workflow.
     """
-    severities = SCHEDULE.get(input.scripted_outcome)
-    if severities is None:
-        raise ApplicationError(
-            f"unknown scripted_outcome {input.scripted_outcome!r}; expected one "
-            f"of {sorted(SCHEDULE)}",
-            non_retryable=True,
-        )
-    max_severity = severities[min(input.stage_number - 1, len(severities) - 1)]
+    max_severity = _scripted_severity(input.scripted_outcome, input.stage_number)
     blocking = severity_at_or_above(max_severity, SCAN_FINDING_SEVERITY_THRESHOLD)
     result = {
         "stage": input.stage_number,
@@ -85,6 +87,90 @@ def run_scan_check(input: ScanCheckInput) -> dict[str, Any]:
         result["passed"],
     )
     return result
+
+
+def _scripted_severity(scripted_outcome: str, stage_number: int) -> str:
+    severities = SCHEDULE.get(scripted_outcome)
+    if severities is None:
+        raise ApplicationError(
+            f"unknown scripted_outcome {scripted_outcome!r}; expected one "
+            f"of {sorted(SCHEDULE)}",
+            non_retryable=True,
+        )
+    return severities[min(stage_number - 1, len(severities) - 1)]
+
+
+# ------------------------------------------------- dependency_scan sub-stages
+#
+# The three steps stage 1 is actually made of. Each is its own Activity so a
+# worker restart part-way through resumes at the next un-run step rather than
+# re-resolving the whole dependency tree, and so Event History says which part
+# of the dependency scan was running when something went wrong.
+
+
+@activity.defn
+def generate_sbom(input: GenerateSbomInput) -> dict[str, Any]:
+    """Resolve the transitive dependency tree into an SBOM.
+
+    The longest of the three, because real transitive resolution is: everything
+    downstream is a lookup against what this produces.
+    """
+    time.sleep(1.5)
+    digest = hashlib.sha256(
+        f"sbom::{input.service}::{input.version}".encode()
+    ).hexdigest()
+    sbom_ref = f"sbom://{input.service}/{input.version}/{digest[:12]}"
+    dependency_count = 180 + int(digest[:4], 16) % 240
+    activity.logger.info(
+        "resolved %s transitive dependencies into %s",
+        dependency_count,
+        sbom_ref,
+    )
+    return {
+        "service": input.service,
+        "version": input.version,
+        "sbom_ref": sbom_ref,
+        "dependency_count": dependency_count,
+    }
+
+
+@activity.defn
+def check_cve_database(input: CheckCveInput) -> dict[str, Any]:
+    """Check the SBOM against the advisory feed.
+
+    The single controllable failure lever for the whole dependency_scan stage:
+    the top-level scripted_outcome resolves to a severity here and nowhere else,
+    so what fails the stage is exactly what the presenter chose.
+    """
+    time.sleep(1.0)
+    max_severity = _scripted_severity(input.scripted_outcome, input.stage_number)
+    blocking = severity_at_or_above(max_severity, SCAN_FINDING_SEVERITY_THRESHOLD)
+    return {
+        "check": "check_cve_database",
+        "sbom_ref": input.sbom_ref,
+        "findings": 1 if blocking else 0,
+        "max_severity": max_severity,
+        "passed": not blocking,
+    }
+
+
+@activity.defn
+def check_license_compliance(input: CheckLicenseInput) -> dict[str, Any]:
+    """Check the same SBOM's licences against the allowed list.
+
+    Always clean, on purpose and regardless of scripted_outcome. Scripting this
+    to fail as well would give dependency_scan two independent reasons to go red
+    that could disagree with each other, and there is no narrative in the demo
+    that would explain which one the audience is looking at.
+    """
+    time.sleep(1.0)
+    return {
+        "check": "check_license_compliance",
+        "sbom_ref": input.sbom_ref,
+        "findings": 0,
+        "max_severity": "none",
+        "passed": True,
+    }
 
 
 @activity.defn

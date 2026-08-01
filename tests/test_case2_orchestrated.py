@@ -10,6 +10,12 @@ The invoke_tool fake here delegates to the real deployment backend in
 mock_tool.server rather than returning a canned dict, so what the orchestrator
 reads back is what the real tool would say: prod really is on 2.2.0, a minor bump
 really lands on 2.3.0, and cutting the same version twice really is a no-op.
+
+Cutting and promoting are Child Workflows, so the real steps inside them are
+swapped for the fakes in tests/release_step_fakes.py. The children themselves,
+the gate run a staging landing triggers, and the pipeline's version-keyed wait on
+that gate are all real here; only the leaf Activities are stubbed, to drop the
+HTTP calls and the demo-paced sleeps.
 """
 
 from __future__ import annotations
@@ -25,6 +31,8 @@ from temporalio.client import WorkflowHandle
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+import activities.gateway_activities as gateway_activities
+from activities.gateway_activities import await_quality_gate
 from common.models import (
     ApprovalDecision,
     ChainInput,
@@ -37,29 +45,38 @@ from common.models import (
     ToolCallResponse,
 )
 from mock_tool import server as backend
+from tests import release_step_fakes
+from tests.release_step_fakes import RELEASE_STEP_ACTIVITIES, TOOL_CALLS
 from workflows.chain import AgenticChainWorkflow
+from workflows.release_children import (
+    CutReleaseChildWorkflow,
+    PromoteReleaseChildWorkflow,
+    QualityGateChildWorkflow,
+)
 
 TASK_QUEUE = "test-agent-gateway-orchestrated"
 SERVICE = "delivery-matching-service"
 PRINCIPAL = "requester@example.com"
 
-# (tool_name, arguments, idempotency_key) for every downstream tool invocation.
-INVOKE_CALLS: list[tuple[str, dict, str]] = []
+# (tool_name, arguments, idempotency_key) for every downstream tool invocation,
+# whether it ran as an Activity or as a step inside a release Child Workflow.
+INVOKE_CALLS = TOOL_CALLS
 
 # The seeded fleet, captured before any test mutates it. Both dicts are module
 # state in mock_tool.server, so each test restores them.
 _PRISTINE_DEPLOYED = copy.deepcopy(backend._deployed)
 _PRISTINE_RELEASES = copy.deepcopy(backend._releases)
+_IDLE_GATES = copy.deepcopy(backend._quality_gates)
 
 
 def _reset_backend() -> None:
-    INVOKE_CALLS.clear()
+    release_step_fakes.reset()
     backend._deployed.clear()
     backend._deployed.update(copy.deepcopy(_PRISTINE_DEPLOYED))
     backend._releases.clear()
     backend._releases.update(copy.deepcopy(_PRISTINE_RELEASES))
     backend._seen.clear()
-    backend._quality_gates = None
+    backend._quality_gates = copy.deepcopy(_IDLE_GATES)
 
 
 def _tool_names() -> list[str]:
@@ -70,6 +87,25 @@ def _call(tool_name: str) -> tuple[str, dict, str]:
     matches = [entry for entry in INVOKE_CALLS if entry[0] == tool_name]
     assert matches, f"{tool_name} was never invoked; calls were {_tool_names()}"
     return matches[0]
+
+
+async def _wait_for_gate(status: str = "passed", timeout: float = 10) -> dict:
+    """Wait for the backend's gate projection to reach a terminal status.
+
+    A gate run is started by the staging promotion and abandoned, so nothing in
+    the pipeline path waits on it except the pipeline's own explicit wait. A
+    test that wants to assert on the card has to wait for it the way the
+    dashboard's poll would.
+    """
+
+    async def poll() -> dict:
+        while True:
+            gate = backend._quality_gates
+            if gate and gate.get("status") == status:
+                return dict(gate)
+            await asyncio.sleep(0.02)
+
+    return await asyncio.wait_for(poll(), timeout=timeout)
 
 
 @activity.defn(name="evaluate_policy")
@@ -103,36 +139,45 @@ async def backend_invoke_tool(input: InvokeToolInput) -> dict:
     replay-safe retry path leans on, so the fake has to reproduce it rather than
     assume it.
     """
-    INVOKE_CALLS.append(
-        (input.tool_name, dict(input.arguments), input.idempotency_key)
+    return release_step_fakes.backend_call(
+        input.tool_name, dict(input.arguments), input.idempotency_key
     )
-    key = input.idempotency_key
-    if key and key in backend._seen:
-        prior = dict(backend._seen[key])
-        prior["idempotent_replay"] = True
-        return prior
-    result = backend._handle(input.tool_name, dict(input.arguments))
-    result["idempotent_replay"] = False
-    if key:
-        backend._seen[key] = result
-    return result
 
 
 async def _environment() -> WorkflowEnvironment:
     temporal = shutil.which("temporal")
     assert temporal, "Temporal CLI is required for workflow tests"
-    return await WorkflowEnvironment.start_local(
+    env = await WorkflowEnvironment.start_local(
         dev_server_existing_path=temporal,
         dev_server_log_level="error",
     )
+    # await_quality_gate is the one release Activity kept real, and it opens its
+    # own client to wait on a specific gate workflow. Point it at this test
+    # server, the same way tests/test_case2b_security_scan.py does for the
+    # gateway's own cross-workflow Activities.
+    gateway_activities.TEMPORAL_ADDRESS = (
+        env.client.service_client.config.target_host
+    )
+    gateway_activities.TEMPORAL_NAMESPACE = env.client.namespace
+    return env
 
 
 def _worker(env: WorkflowEnvironment) -> Worker:
     return Worker(
         env.client,
         task_queue=TASK_QUEUE,
-        workflows=[AgenticChainWorkflow],
-        activities=[fake_evaluate_policy, backend_invoke_tool],
+        workflows=[
+            AgenticChainWorkflow,
+            CutReleaseChildWorkflow,
+            PromoteReleaseChildWorkflow,
+            QualityGateChildWorkflow,
+        ],
+        activities=[
+            fake_evaluate_policy,
+            backend_invoke_tool,
+            await_quality_gate,
+            *RELEASE_STEP_ACTIVITIES,
+        ],
     )
 
 
@@ -246,17 +291,20 @@ async def _prod_requires_approval_for_the_computed_version(
     )
 
     # Tool1 ran the team's whole pipeline: read production (seeded at 2.2.0),
-    # computed the next minor, cut it, put it on staging, and qualified it there.
-    # The canned prepare tool is gone from this path.
-    # ...and then looked for a security scan provider, found none registered, and
-    # opened the production promotion itself. That last step is CASE-2a: with
+    # computed the next minor, cut it, and put it on staging. Landing on staging
+    # started a gate run, which the pipeline then waited on.
+    # ...and then it looked for a security scan provider, found none registered,
+    # and opened the production promotion itself. That last step is CASE-2a: with
     # the Security team's platform not running, the pipeline behaves exactly as it
     # did before the scan existed.
+    #
+    # Note there is no "run_quality_gates" call. There is no such tool any more:
+    # the gates are a Child Workflow the staging promotion starts, not something
+    # the pipeline invokes.
     assert _tool_names() == [
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
         "get_security_scan_status",
     ]
     assert "release_orchestrator_prepare" not in _tool_names()
@@ -272,14 +320,12 @@ async def _prod_requires_approval_for_the_computed_version(
         "version": "2.3.0",
         "environment": "staging",
     }
-    assert _call("run_quality_gates")[1] == {
-        "service": SERVICE,
-        "version": "2.3.0",
-        "environment": "staging",
-    }
     assert (SERVICE, "2.3.0") in backend._releases
     assert backend._deployed["staging"]["version"] == "2.3.0"
+    # The gate card reflects the candidate that was staged, and it is green.
     assert backend._quality_gates["status"] == "passed"
+    assert backend._quality_gates["version"] == "2.3.0"
+    assert len(backend._quality_gates["checks"]) == 4
 
     # The protected promotion is the only thing that reached the approver, and it
     # names the version Tool1 computed.
@@ -310,10 +356,25 @@ async def _prod_requires_approval_for_the_computed_version(
     prepare_result = parent.checkpoint["tool1_prepare_result"]
     assert prepare_result["current_version"] == "2.2.0"
     assert prepare_result["version"] == "2.3.0"
-    assert prepare_result["cut_release_result"]["already_cut"] is False
+    # The cut is a Child Workflow now, so its result carries what the three
+    # steps produced rather than a single tool's response.
+    cut_result = prepare_result["cut_release_result"]
+    assert cut_result["commit_sha"]
+    assert cut_result["artifact_ref"]
+    assert cut_result["sha256"]
     # The expensive part of the pipeline is in the checkpoint, waiting on a human.
-    assert prepare_result["quality_gate_result"]["passed"] is True
-    assert prepare_result["staging_promotion_result"]["promoted"] is True
+    staged_result = prepare_result["staging_promotion_result"]
+    assert staged_result["status"] == "completed"
+    assert staged_result["previous_version"] == "2.2.0"
+    # The pipeline waited on the gate its OWN staging promotion started, not on
+    # whatever gate happened to have run most recently.
+    gate_result = prepare_result["quality_gate_result"]
+    assert gate_result["passed"] is True
+    assert gate_result["version"] == "2.3.0"
+    assert gate_result["gate_workflow_id"] == staged_result[
+        "quality_gate_workflow_id"
+    ]
+    assert "2.3.0" in gate_result["gate_workflow_id"]
     # Production is untouched: cut, staged, and gated, but not promoted.
     assert backend._deployed["prod"]["version"] == "2.2.0"
 
@@ -327,12 +388,11 @@ async def _prod_requires_approval_for_the_computed_version(
     completed = await _wait_for_status(handle, "prod-minor-parent", "completed")
 
     assert completed.result["resumed_from_checkpoint"] is True
-    assert completed.result["tool2_result"]["promoted"] is True
+    assert completed.result["tool2_result"]["status"] == "completed"
     assert _tool_names() == [
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
         "get_security_scan_status",
         "promote_release",
         "release_orchestrator_resume",
@@ -348,21 +408,31 @@ async def _prod_requires_approval_for_the_computed_version(
 
     ledger = await handle.query(AgenticChainWorkflow.get_ledger)
     events = {entry.event for entry in ledger}
+    # tool1_quality_gate_verdict, not tool1_quality_gates: the pipeline read a
+    # verdict, it did not run a check.
     assert {
         "tool1_version_resolved",
         "tool1_release_cut",
         "tool1_staged",
-        "tool1_quality_gates",
+        "tool1_quality_gate_verdict",
         "tool1_checkpointed",
         "waiting_for_approval",
         "approved",
         "tool1_completed",
     }.issubset(events)
+    assert "tool1_quality_gates" not in events
     resolved = next(
         entry for entry in ledger if entry.event == "tool1_version_resolved"
     )
     assert resolved.detail["current_version"] == "2.2.0"
     assert resolved.detail["resolved_version"] == "2.3.0"
+    verdict = next(
+        entry for entry in ledger if entry.event == "tool1_quality_gate_verdict"
+    )
+    assert verdict.detail["passed"] is True
+    assert verdict.detail["version"] == "2.3.0"
+    # The prod promotion carries no team restriction: no Security scan gated it.
+    assert child.required_approver_team is None
 
 
 async def _staging_target_runs_the_first_leg_only(env: WorkflowEnvironment) -> None:
@@ -381,16 +451,27 @@ async def _staging_target_runs_the_first_leg_only(env: WorkflowEnvironment) -> N
 
     # No approval anywhere in this flow, and no waiting state to poll.
     assert response.status == "completed"
-    # A staging target stops after staging, so the gates do not run: nothing is
-    # being qualified for production yet. The gate card therefore stays absent.
+    # A staging target stops after staging: the pipeline never waits on a gate,
+    # because nothing is being qualified for production yet.
     assert _tool_names() == [
         "get_deployed_version",
         "cut_release",
         "promote_release",
         "release_orchestrator_resume",
     ]
-    assert "run_quality_gates" not in _tool_names()
-    assert backend._quality_gates is None
+    ledger = await handle.query(AgenticChainWorkflow.get_ledger)
+    assert not [
+        entry
+        for entry in ledger
+        if entry.event == "tool1_quality_gate_verdict"
+    ]
+    # A gate run still HAPPENS, though, because something reached staging, and
+    # that is the point of the redesign: the gate reacts to the landing rather
+    # than to the pipeline. It just runs alongside, with nobody waiting on it.
+    child_view = await _operation_view(handle, "staging-bugfix-child")
+    assert child_view.result["quality_gate_workflow_id"]
+    gate = await _wait_for_gate("passed")
+    assert gate["version"] == "2.2.1"
     # Still bumped from production, not from staging.
     assert _call("get_deployed_version")[1] == {"environment": "prod"}
     assert _call("cut_release")[1]["version"] == "2.2.1"
@@ -436,7 +517,6 @@ async def _duplicate_call_dedups_without_a_second_cut(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
         "get_security_scan_status",
     ]
     ledger = await handle.query(AgenticChainWorkflow.get_ledger)
@@ -537,10 +617,10 @@ async def _uncontrolled_without_replay_safety_stays_blocked(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
     ]
     assert backend._deployed["staging"]["version"] == "2.3.0"
     assert backend._deployed["prod"]["version"] == "2.2.0"
+    assert backend._quality_gates["status"] == "passed"
 
 
 async def _replay_safe_retry_reverifies_without_remutating(
@@ -550,8 +630,9 @@ async def _replay_safe_retry_reverifies_without_remutating(
 
     This is the whole argument for a suspension-aware Tool1, priced. Mutations are
     keyed once, so the cut and the staging promotion are found already done. The
-    verification is keyed per pass, so the candidate is re-qualified rather than
-    promoted on a verdict from before the pause.
+    gate is not keyed at all: the replay's own staging promotion starts a fresh
+    gate run and the replay waits on that one, so the candidate is re-qualified
+    rather than promoted on a verdict from before the pause.
     """
     _reset_backend()
     handle = await _start_chain(env, "orch-replayable")
@@ -571,11 +652,13 @@ async def _replay_safe_retry_reverifies_without_remutating(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
     ]
     first_cut_at = backend._releases[(SERVICE, "2.3.0")]["cut_at"]
     releases_after_first_cut = len(backend._releases)
-    first_gate_started = backend._quality_gates["started_at"]
+    first_view = await _operation_view(handle, "replay-minor-parent")
+    first_gate_id = first_view.checkpoint["tool1_prepare_result"][
+        "quality_gate_result"
+    ]["gate_workflow_id"]
 
     await handle.signal(
         AgenticChainWorkflow.approve_operation,
@@ -603,11 +686,9 @@ async def _replay_safe_retry_reverifies_without_remutating(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
         "promote_release",
         "release_orchestrator_resume",
     ]
@@ -618,7 +699,6 @@ async def _replay_safe_retry_reverifies_without_remutating(
         for entry in INVOKE_CALLS
         if entry[0] == "promote_release" and entry[1]["environment"] == "staging"
     ]
-    gates = [entry for entry in INVOKE_CALLS if entry[0] == "run_quality_gates"]
 
     # Mutations: same idempotency key on both passes, so the second call is a
     # replay of the first and the effect is applied once.
@@ -628,16 +708,19 @@ async def _replay_safe_retry_reverifies_without_remutating(
     assert backend._releases[(SERVICE, "2.3.0")]["cut_at"] == first_cut_at
     assert backend._deployed["staging"]["promotions"] == 1
 
-    # Verification: different keys, so the gates genuinely ran again. That is the
-    # cost of a Tool1 that could not hold the pause.
-    assert gates[0][2] != gates[1][2]
-    assert backend._quality_gates["started_at"] != first_gate_started
-
     replay_view = await _operation_view(handle, "replay-minor-parent")
     replayed = replay_view.checkpoint["tool1_replay_result"]
-    assert replayed["cut_release_result"]["idempotent_replay"] is True
-    assert replayed["staging_promotion_result"]["idempotent_replay"] is True
-    assert replayed["quality_gate_result"]["idempotent_replay"] is False
+    assert replayed["cut_release_result"]["service"] == SERVICE
+    assert replayed["staging_promotion_result"]["status"] == "completed"
+    # Verification: the replay's own staging promotion started a NEW gate run
+    # and the replay waited on that one, so the promotion is not going ahead on
+    # a verdict from before the pause. That is the cost of a Tool1 that could
+    # not hold it.
+    replay_gate_id = replayed["quality_gate_result"]["gate_workflow_id"]
+    assert replay_gate_id != first_gate_id
+    assert replay_gate_id == replayed["staging_promotion_result"][
+        "quality_gate_workflow_id"
+    ]
     assert replayed["quality_gate_result"]["passed"] is True
 
     # Tool2 still ran exactly once, on the approved version.
@@ -663,7 +746,7 @@ def test_case2_orchestrated_failing_gates_never_reach_the_approver() -> None:
             async with _worker(env):
                 _reset_backend()
                 # prod 2.2.0, minor bump -> 2.3.0, which this run fails.
-                backend.QUALITY_GATE_FAIL_VERSIONS.add("2.3.0")
+                release_step_fakes.QUALITY_GATE_FAIL_VERSIONS.add("2.3.0")
                 try:
                     handle = await _start_chain(env, "orch-gatefail")
                     response = await handle.execute_update(
@@ -676,20 +759,20 @@ def test_case2_orchestrated_failing_gates_never_reach_the_approver() -> None:
                         ),
                     )
                 finally:
-                    backend.QUALITY_GATE_FAIL_VERSIONS.discard("2.3.0")
+                    release_step_fakes.QUALITY_GATE_FAIL_VERSIONS.discard("2.3.0")
 
                 assert response.status == "failed"
                 assert "quality gates failed" in response.reason.lower()
-                # The pipeline stopped at the gate. Production was never promoted
-                # and the target promotion was never even created.
+                # The pipeline stopped on the verdict. Production was never
+                # promoted and the target promotion was never even created.
                 assert _tool_names() == [
                     "get_deployed_version",
                     "cut_release",
                     "promote_release",
-                    "run_quality_gates",
                 ]
                 assert backend._deployed["prod"]["version"] == "2.2.0"
                 assert backend._quality_gates["status"] == "failed"
+                assert backend._quality_gates["version"] == "2.3.0"
 
                 parent = await _operation_view(handle, "gatefail-minor-parent")
                 assert parent.status == "failed"
@@ -733,8 +816,18 @@ def test_case2_orchestrated_refuses_when_policy_protects_staging() -> None:
             async with Worker(
                 env.client,
                 task_queue=TASK_QUEUE,
-                workflows=[AgenticChainWorkflow],
-                activities=[protect_everything, backend_invoke_tool],
+                workflows=[
+                    AgenticChainWorkflow,
+                    CutReleaseChildWorkflow,
+                    PromoteReleaseChildWorkflow,
+                    QualityGateChildWorkflow,
+                ],
+                activities=[
+                    protect_everything,
+                    backend_invoke_tool,
+                    await_quality_gate,
+                    *RELEASE_STEP_ACTIVITIES,
+                ],
             ):
                 _reset_backend()
                 handle = await _start_chain(env, "orch-policyconflict")

@@ -53,12 +53,28 @@ _releases: dict[tuple[str, str], dict] = {
 }
 _autonomous_followups: set[str] = set()
 
-# Last quality gate run, or None if the gates have never run. None is meaningful:
-# the fleet panel renders the gate card only once this exists, so the card is
-# absent for the whole of CASE-1 and appears the first time the CASE-2 pipeline
-# reaches it. That is the narrative, not a demo toggle: the capability shows up
-# when the team builds it. Restarting this service restores the "before" picture.
-_quality_gates: dict | None = None
+# The quality gate card's state, and it is never absent. Gates are not a CASE-2
+# capability that appears partway through the demo any more: they are ambient
+# infrastructure that reacts to anything reaching staging, so the card is on the
+# dashboard from container startup, honestly reporting that nothing has been
+# staged yet. It moves to running the first time any promotion reaches staging,
+# by any route, including a CASE-1 manual one.
+#
+# Contrast the security scan below, which IS still absent until it first runs,
+# because a scan really is another team's capability that gets switched on
+# mid-demo.
+_IDLE_GATES = {
+    "status": "idle",
+    "service": None,
+    "version": None,
+    "environment": None,
+    "checks": [],
+    "checks_completed": 0,
+    "check_count": 4,
+    "gate_workflow_id": "",
+    "updated_at": _BOOT,
+}
+_quality_gates: dict = dict(_IDLE_GATES)
 
 # Last security scan, or None if a scan has never run. Same contract as
 # _quality_gates above: the fleet panel renders the security scan card only once
@@ -72,21 +88,14 @@ _scan: dict | None = None
 # entry goes stale on its own once it stops, so the capability disappears when
 # their platform goes away rather than lingering as an advertisement for something
 # nobody is serving. This is the shared platform's service registry, and it is
-# what makes "the Security team onboarded Waypoint" a thing that happens by
+# what makes "the Security team onboarded the Waypoint team" a thing that happens by
 # starting their container rather than by editing a config flag.
 _scan_provider: dict | None = None
 
-# How long a gate run takes. Long enough to watch the card work and to trip the
-# gateway's sync budget honestly, short enough to stay well inside the invoke
-# Activity's request timeout.
-QUALITY_GATE_SECONDS = float(os.getenv("QUALITY_GATE_SECONDS", "12"))
-# Demo knob: gates fail for these versions, so the fail-closed path can be shown
-# on demand. Empty by default, so gates pass.
-QUALITY_GATE_FAIL_VERSIONS = {
-    item.strip()
-    for item in os.getenv("QUALITY_GATE_FAIL_VERSIONS", "").split(",")
-    if item.strip()
-}
+# How long a gate run takes is no longer this backend's business. The four
+# checks are Activities inside QualityGateChildWorkflow, each with its own fixed
+# duration, and QUALITY_GATE_FAIL_VERSIONS is read there too. All this service
+# does now is hold the latest published state so the dashboard can draw it.
 
 # Idempotency store keyed by the Idempotency-Key header. A replayed activity
 # attempt with the same key returns the original result and does not apply the
@@ -100,52 +109,12 @@ SLOW_CUT_VERSION = os.getenv("SLOW_CUT_VERSION", "2.3.1")
 SLOW_CUT_DELAY_SECONDS = float(os.getenv("SLOW_CUT_DELAY_SECONDS", "8"))
 
 
-def _gate_checks(version: str, passing: bool) -> list[dict]:
-    """The individual checks shown on the gate card and the approval request.
-
-    Fixed content: this is a demo backend, and the point is that the approver has
-    concrete evidence in front of them, not that the numbers are real.
-    """
-    if passing:
-        return [
-            {"name": "functional tests", "detail": "412 passed", "ok": True},
-            {"name": "user acceptance tests", "detail": "38 scenarios passed", "ok": True},
-            {"name": "performance tests", "detail": "p99 180ms, within budget", "ok": True},
-            {"name": "security scan", "detail": "no new findings", "ok": True},
-        ]
-    return [
-        {"name": "functional tests", "detail": "412 passed", "ok": True},
-        {"name": "user acceptance tests", "detail": "3 scenarios failed", "ok": False},
-        {"name": "performance tests", "detail": "p99 940ms, over budget", "ok": False},
-        {"name": "security scan", "detail": "no new findings", "ok": True},
-    ]
-
-
 async def _maybe_delay(tool_name: str, arguments: dict) -> None:
     if (
         tool_name == "cut_release"
         and str(arguments.get("version", "")) == SLOW_CUT_VERSION
     ):
         await asyncio.sleep(SLOW_CUT_DELAY_SECONDS)
-    if tool_name == "run_quality_gates":
-        # Publish the running state before sleeping, so the fleet panel can show
-        # the gate card appear and work while the pipeline waits on it. Without
-        # this the card would only exist after the run finished, and the audience
-        # would lose the causality between the gate and the promotion that waited
-        # on it.
-        global _quality_gates
-        _quality_gates = {
-            "service": str(arguments.get("service", "")),
-            "version": str(arguments.get("version", "")),
-            "environment": str(arguments.get("environment", "staging")),
-            "status": "running",
-            "passed": None,
-            "checks": [],
-            "started_at": time.time(),
-            "completed_at": None,
-            "duration_seconds": None,
-        }
-        await asyncio.sleep(QUALITY_GATE_SECONDS)
 
 
 def _handle(tool_name: str, arguments: dict) -> dict:
@@ -221,48 +190,34 @@ def _handle(tool_name: str, arguments: dict) -> dict:
             "version": version,
             "environment": env,
             "promoted": True,
+            # The version this promotion replaced. Carried on the result as well
+            # as in the fleet state because PromoteReleaseChildWorkflow reports
+            # it back to the caller, and the dashboard's toast names it.
+            "previous_version": prior["version"] if prior else None,
             "message": f"promoted {service} {version} to {env}",
         }
 
-    if tool_name == "run_quality_gates":
+    if tool_name == "record_quality_gate_state":
+        # Visibility only, exactly like record_scan_state below. The verdict
+        # lives in QualityGateChildWorkflow's own Event History; this is just the
+        # projection the dashboard draws, published as the run progresses so the
+        # card can honestly say "2 / 4 checks complete" mid-run.
         global _quality_gates
-        service = str(arguments.get("service", ""))
-        version = str(arguments.get("version", ""))
-        env = str(arguments.get("environment", "staging"))
-        passed = version not in QUALITY_GATE_FAIL_VERSIONS
-        checks = _gate_checks(version, passed)
-        started = (
-            _quality_gates["started_at"]
-            if _quality_gates and _quality_gates.get("status") == "running"
-            else time.time()
-        )
-        now = time.time()
+        checks = list(arguments.get("checks") or [])
         _quality_gates = {
-            "service": service,
-            "version": version,
-            "environment": env,
-            "status": "passed" if passed else "failed",
-            "passed": passed,
+            "service": str(arguments.get("service", "")),
+            "version": str(arguments.get("version", "")),
+            "environment": str(arguments.get("environment", "staging")),
+            "status": str(arguments.get("status", "running")),
             "checks": checks,
-            "started_at": started,
-            "completed_at": now,
-            "duration_seconds": round(now - started, 1),
-        }
-        failures = [check["name"] for check in checks if not check["ok"]]
-        return {
-            "service": service,
-            "version": version,
-            "environment": env,
-            "passed": passed,
-            "checks": checks,
-            "duration_seconds": _quality_gates["duration_seconds"],
-            "message": (
-                f"quality gates passed for {version} in {env}"
-                if passed
-                else f"quality gates failed for {version} in {env}: "
-                + ", ".join(failures)
+            "checks_completed": int(
+                arguments.get("checks_completed", len(checks))
             ),
+            "check_count": int(arguments.get("check_count", 4)),
+            "gate_workflow_id": str(arguments.get("gate_workflow_id", "")),
+            "updated_at": time.time(),
         }
+        return {"recorded": True, "status": _quality_gates["status"]}
 
     if tool_name == "register_security_scan_capability":
         global _scan_provider
@@ -424,10 +379,12 @@ async def state(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "generated_at": time.time(),
-            # Absent until the gates have run at least once. The dashboard keys the
-            # gate card on presence, so "the team has not built this yet" and "the
-            # team built it" are the same code path with different state.
-            "quality_gates": dict(_quality_gates) if _quality_gates else None,
+            # Always present, in whichever of idle/running/passed/failed is
+            # honestly true. Idle at startup means no candidate has ever reached
+            # staging, which is a state worth drawing rather than a card worth
+            # hiding: the gate is standing infrastructure, not a capability that
+            # gets built partway through the demo.
+            "quality_gates": dict(_quality_gates),
             # Absent until the Security team has run a scan at least once. Same
             # "the card exists because the capability ran" contract as the gate
             # above, one checkpoint further along the pipeline.

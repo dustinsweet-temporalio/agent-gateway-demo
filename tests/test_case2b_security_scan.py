@@ -42,6 +42,7 @@ from temporalio.worker import Worker
 
 import activities.gateway_activities as gateway_activities
 from activities.gateway_activities import (
+    await_quality_gate,
     signal_operation_callback,
     submit_nested_tool_call,
 )
@@ -56,7 +57,12 @@ from common.models import (
 )
 from mock_tool import server as backend
 import security_scan.models as security_models
-from security_scan.security_scan_activities import run_scan_check
+from security_scan.security_scan_activities import (
+    check_cve_database,
+    check_license_compliance,
+    generate_sbom,
+    run_scan_check,
+)
 from security_scan.security_scan_workflow import SecurityScanWorkflow
 from security_scan.models import PublishScanStateInput, ScanResult
 from security_scan.nexus_contracts import (
@@ -66,7 +72,14 @@ from security_scan.nexus_contracts import (
 from security_scan.nexus_handlers import SecurityScanServiceHandler
 from workflows.nexus_handlers import AgentGatewayServiceHandler
 from workflows.protected_action import ProtectedActionWorkflow
+from tests import release_step_fakes
+from tests.release_step_fakes import RELEASE_STEP_ACTIVITIES
 from workflows.chain import AgenticChainWorkflow
+from workflows.release_children import (
+    CutReleaseChildWorkflow,
+    PromoteReleaseChildWorkflow,
+    QualityGateChildWorkflow,
+)
 
 GATEWAY_TASK_QUEUE = "test-agent-gateway-2b"
 SECURITY_TASK_QUEUE = "test-security-tq"
@@ -82,22 +95,25 @@ PRINCIPAL = "requester@example.com"
 TEST_CHECK_SECONDS = 1
 TEST_STAGE_COUNT = 2
 
-INVOKE_CALLS: list[tuple[str, dict, str]] = []
+# Shared with the release-step fakes, so one list shows the whole sequence
+# whether a step ran as an Activity or inside a release Child Workflow.
+INVOKE_CALLS = release_step_fakes.TOOL_CALLS
 PUBLISHED: list[PublishScanStateInput] = []
 
 _PRISTINE_DEPLOYED = copy.deepcopy(backend._deployed)
 _PRISTINE_RELEASES = copy.deepcopy(backend._releases)
+_IDLE_GATES = copy.deepcopy(backend._quality_gates)
 
 
 def _reset_backend(*, scan_available: bool, fail_versions: set[str] | None = None):
-    INVOKE_CALLS.clear()
+    release_step_fakes.reset()
     PUBLISHED.clear()
     backend._deployed.clear()
     backend._deployed.update(copy.deepcopy(_PRISTINE_DEPLOYED))
     backend._releases.clear()
     backend._releases.update(copy.deepcopy(_PRISTINE_RELEASES))
     backend._seen.clear()
-    backend._quality_gates = None
+    backend._quality_gates = copy.deepcopy(_IDLE_GATES)
     backend._scan = None
     # The scan's shape and its verdict rule both belong to the Security team, so
     # both are set on their module rather than passed in by anyone.
@@ -144,17 +160,9 @@ async def fake_evaluate_policy(input: EvaluatePolicyInput) -> PolicyDecision:
 
 @activity.defn(name="invoke_tool")
 async def backend_invoke_tool(input: InvokeToolInput) -> dict:
-    INVOKE_CALLS.append((input.tool_name, dict(input.arguments), input.idempotency_key))
-    key = input.idempotency_key
-    if key and key in backend._seen:
-        prior = dict(backend._seen[key])
-        prior["idempotent_replay"] = True
-        return prior
-    result = backend._handle(input.tool_name, dict(input.arguments))
-    result["idempotent_replay"] = False
-    if key:
-        backend._seen[key] = result
-    return result
+    return release_step_fakes.backend_call(
+        input.tool_name, dict(input.arguments), input.idempotency_key
+    )
 
 
 @activity.defn(name="publish_scan_state")
@@ -235,12 +243,23 @@ def _gateway_worker(env: WorkflowEnvironment) -> Worker:
     return Worker(
         env.client,
         task_queue=GATEWAY_TASK_QUEUE,
-        workflows=[AgenticChainWorkflow, ProtectedActionWorkflow],
+        workflows=[
+            AgenticChainWorkflow,
+            ProtectedActionWorkflow,
+            # The Waypoint team's own release steps. Same namespace and task
+            # queue as the chain that starts them, which is the deliberate
+            # contrast with SecurityScanWorkflow below.
+            CutReleaseChildWorkflow,
+            PromoteReleaseChildWorkflow,
+            QualityGateChildWorkflow,
+        ],
         activities=[
             fake_evaluate_policy,
             backend_invoke_tool,
             submit_nested_tool_call,
             signal_operation_callback,
+            await_quality_gate,
+            *RELEASE_STEP_ACTIVITIES,
         ],
         nexus_service_handlers=[AgentGatewayServiceHandler()],
     )
@@ -252,7 +271,14 @@ def _scan_worker(client: Client) -> Worker:
         client,
         task_queue=SECURITY_TASK_QUEUE,
         workflows=[SecurityScanWorkflow],
-        activities=[run_scan_check, fake_publish_scan_state],
+        activities=[
+            run_scan_check,
+            fake_publish_scan_state,
+            # dependency_scan is three sub-steps of its own now.
+            generate_sbom,
+            check_cve_database,
+            check_license_compliance,
+        ],
         nexus_service_handlers=[SecurityScanServiceHandler()],
         # run_scan_check is synchronous, exactly as it is in the real worker.
         activity_executor=concurrent.futures.ThreadPoolExecutor(max_workers=8),
@@ -382,7 +408,6 @@ async def _scan_runs_and_suspends(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "run_quality_gates",
         "get_security_scan_status",
     ]
     parent = await _operation_view(handle, "scan-pass-parent")
@@ -467,12 +492,38 @@ async def _resumes_on_a_fresh_worker(
             == ticks_before
         ), "replay must not re-run scan stages"
 
-        # Approve on the gateway side, through the mechanism that has not changed
-        # since CASE-1.
+        # This promotion was requested by the Security team's scan, so it may
+        # only be decided by the Security team. An approver from anywhere else
+        # is refused outright rather than quietly ignored: the operation stays
+        # waiting, the ledger records the attempt, and nothing is promoted.
+        #
+        # That requirement is what makes the scan the only correct caller here.
+        # If any approver would do, the Waypoint pipeline could just as well have
+        # waited for the verdict and requested the promotion itself; because a
+        # Security-team member has to sign off, the requester identity on the
+        # operation has to genuinely be theirs.
         await handle.signal(
             AgenticChainWorkflow.approve_operation,
             ApprovalDecision(
-                operation_id=promotion.operation_id, approver="approver@example.com"
+                operation_id=promotion.operation_id,
+                approver="approver@example.com",
+                approver_team="waypoint",
+            ),
+        )
+        await asyncio.sleep(0.5)
+        still_waiting = await _operation_view(handle, promotion.operation_id)
+        assert still_waiting.status == "waiting_for_approval"
+        assert still_waiting.required_approver_team == "security"
+        assert "approval_refused_wrong_team" in await _ledger_events(handle)
+        assert backend._deployed["prod"]["version"] == "2.2.0"
+
+        # The Security team's own approver, and now it lands.
+        await handle.signal(
+            AgenticChainWorkflow.approve_operation,
+            ApprovalDecision(
+                operation_id=promotion.operation_id,
+                approver="Abe Roover <abe.roover@porticour.io>",
+                approver_team="security",
             ),
         )
 
@@ -482,7 +533,7 @@ async def _resumes_on_a_fresh_worker(
         result = await asyncio.wait_for(scan.result(), timeout=30)
         assert result.phase == "completed"
         assert result.verdict == "pass"
-        assert result.promotion_result["promoted"] is True
+        assert result.promotion_result["status"] == "completed"
         assert result.promotion_result["environment"] == "prod"
         assert backend._deployed["prod"]["version"] == "2.3.0"
 
@@ -525,11 +576,15 @@ def test_rejecting_the_promotion_wakes_the_scan_with_the_bad_news() -> None:
                 )
                 promotion = await _waiting_promotion(handle)
 
+                # Rejecting is a decision too, and it disposes of the operation
+                # just as finally as approving does, so the same team
+                # restriction applies to it.
                 await handle.signal(
                     AgenticChainWorkflow.reject_operation,
                     ApprovalDecision(
                         operation_id=promotion.operation_id,
-                        approver="approver@example.com",
+                        approver="Abe Roover <abe.roover@porticour.io>",
+                        approver_team="security",
                         reason="holiday change freeze",
                     ),
                 )

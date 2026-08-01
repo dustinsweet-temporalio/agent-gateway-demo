@@ -34,15 +34,20 @@ SEVERITY_ORDER = ["none", "low", "medium", "high", "critical"]
 # and the same on every run.
 SCAN_FINDING_SEVERITY_THRESHOLD = "medium"
 
-# The scan. Four checks five seconds apart is fifteen seconds of live wall clock:
-# long enough that the stage counter reads as an observable wait (and long enough
-# to kill the worker mid-scan and show the workflow pick up where it left off),
-# short enough that nobody watching a demo loses interest. A real pre-prod scan
-# takes considerably longer than this, and sometimes stops entirely on a human
+# The scan runs for about fifteen seconds of live wall clock: long enough that
+# the stage counter reads as an observable wait (and long enough to kill the
+# worker mid-scan and show the workflow pick up where it left off), short enough
+# that nobody watching a demo loses interest. A real pre-prod scan takes
+# considerably longer than this, and sometimes stops entirely on a human
 # reviewing a flagged finding, which is the reason it has to be able to hold its
 # own state at all. These are constants rather than dashboard inputs on purpose.
 # Changing them is a deliberate decision about the demo, not a knob to reach for.
-SCAN_CHECK_SECONDS = 5
+#
+# The budget: dependency_scan is three sub-Activities of its own and takes ~3.5s,
+# the other three stages are instant, and there are three four-second gaps
+# between the four stages. 3.5 + 12 is a hair over fifteen, which is where this
+# has always been aimed.
+SCAN_CHECK_SECONDS = 4
 SCAN_CHECK_COUNT = 4
 
 # What each check stands in for. A real scan runs these as distinct stages
@@ -142,6 +147,44 @@ class ScanCheckResult:
     findings: int
     max_severity: str
     passed: bool
+
+
+# ---------------------------------------------------- dependency_scan internals
+#
+# The first stage is three sub-steps rather than one, because a dependency scan
+# genuinely is: resolve the transitive tree into an SBOM, check that SBOM against
+# an advisory feed, and check the same SBOM's licences. The other three stages
+# stay single Activities -- they are already visible enough individually, and
+# giving every stage internal structure would be depth for its own sake.
+#
+# Only the CVE check is scripted to fail. The licence check always passes, so
+# there is exactly one controllable failure lever for this stage, expressed
+# through the top-level scripted_outcome the same way it always was. Two
+# independently failing sub-checks could disagree with no narratively visible
+# reason, which would make the demo's failure story harder to explain rather
+# than richer.
+
+
+@dataclass
+class GenerateSbomInput:
+    service: str
+    version: str
+
+
+@dataclass
+class CheckCveInput:
+    service: str
+    version: str
+    sbom_ref: str
+    stage_number: int
+    scripted_outcome: str
+
+
+@dataclass
+class CheckLicenseInput:
+    service: str
+    version: str
+    sbom_ref: str
 
 
 @dataclass

@@ -8,10 +8,20 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from activities.gateway_activities import (
+    archive_artifacts,
+    await_quality_gate,
+    calculate_integrity_hashes,
+    deploy_binaries,
     evaluate_policy,
+    health_check_new_instances,
     invoke_tool,
+    publish_quality_gate_state,
+    run_quality_check,
     signal_operation_callback,
     submit_nested_tool_call,
+    tag_commit_in_source_control,
+    update_release_notes,
+    update_traffic_routing,
 )
 from workflows.nexus_handlers import AgentGatewayServiceHandler
 from workflows.protected_action import ProtectedActionWorkflow
@@ -21,6 +31,11 @@ from adk_agents.release_approval_agent.temporal_integration import (
 from workflows.adk_session import TemporalAdkSessionWorkflow
 from workflows.autonomous_agent import AutonomousAgentWorkflow
 from workflows.chain import AgenticChainWorkflow
+from workflows.release_children import (
+    CutReleaseChildWorkflow,
+    PromoteReleaseChildWorkflow,
+    QualityGateChildWorkflow,
+)
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
@@ -44,6 +59,12 @@ async def main() -> None:
                 # Services one external tool request each, for as long as the
                 # approval takes.
                 ProtectedActionWorkflow,
+                # The Waypoint team's own release steps, as children of the
+                # chain. Same namespace, same task queue, same worker: depth,
+                # not a team boundary.
+                CutReleaseChildWorkflow,
+                PromoteReleaseChildWorkflow,
+                QualityGateChildWorkflow,
             ],
             activities=[
                 evaluate_policy,
@@ -52,6 +73,19 @@ async def main() -> None:
                 # a client for anyone else's cluster.
                 submit_nested_tool_call,
                 signal_operation_callback,
+                # The individual steps inside the release children. Separate
+                # Activity functions rather than one parameterized call, so
+                # Event History names what actually happened.
+                tag_commit_in_source_control,
+                archive_artifacts,
+                calculate_integrity_hashes,
+                deploy_binaries,
+                health_check_new_instances,
+                update_traffic_routing,
+                update_release_notes,
+                run_quality_check,
+                publish_quality_gate_state,
+                await_quality_gate,
             ],
             # The gateway's Nexus front door, behind the `agent-gateway`
             # Endpoint. This is how another team's tool asks for a protected

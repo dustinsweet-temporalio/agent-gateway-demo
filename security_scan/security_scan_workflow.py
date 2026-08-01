@@ -9,12 +9,17 @@ from temporalio.exceptions import ActivityError
 with workflow.unsafe.imports_passed_through():
     from security_scan.models import (
         SecurityScanInput,
+        CheckCveInput,
+        CheckLicenseInput,
+        GenerateSbomInput,
         ScanCheckInput,
         ScanResult,
         ScanState,
         ScanStatusView,
         SCAN_FINDING_SEVERITY_THRESHOLD,
+        SEVERITY_ORDER,
         PublishScanStateInput,
+        stage_name,
     )
     from security_scan.nexus_contracts import (
         AGENT_GATEWAY_ENDPOINT,
@@ -23,9 +28,15 @@ with workflow.unsafe.imports_passed_through():
         ToolOutcomeReport,
     )
     from security_scan.security_scan_activities import (
+        check_cve_database,
+        check_license_compliance,
+        generate_sbom,
         publish_scan_state,
         run_scan_check,
     )
+
+# The stage that has internal structure. Every other stage is one Activity.
+DEPENDENCY_SCAN_STAGE = 1
 
 CHECK_TIMEOUT = timedelta(seconds=15)
 PUBLISH_TIMEOUT = timedelta(seconds=10)
@@ -95,20 +106,24 @@ class SecurityScanWorkflow:
         # rescanning from the top, which is the property being demonstrated when
         # the container is killed between the second and third stage.
         for stage_number in range(1, input.stage_count + 1):
-            stage = await workflow.execute_activity(
-                run_scan_check,
-                ScanCheckInput(
-                    service=input.service,
-                    version=input.version,
-                    stage_number=stage_number,
-                    stage_count=input.stage_count,
-                    scripted_outcome=input.scripted_outcome,
-                    scan_workflow_id=workflow.info().workflow_id,
-                    environment=input.environment,
-                ),
-                start_to_close_timeout=CHECK_TIMEOUT,
-                retry_policy=RetryPolicy(maximum_attempts=3),
+            check_input = ScanCheckInput(
+                service=input.service,
+                version=input.version,
+                stage_number=stage_number,
+                stage_count=input.stage_count,
+                scripted_outcome=input.scripted_outcome,
+                scan_workflow_id=workflow.info().workflow_id,
+                environment=input.environment,
             )
+            if stage_number == DEPENDENCY_SCAN_STAGE:
+                stage = await self._run_dependency_scan_stage(check_input)
+            else:
+                stage = await workflow.execute_activity(
+                    run_scan_check,
+                    check_input,
+                    start_to_close_timeout=CHECK_TIMEOUT,
+                    retry_policy=RetryPolicy(maximum_attempts=3),
+                )
             self._state.stage_results.append(stage)
             self._state.stages_completed = stage_number
             if not stage["passed"]:
@@ -215,6 +230,89 @@ class SecurityScanWorkflow:
         )
 
     # -------------------------------------------------------------- helpers
+
+    async def _run_dependency_scan_stage(self, input: ScanCheckInput) -> dict:
+        """Stage 1, which is three sub-steps rather than one.
+
+        Sequenced inline here rather than extracted to its own Child Workflow.
+        The four top-level stages are already individually visible as Activities,
+        and this is the only one with genuine internal structure: resolve the
+        transitive tree, then check that resolved tree twice, once against the
+        advisory feed and once against the licence allow-list. Both checks depend
+        on the SBOM existing, which is why they follow it.
+
+        The stage result keeps exactly the shape every other stage produces, so
+        the workflow's own pass/fail logic, the dashboard card, and the failure
+        report do not have to know this stage is built differently. What it adds
+        is sub_checks, for anyone who wants to see which part found what.
+        """
+        sbom = await workflow.execute_activity(
+            generate_sbom,
+            GenerateSbomInput(service=input.service, version=input.version),
+            start_to_close_timeout=CHECK_TIMEOUT,
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        cve_result = await workflow.execute_activity(
+            check_cve_database,
+            CheckCveInput(
+                service=input.service,
+                version=input.version,
+                sbom_ref=sbom["sbom_ref"],
+                stage_number=input.stage_number,
+                scripted_outcome=input.scripted_outcome,
+            ),
+            start_to_close_timeout=CHECK_TIMEOUT,
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        license_result = await workflow.execute_activity(
+            check_license_compliance,
+            CheckLicenseInput(
+                service=input.service,
+                version=input.version,
+                sbom_ref=sbom["sbom_ref"],
+            ),
+            start_to_close_timeout=CHECK_TIMEOUT,
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        findings = cve_result["findings"] + license_result["findings"]
+        max_severity = self._highest_severity(
+            [cve_result["max_severity"], license_result["max_severity"]]
+        )
+        return {
+            "stage": input.stage_number,
+            "stage_name": stage_name(input.stage_number),
+            "findings": findings,
+            "max_severity": max_severity,
+            # The licence check never fails, so this is the CVE check's verdict
+            # in practice. Written as the combination anyway, because that is
+            # what it means and a future second failing sub-check should not
+            # need this line rewritten.
+            "passed": not findings,
+            "sub_checks": {
+                "generate_sbom": {
+                    "sbom_ref": sbom["sbom_ref"],
+                    "dependency_count": sbom["dependency_count"],
+                },
+                "check_cve_database": cve_result,
+                "check_license_compliance": license_result,
+            },
+        }
+
+    @staticmethod
+    def _highest_severity(severities: list[str]) -> str:
+        """The worst level on the ladder, or the first unrecognised one.
+
+        An unknown level is treated as the answer rather than skipped, which
+        matches severity_at_or_above: a scanner reporting something this platform
+        does not understand is a reason to stop, not to ignore it.
+        """
+        worst = "none"
+        for severity in severities:
+            if severity not in SEVERITY_ORDER:
+                return severity
+            if SEVERITY_ORDER.index(severity) > SEVERITY_ORDER.index(worst):
+                worst = severity
+        return worst
 
     async def _fail_scan(self, stage: dict) -> ScanResult:
         """One finding at or above the threshold ends the scan.

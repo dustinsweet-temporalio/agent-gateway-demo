@@ -57,14 +57,8 @@ services:
       # Cutting this release runs long and trips the gateway convert-to-async path.
       SLOW_CUT_VERSION: "2.3.1"
       SLOW_CUT_DELAY_SECONDS: "12"
-      # How long the CASE-2 quality gates take. Long enough to watch the gate card
-      # work, short enough to stay inside the invoke Activity's request timeout.
-      QUALITY_GATE_SECONDS: "${QUALITY_GATE_SECONDS:-12}"
-      # Versions the gates reject. Empty by default, so gates pass. Set it to show
-      # the fail-closed path, then recreate the service to clear it.
-      QUALITY_GATE_FAIL_VERSIONS: "${QUALITY_GATE_FAIL_VERSIONS:-}"
-      # Same idea for the security scan: versions whose scan fails. Empty by
-      # default, so a scan that runs passes.
+      # Versions whose security scan fails. Read on the Security team's own side
+      # too; kept here so a single .env value configures the whole demo.
       SCAN_FAIL_VERSIONS: "${SCAN_FAIL_VERSIONS:-}"
     ports:
       - "9000:9000"
@@ -86,6 +80,16 @@ services:
       AGENT_GATEWAY_TOKEN: "tok_adk"
       ADK_MODEL: "${ADK_MODEL:-gemini-3.6-flash}"
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+      # Quality gate checks are Activities on this worker now, not a call into
+      # the deployment backend, so the fail-closed knob is read here. Empty by
+      # default, so gates pass. Set it and recreate this service to show a
+      # candidate being refused before anyone is asked to approve it.
+      QUALITY_GATE_FAIL_VERSIONS: "${QUALITY_GATE_FAIL_VERSIONS:-}"
+      # Same shape for the promotion health check: a version listed here fails
+      # its post-deploy health check, so update_traffic_routing never runs and
+      # the environment keeps serving what it was serving. Implemented and
+      # correct, deliberately not part of the default scripted run.
+      HEALTH_CHECK_FAIL_VERSIONS: "${HEALTH_CHECK_FAIL_VERSIONS:-}"
       # This worker's own namespace, and the only one it connects to. Reaching
       # the Security team needs no configuration here at all: the `security`
       # Nexus Endpoint is a cluster object, and the endpoint name is in the code
@@ -148,8 +152,16 @@ services:
       # Static bearer-token to identity map. The gateway sets the approval
       # requester from a matching token, never from anything the agent says.
       # Connect Claude Code with: --header "Authorization: Bearer tok_dustin"
-      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>","tok_abe":"Abe Roover <Abe.Roover@temporal.io>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo"}'
-      GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@temporal.io>,Abe Roover <Abe.Roover@temporal.io>"
+      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@porticour.io>","tok_abe":"Abe Roover <abe.roover@porticour.io>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo"}'
+      GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@porticour.io>,Abe Roover <abe.roover@porticour.io>"
+      # Which Porticour engineering team each principal belongs to. Explicit and
+      # auditable on purpose: an Operation gated by the Security team's scan may
+      # only be approved by a Security-team member, and inferring that from an
+      # email domain or a token-name pattern would break silently the first time
+      # a persona's address changed. Keys may be the full principal string or
+      # just the address inside it; anything absent has no team and therefore
+      # cannot approve a team-restricted Operation.
+      GATEWAY_PRINCIPAL_TEAMS: '{"dustin.sweet@porticour.io":"waypoint","abe.roover@porticour.io":"security"}'
       GATEWAY_DEBUG: "1"
     ports:
       - "8080:8080"

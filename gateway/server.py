@@ -107,8 +107,17 @@ POLL_AFTER_SECONDS = int(os.getenv("POLL_AFTER_SECONDS", "5"))
 # A tool absent from this map uses _DEFAULT_STRATEGY.
 _TOOL_STRATEGY: dict[str, object] = {
     "get_deployed_version": "sync",
+    # A cut runs its three steps in about four seconds, so an ordinary one
+    # answers inside this budget. SLOW_CUT_VERSION deliberately does not, which
+    # is what demonstrates the conversion.
     "cut_release": 5000,
-    "promote_release": 5000,
+    # A promotion runs four steps in about five and a half seconds. The budget
+    # is set above that on purpose: an unprotected staging promotion should
+    # still answer `completed` to its caller rather than converting to async
+    # just because the work behind it became several steps instead of one. A
+    # protected promotion never gets near this, because it returns
+    # waiting_for_approval before any of those steps run.
+    "promote_release": 9000,
 }
 _DEFAULT_STRATEGY: object = 5000
 
@@ -134,7 +143,7 @@ _DEFAULT_CHAIN = "wf-" + uuid.uuid4().hex[:6]
 def _load_principals() -> dict[str, str]:
     """Static bearer token to identity map from GATEWAY_PRINCIPALS (JSON).
 
-    Example: {"tok_dustin": "Dustin Sweet <dustin.sweet@temporal.io>"}
+    Example: {"tok_dustin": "Dustin Sweet <dustin.sweet@porticour.io>"}
     """
     raw = os.getenv("GATEWAY_PRINCIPALS", "").strip()
     if not raw:
@@ -155,6 +164,50 @@ def _load_approvers() -> set[str]:
 
 
 _APPROVERS = _load_approvers()
+
+
+def _load_principal_teams() -> dict[str, str]:
+    """Principal to Porticour engineering team map from GATEWAY_PRINCIPAL_TEAMS.
+
+    Example:
+      {"dustin.sweet@porticour.io": "waypoint",
+       "abe.roover@porticour.io": "security"}
+
+    Explicit rather than inferred. An Operation gated by the Security team's
+    pre-prod scan may only be approved by a member of the Security team (see
+    _authorize_approver), and deriving team membership from an email domain, a
+    token name, or any other implicit signal would be both unauditable and
+    silently wrong the first time a persona's address changed.
+    """
+    raw = os.getenv("GATEWAY_PRINCIPAL_TEAMS", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return {str(k).strip(): str(v).strip().lower() for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+_PRINCIPAL_TEAMS = _load_principal_teams()
+
+
+def _team_for_principal(principal: str) -> Optional[str]:
+    """The team this principal belongs to, or None if it has no mapping.
+
+    Keys may be written either as the full principal string the token resolves
+    to ("Abe Roover <abe.roover@porticour.io>") or as just the address inside
+    it. Pulling the address out of the angle brackets is a lookup normalization
+    against the explicit map, not an inference: the domain is never consulted,
+    and an address that is not in the map has no team.
+    """
+    team = _PRINCIPAL_TEAMS.get(principal)
+    if team is not None:
+        return team
+    if "<" in principal and principal.rstrip().endswith(">"):
+        address = principal[principal.index("<") + 1 : principal.rindex(">")].strip()
+        return _PRINCIPAL_TEAMS.get(address)
+    return None
 
 # The requester is resolved at the ASGI layer (see PrincipalMiddleware) where the
 # raw HTTP headers are reliably available. The bundled mcp SDK does not reliably
@@ -1104,6 +1157,9 @@ async def whoami(request: Request) -> JSONResponse:
             "resolved_from_this_request": _principal_for_token(token),
             "resolved_from_middleware_contextvar": _current_principal.get(),
             "is_approver": _is_approver(_resolve_principal()),
+            # Which Porticour team this token approves as. Only matters for an
+            # operation that carries a team restriction; null everywhere else.
+            "team": _team_for_principal(_principal_for_token(token)),
         }
     )
 
@@ -1206,38 +1262,91 @@ async def fleet(request: Request) -> JSONResponse:
     return JSONResponse(state)
 
 
+async def _authorize_approver(handle, operation_id: str, principal: str) -> None:
+    """Refuse a decision from someone not on the team this operation requires.
+
+    Being in GATEWAY_APPROVERS is necessary and, for almost everything,
+    sufficient: CASE-1's ordinary production promotions, CASE-2a runs with no
+    security scan in play, and CASE-3 runs all carry no team restriction and are
+    decided by any approver, unchanged.
+
+    What is new is the operation a Security scan asked for. Promoting to
+    production off the back of a pre-prod security scan is the Security team's
+    call to stand behind, so a member of that team has to be the one who makes
+    it. That authorization requirement is precisely what makes the Security
+    team's own workflow the only correct caller for the promotion: the requester
+    identity on the operation genuinely reflects who is accountable, rather than
+    being a decision relayed on their behalf.
+
+    Raised as a PermissionError, and turned into a 403 by the caller, so an
+    approver who cannot act on an entry finds out immediately instead of
+    watching a decision quietly fail to register.
+    """
+    required = await handle.query(
+        "get_required_approver_team", operation_id, result_type=str
+    )
+    if not required:
+        return
+    team = _team_for_principal(principal)
+    if team != required:
+        raise PermissionError(
+            f"operation {operation_id} requires approval from the {required} "
+            f"team; {principal!r} is not authorized to decide it"
+        )
+
+
+def _decision_forbidden(err: PermissionError) -> HTMLResponse:
+    return HTMLResponse(_render_forbidden(str(err)), status_code=403)
+
+
 @mcp.custom_route("/approve", methods=["POST"])
-async def approve(request: Request) -> RedirectResponse:
+async def approve(request: Request) -> Response:
     principal = _resolve_principal()
     if not _is_approver(principal):
         return RedirectResponse("/login", status_code=303)
     form = await request.form()
+    operation_id = str(form["operation_id"])
     client = await get_client()
     handle = client.get_workflow_handle(str(form["workflow_id"]))
+    try:
+        await _authorize_approver(handle, operation_id, principal)
+    except PermissionError as err:
+        return _decision_forbidden(err)
     await handle.signal(
         "approve_operation",
         ApprovalDecision(
-            operation_id=str(form["operation_id"]),
+            operation_id=operation_id,
             approver=principal,
+            # Resolved here, at the trust boundary, from the validated bearer
+            # token. The Workflow enforces the match but does not decide team
+            # membership: that is environment-driven configuration, which
+            # Workflow code must not read.
+            approver_team=_team_for_principal(principal) or "",
         ),
     )
     return RedirectResponse("/", status_code=303)
 
 
 @mcp.custom_route("/reject", methods=["POST"])
-async def reject(request: Request) -> RedirectResponse:
+async def reject(request: Request) -> Response:
     principal = _resolve_principal()
     if not _is_approver(principal):
         return RedirectResponse("/login", status_code=303)
     form = await request.form()
+    operation_id = str(form["operation_id"])
     client = await get_client()
     handle = client.get_workflow_handle(str(form["workflow_id"]))
+    try:
+        await _authorize_approver(handle, operation_id, principal)
+    except PermissionError as err:
+        return _decision_forbidden(err)
     await handle.signal(
         "reject_operation",
         ApprovalDecision(
-            operation_id=str(form["operation_id"]),
+            operation_id=operation_id,
             approver=principal,
             reason=str(form.get("reason") or "Rejected by approver"),
+            approver_team=_team_for_principal(principal) or "",
         ),
     )
     return RedirectResponse("/", status_code=303)
@@ -1274,6 +1383,22 @@ def _short_ts(iso: Optional[str]) -> str:
         return iso.split(".")[0].replace("T", " ")
 
 
+def _team_badge(op: Any) -> str:
+    """Label an entry only this team's approvers may decide.
+
+    Shown so a non-Security approver understands why they cannot act on the
+    entry before they try and are refused, rather than the restriction only
+    surfacing as a 403 after the fact.
+    """
+    required = getattr(op, "required_approver_team", None)
+    if not required:
+        return ""
+    return (
+        f'<div class="team-req">{html.escape(required.title())} approval '
+        "required</div>"
+    )
+
+
 def _render_pending_row(workflow_id: str, op: Any) -> str:
     wf = html.escape(workflow_id)
     op_id = html.escape(op.operation_id)
@@ -1282,7 +1407,7 @@ def _render_pending_row(workflow_id: str, op: Any) -> str:
     <tr>
       <td class="mono">{wf}</td>
       <td class="mono">{op_id}</td>
-      <td>{_fmt(op.requested_action)}</td>
+      <td>{_fmt(op.requested_action)}{_team_badge(op)}</td>
       <td>{_fmt(op.requester)}</td>
       <td class="mono">{_args_summary(op.arguments)}</td>
       <td>{_fmt(op.justification)}</td>
@@ -1348,7 +1473,9 @@ _CSS = """
   --accent-wash: rgba(15,155,142,0.12); --shine: rgba(15,155,142,0.12);
 }
 body { background: var(--bg); color: var(--fg); font-family: Inter, system-ui, sans-serif; margin: 2rem; }
-header { display: flex; align-items: center; justify-content: space-between; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+header h1 { margin: 0; }
+.brandline { margin: 0.25rem 0 0; max-width: 44rem; }
 h1 { font-size: 1.25rem; }
 h2 { font-size: 1rem; margin: 0; }
 table { border-collapse: collapse; width: 100%; margin-top: 0.5rem; }
@@ -1365,6 +1492,15 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .reject { background: #ef4444; }
 .toggle { background: transparent; border: 1px solid var(--border); color: var(--fg); }
 .countdown.urgent { color: #ef4444; font-weight: 600; }
+/* Only one Porticour team may decide this entry. Reads as a constraint on the
+   row rather than a status of the operation, so it sits under the requested
+   action instead of in the outcome column. */
+.team-req { display: inline-block; margin-top: 0.3rem; padding: 0.12rem 0.45rem;
+        border: 1px solid var(--protect); border-radius: 999px; color: var(--protect);
+        font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; }
+.forbidden { max-width: 34rem; margin: 12vh auto; padding: 2rem;
+        border: 1px solid #ef4444; border-radius: 8px; }
+.forbidden h1 { color: #ef4444; }
 .prot-y { color: #f59e0b; font-weight: 600; }
 .prot-n { color: var(--muted); }
 .badge { padding: 0.1rem 0.45rem; border-radius: 999px; font-size: 0.7rem; color: white; }
@@ -1481,17 +1617,26 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 @keyframes shine { 0% { left: -60%; opacity: 0; } 22% { opacity: 1; } 100% { left: 115%; opacity: 0; } }
 
 /* ------------------------------------------------------- quality gate card
-   Absent until the release pipeline has run its gates at least once, so during
-   CASE-1 the row is staging -> production exactly as before. It appears in place,
-   between the two environments, the first time the pipeline reaches it. Narrower
-   than an environment card and visually a checkpoint rather than a destination:
-   nothing is deployed here, it is the thing a candidate has to get past. */
+   Always on the row, from container startup, in whichever of idle / running /
+   passed / failed is honestly true. Gates are not a capability that appears
+   partway through the demo: they react whenever anything reaches staging, from
+   any phase, so an empty card saying "no candidate staged yet" is the accurate
+   picture at t=0 rather than something to hide. Narrower than an environment
+   card and visually a checkpoint rather than a destination: nothing is deployed
+   here, it is the thing a candidate has to get past.
+
+   Only the SECURITY SCAN card keeps the first-appearance reveal, because that
+   one really does arrive mid-demo when another team's platform starts. */
 .gate { flex: 0 0 11rem; min-width: 0; position: relative; overflow: hidden;
         padding: 0.7rem 0.8rem 0.8rem; border: 1px dashed var(--card-edge);
         border-radius: 14px; background: var(--card);
         transition: border-color 0.4s ease, box-shadow 0.4s ease; }
-.gate.appearing { animation: gate-in 0.6s cubic-bezier(0.16,1,0.3,1); }
+.gate.scan.appearing { animation: gate-in 0.6s cubic-bezier(0.16,1,0.3,1); }
 @keyframes gate-in { from { transform: scale(0.9); opacity: 0; } to { transform: none; opacity: 1; } }
+/* Nothing staged yet. Deliberately quiet: present, legible, and clearly not
+   reporting a verdict about anything. */
+.gate.idle { border-style: dashed; border-color: var(--card-edge); opacity: 0.75; }
+.gate.idle .gate-verdict { color: var(--muted); }
 .gate-top { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
 .gate-name { font-size: 0.66rem; font-weight: 600; text-transform: uppercase;
         letter-spacing: 0.1em; color: var(--th); }
@@ -1527,8 +1672,9 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
    gate card uses. It sits between the gate and production, because that is
    where it sits in the pipeline: the last checkpoint before the protected
    promotion. Marked with its owner, because unlike every other card in this row
-   it is not Waypoint's -- it is another team's system, running in another
-   Temporal namespace, and the demo's whole CASE-2b beat is that distinction. */
+   it is not the Waypoint team's -- it belongs to another Porticour engineering
+   team, running in another Temporal namespace, and the demo's whole CASE-2b
+   beat is that distinction. */
 .gate.scan { flex: 0 0 12rem; }
 .gate-owner { margin-top: 0.05rem; font-size: 0.58rem; text-transform: uppercase;
         letter-spacing: 0.09em; color: var(--muted); opacity: 0.85; }
@@ -1557,7 +1703,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .gate.waiting .gate-verdict { color: var(--protect); }
 
 @media (prefers-reduced-motion: reduce) {
-  .gate.appearing, .gate.running::after, .scan-dot.live { animation: none; }
+  .gate.scan.appearing, .gate.running::after, .scan-dot.live { animation: none; }
 }
 
 .rail-head { margin-top: 1.1rem; }
@@ -1723,12 +1869,13 @@ var FLEET = (function () {
     return card;
   }
 
-  function buildPipeline(records, hasGate, hasScan) {
+  function buildPipeline(records, hasScan) {
     pipeline.innerHTML = '';
     records.forEach(function (rec) {
       // The gate sits on the path into production, so a candidate visibly has to
-      // pass through it rather than around it.
-      if (hasGate && rec.environment === 'prod') {
+      // pass through it rather than around it. Always built, never conditional:
+      // an idle gate is a state, not an absence.
+      if (rec.environment === 'prod') {
         var gateLink = el('div', 'link');
         gateLink.setAttribute('data-into', 'gate');
         gateLink.appendChild(el('span', 'link-line'));
@@ -1821,32 +1968,62 @@ var FLEET = (function () {
 
   function hold() { holdUntil = Date.now() + ANIM_MS + 600; }
 
-  function paintGate(gate, appearing) {
-    var card = pipeline.querySelector('.gate');
-    if (!card || !gate) return;
-    var running = gate.status === 'running';
-    var failed = gate.status === 'failed';
-    card.className = 'gate ' + gate.status + (appearing ? ' appearing' : '');
-    card.querySelector('.gate-verdict').textContent = running
-      ? 'running' : (failed ? 'failed' : 'passed');
-    var sub = gate.version ? gate.version + ' on ' + label(gate.environment) : '';
-    if (!running && gate.duration_seconds) sub += ' \\u00b7 ' + gate.duration_seconds + 's';
-    card.querySelector('.gate-sub').textContent = sub;
+  // The gate card is always on the row, in whichever of four states is true:
+  //   idle     nothing has ever reached staging (the state at container start)
+  //   running  a gate workflow is evaluating a specific staged candidate
+  //   passed   the most recent evaluated candidate cleared all four checks
+  //   failed   the most recent evaluated candidate failed at least one
+  // No first-appearance animation, unlike the security scan card: gates do not
+  // arrive partway through the demo, they are standing infrastructure that
+  // reacts whenever anything lands on staging.
+  var GATE_VERDICTS = {
+    idle: 'idle', running: 'running', passed: 'passed', failed: 'failed'
+  };
+
+  function paintGate(gate) {
+    var card = pipeline.querySelector('.gate:not(.scan)');
+    if (!card) return;
+    gate = gate || { status: 'idle', checks: [] };
+    var status = GATE_VERDICTS[gate.status] ? gate.status : 'idle';
+    var running = status === 'running';
+    var failed = status === 'failed';
+    var checks = gate.checks || [];
+    var total = gate.check_count || 4;
+    var done = gate.checks_completed === undefined ? checks.length : gate.checks_completed;
+    card.className = 'gate ' + status;
+    card.querySelector('.gate-verdict').textContent = GATE_VERDICTS[status];
+
+    if (status === 'idle') {
+      card.querySelector('.gate-sub').textContent = 'no candidate staged yet';
+    } else {
+      var sub = (gate.version || '') + ' on ' + label(gate.environment || 'staging');
+      if (running) sub += ' \\u00b7 ' + done + ' / ' + total + ' checks complete';
+      else if (failed) {
+        var bad = checks.filter(function (c) { return !c.passed; })
+          .map(function (c) { return c.check_name; });
+        if (bad.length) sub += ' \\u00b7 ' + bad.join(', ');
+      }
+      card.querySelector('.gate-sub').textContent = sub;
+    }
+
+    // Which checks have reported, and how they went. Empty while idle, filling
+    // in as the four concurrent checks land.
     var list = card.querySelector('.gate-checks');
     list.innerHTML = '';
-    (gate.checks || []).forEach(function (check) {
-      var li = el('li', check.ok ? 'ok' : 'bad');
-      li.appendChild(el('span', 'mark', check.ok ? '\\u2713' : '\\u2717'));
-      li.appendChild(el('span', null, check.name));
+    checks.forEach(function (check) {
+      var li = el('li', check.passed ? 'ok' : 'bad');
+      li.appendChild(el('span', 'mark', check.passed ? '\\u2713' : '\\u2717'));
+      li.appendChild(el('span', null, check.check_name));
       list.appendChild(li);
     });
+
     // A failed gate means nothing moved past it, so say so with the connector
     // rather than leaving a green arrow pointing at an untouched production card.
-    // A failed gate stops the flow. The connector it blocks is whichever one
-    // leads onward, which is the security scan card once that exists.
+    // The connector it blocks is whichever one leads onward, which is the
+    // security scan card once that exists.
     var out = linkInto(pipeline.querySelector('.gate.scan') ? 'scan' : 'prod');
     if (out) out.classList.toggle('blocked', failed);
-    if (running || appearing) hold();
+    if (running) hold();
   }
 
   // phase -> [card class, verdict label]. The phases come straight from
@@ -1940,27 +2117,27 @@ var FLEET = (function () {
       serviceEl.textContent = service ? ': ' + service : '';
     }
 
-    // The gate card's existence is state, not configuration. No gate state means
-    // the pipeline has never run its gates, which during CASE-1 is the truth: the
-    // team has not built them yet. The shape changing is what makes the card
-    // appear, so it animates in at the moment the capability first runs.
-    // The security scan is the same contract one checkpoint later: no scan state
-    // means the Security team has not scanned anything here, which through CASE-1
-    // and CASE-2a is the truth, so the card does not exist yet either.
+    // The gate card is part of the row's fixed shape now: it is on the
+    // dashboard from container startup, idle, because gates are standing
+    // infrastructure that reacts whenever anything reaches staging rather than a
+    // capability the team builds partway through the demo.
+    //
+    // The security scan is still the other contract. No scan state means the
+    // Security team has not scanned anything here, which through CASE-1 and
+    // CASE-2a is the truth, so that card genuinely does not exist yet and
+    // animates in the first time their platform runs one.
     var gate = state.quality_gates || null;
     var scan = state.security_scan || null;
     var previous = pipeline.getAttribute('data-shape') || '';
     var shape = records.map(function (rec) { return rec.environment; }).join('|') +
-      (gate ? '|gate' : '') + (scan ? '|scan' : '');
-    var gateAppearing = false;
+      '|gate' + (scan ? '|scan' : '');
     var scanAppearing = false;
     if (previous !== shape) {
-      gateAppearing = !!gate && previous.indexOf('gate') < 0;
       scanAppearing = !!scan && previous.indexOf('scan') < 0;
-      buildPipeline(records, !!gate, !!scan);
+      buildPipeline(records, !!scan);
       pipeline.setAttribute('data-shape', shape);
     }
-    paintGate(gate, gateAppearing);
+    paintGate(gate);
     paintScan(scan, scanAppearing);
 
     var animated = false;
@@ -2181,13 +2358,18 @@ def _render_dashboard(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Waypoint Deployment Monitor</title>
+  <title>Porticour Release Control</title>
   <script>{_THEME_BOOT_JS}</script>
   <style>{_CSS}</style>
 </head>
 <body>
   <header>
-    <h1>Waypoint Deployment Monitor</h1>
+    <div>
+      <h1>Porticour Release Control</h1>
+      <p class="muted brandline">Release management for the Waypoint engineering
+      team &middot; delivery matching. Approvers from other Porticour teams sign
+      in here too.</p>
+    </div>
     <div>
       <span class="muted">{html.escape(_resolve_principal())}</span>
       <button id="theme-btn" class="toggle" type="button">Light mode</button>
@@ -2249,6 +2431,34 @@ def _render_dashboard(
 </html>"""
 
 
+def _render_forbidden(message: str) -> str:
+    """The visible half of the authorization boundary.
+
+    A demoable moment rather than an error to avoid: it is what makes the
+    Security team's approval requirement real instead of a label on a row.
+    """
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Not authorized &middot; Porticour Release Control</title>
+  <script>{_THEME_BOOT_JS}</script>
+  <style>{_CSS}</style>
+</head>
+<body>
+  <main class="forbidden">
+    <h1>Not authorized to decide this operation</h1>
+    <p>{html.escape(message)}</p>
+    <p class="muted">This promotion was requested by another Porticour team's
+    pre-prod security scan, so a member of that team has to be the one who
+    approves or rejects it. Sign in with that team's approver token and the
+    entry becomes actionable.</p>
+    <p><a href="/">Back to the queue</a></p>
+  </main>
+</body>
+</html>"""
+
+
 def _render_login(error: str = "") -> str:
     message = (
         f'<p style="color:#ef4444">{html.escape(error)}</p>' if error else ""
@@ -2257,15 +2467,17 @@ def _render_login(error: str = "") -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Waypoint Deployment Monitor</title>
+  <title>Porticour Release Control</title>
   <script>{_THEME_BOOT_JS}</script>
   <style>{_CSS}</style>
 </head>
 <body>
   <main class="login">
     <h1>Approver sign in</h1>
-    <p class="muted">Use a gateway-issued approver token. Decisions are recorded
-    under the identity mapped to the token, not a form-supplied name.</p>
+    <p class="muted">Porticour Release Control. Use a gateway-issued approver
+    token. Decisions are recorded under the identity mapped to the token, not a
+    form-supplied name, and the token is what determines which Porticour team
+    you approve as.</p>
     {message}
     <form method="post" action="/login">
       <label for="token">Approver token</label>

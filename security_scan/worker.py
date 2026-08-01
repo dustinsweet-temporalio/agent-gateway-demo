@@ -18,7 +18,13 @@ import requests
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from security_scan.security_scan_activities import publish_scan_state, run_scan_check
+from security_scan.security_scan_activities import (
+    check_cve_database,
+    check_license_compliance,
+    generate_sbom,
+    publish_scan_state,
+    run_scan_check,
+)
 from security_scan.security_scan_workflow import SecurityScanWorkflow
 from security_scan.nexus_handlers import SecurityScanServiceHandler
 from security_scan.models import SECURITY_NAMESPACE, SECURITY_TASK_QUEUE
@@ -37,8 +43,9 @@ HEARTBEAT_SECONDS = float(os.getenv("SECURITY_SCAN_HEARTBEAT_SECONDS", "5"))
 async def _announce_forever() -> None:
     """Advertise pre-prod security scanning to the shared platform, on a heartbeat.
 
-    This is how Waypoint's release pipeline discovers that the capability exists
-    at all. Before the Security team onboarded Waypoint, the pipeline went from
+    This is how the Waypoint team's release pipeline discovers that the
+    capability exists at all. Before the Security team onboarded them, the
+    pipeline went from
     green quality gates straight to opening the production promotion, because
     there was nothing else to route through. It still does exactly that whenever
     this worker is not running. The pipeline is not configured for the scan; it
@@ -79,7 +86,14 @@ async def main() -> None:
             client,
             task_queue=TASK_QUEUE,
             workflows=[SecurityScanWorkflow],
-            activities=[run_scan_check, publish_scan_state],
+            activities=[
+                run_scan_check,
+                publish_scan_state,
+                # The three sub-steps dependency_scan is actually made of.
+                generate_sbom,
+                check_cve_database,
+                check_license_compliance,
+            ],
             # This team's Nexus front door. Agent Gateway reaches it through the
             # `security` Endpoint and never learns what is behind it.
             nexus_service_handlers=[SecurityScanServiceHandler()],

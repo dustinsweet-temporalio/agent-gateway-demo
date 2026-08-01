@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from datetime import datetime, timedelta, timezone
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, ChildWorkflowError
 
 with workflow.unsafe.imports_passed_through():
     from common.models import (
         ApprovalDecision,
+        AwaitQualityGateInput,
         CancelOperation,
         ChainInput,
         ChainState,
         ChainSummary,
+        CutReleaseInput,
         EvaluatePolicyInput,
         InvokeToolInput,
         LedgerEntry,
@@ -21,6 +24,7 @@ with workflow.unsafe.imports_passed_through():
         OperationStatus,
         OperationView,
         NestedToolCallRequest,
+        PromoteReleaseInput,
         ResumeNestedRequest,
         ScanVerdict,
         SignalOperationCallbackInput,
@@ -34,14 +38,28 @@ with workflow.unsafe.imports_passed_through():
     )
     from common.semver import InvalidVersionError, next_version, normalize_bump
     from activities.gateway_activities import (
+        await_quality_gate,
         evaluate_policy,
         invoke_tool,
         signal_operation_callback,
+    )
+    from workflows.release_children import (
+        CutReleaseChildWorkflow,
+        PromoteReleaseChildWorkflow,
     )
 
 
 POLICY_TIMEOUT = timedelta(seconds=10)
 INVOKE_TIMEOUT = timedelta(seconds=60)
+# A release step that is a Child Workflow rather than a single Activity. Both
+# are a handful of short mock steps, so the ceiling is generous rather than
+# tight; the per-step timeouts inside the child are what actually bound them.
+RELEASE_CHILD_TIMEOUT = timedelta(minutes=5)
+# Waiting on the verdict for a candidate that was just staged. The gate runs
+# four checks concurrently, so it is seconds of work, but the Activity is a
+# genuine wait on another workflow's completion and is given room for a Worker
+# restart mid-run.
+QUALITY_GATE_WAIT_TIMEOUT = timedelta(minutes=5)
 # Starting a pre-prod security scan with the Security team. A Nexus call to
 # another team's endpoint, and a short one: their handler starts a workflow and
 # hands back its id rather than waiting for the scan to finish. See
@@ -94,10 +112,26 @@ PIPELINE_PRODUCTION_ENVIRONMENT = "prod"
 # The capability lookup the pipeline does after its gates pass. Pre-prod security
 # scanning belongs to the Security team, so the pipeline does not have it
 # configured; it asks the shared platform whether that team is currently offering
-# it, and routes through it when they are. Before the Security team onboards
-# Waypoint -- and any time their worker is not running -- the answer is no and the
+# it, and routes through it when they are. Before the Security team onboards the
+# Waypoint team -- and any time their worker is not running -- the answer is no and the
 # pipeline opens the production promotion itself, exactly as it always did.
 SCAN_CAPABILITY_TOOL = "get_security_scan_status"
+
+# Which Porticour engineering team must approve a promotion, keyed by the
+# service that asked for it. A promotion the Security team's scan requested is
+# the Security team's call to stand behind, so a member of that team has to be
+# the one who approves it -- that authorization requirement is what makes the
+# scan the only correct caller, rather than something the Waypoint pipeline
+# could equally well have relayed on their behalf.
+#
+# Anything not named here has no team restriction, which is every CASE-1 call,
+# every CASE-2a run with no scan in play, and every CASE-3 run.
+CALLER_SERVICE_APPROVER_TEAMS = {"security": "security"}
+
+# Executing a tool step raises one of these depending on whether the step is an
+# Activity or a Child Workflow. Callers care that the step failed, not which
+# shape it had, so they catch the pair.
+TOOL_STEP_ERRORS = (ActivityError, ChildWorkflowError)
 
 
 class QualityGateFailure(Exception):
@@ -331,12 +365,12 @@ class AgenticChainWorkflow:
                         resolved_tool2_arguments
                     )
                 else:
-                    prepare = await self._execute_tool_activity(
+                    prepare = await self._execute_tool_step(
                         tool_name=f"{req.tool1_name}_prepare",
                         arguments=req.tool1_arguments,
                         idempotency_key=f"{req.idempotency_key}:prepare",
                     )
-            except ActivityError as err:
+            except TOOL_STEP_ERRORS as err:
                 parent.status = OperationStatus.FAILED
                 parent.error = f"Tool1 preparation failed: {err}"
                 parent.decided_iso = workflow.now().isoformat()
@@ -541,12 +575,12 @@ class AgenticChainWorkflow:
                         expect_version=str(child.arguments.get("version", "")),
                     )
                 else:
-                    replay_prepare = await self._execute_tool_activity(
+                    replay_prepare = await self._execute_tool_step(
                         tool_name=f"{parent.tool_name}_prepare",
                         arguments=parent.arguments,
                         idempotency_key=f"{parent.idempotency_key}:prepare",
                     )
-            except ActivityError as err:
+            except TOOL_STEP_ERRORS as err:
                 parent.status = OperationStatus.FAILED
                 parent.error = f"Tool1 replay failed: {err}"
                 parent.decided_iso = workflow.now().isoformat()
@@ -618,6 +652,25 @@ class AgenticChainWorkflow:
             )
             self._propagate_child_terminal(op)
             return
+        if not self._approver_authorized(op, decision):
+            # Refused, not ignored. The operation stays waiting, so the right
+            # approver can still act on it, and the ledger records the attempt.
+            # The gateway rejects this at the HTTP boundary before it ever gets
+            # here (see gateway.server._authorize_approver), which is what gives
+            # the approver an immediate error instead of a decision that appears
+            # to land and does nothing. This is the same check enforced a second
+            # time on the durable side, so a Signal sent straight to the workflow
+            # cannot walk around the UI.
+            self._log(
+                "approval_refused_wrong_team",
+                op,
+                {
+                    "approver": decision.approver,
+                    "approver_team": decision.approver_team or None,
+                    "required_approver_team": op.required_approver_team,
+                },
+            )
+            return
         parent = (
             self._state.operations.get(op.parent_operation_id)
             if op.parent_operation_id
@@ -648,6 +701,21 @@ class AgenticChainWorkflow:
         if op is None or op.status != OperationStatus.WAITING_FOR_APPROVAL:
             return
         self._touch()
+        # Rejecting is a decision too, and it takes the operation out of the
+        # queue just as finally as approving does. If the Security team owns the
+        # call, they own both halves of it: someone outside the team cannot
+        # dispose of a Security-gated promotion either way.
+        if not self._approver_authorized(op, decision):
+            self._log(
+                "rejection_refused_wrong_team",
+                op,
+                {
+                    "approver": decision.approver,
+                    "approver_team": decision.approver_team or None,
+                    "required_approver_team": op.required_approver_team,
+                },
+            )
+            return
         op.status = OperationStatus.REJECTED
         op.approver = decision.approver
         op.error = decision.reason
@@ -777,6 +845,33 @@ class AgenticChainWorkflow:
     @workflow.query
     def get_workflow_owner(self) -> str:
         return self._state.owner_principal
+
+    @workflow.query
+    def get_required_approver_team(self, operation_id: str) -> str:
+        """Which team must decide this operation, or "" for no restriction.
+
+        Queried by the gateway before it signals a decision, so an approver who
+        is not allowed to act on an entry is told so immediately instead of
+        watching a decision vanish. The Signal handlers enforce the same rule
+        again on the durable side.
+        """
+        op = self._state.operations.get(operation_id)
+        if op is None or not op.required_approver_team:
+            return ""
+        return op.required_approver_team
+
+    @staticmethod
+    def _approver_authorized(op: Operation, decision: ApprovalDecision) -> bool:
+        """Is this decider on the team this operation requires?
+
+        No restriction means anyone the gateway already accepted as an approver
+        may decide, which is every operation except the ones a Security scan
+        asked for. The team on the decision was resolved by the gateway from the
+        validated bearer token, not supplied by whoever sent the Signal.
+        """
+        if not op.required_approver_team:
+            return True
+        return decision.approver_team == op.required_approver_team
 
     # ------------------------------------------------------------- loop helpers
 
@@ -982,24 +1077,87 @@ class AgenticChainWorkflow:
 
     async def _invoke(self, op: Operation) -> None:
         try:
-            result = await self._execute_tool_activity(
+            result = await self._execute_tool_step(
                 tool_name=op.tool_name,
                 arguments=op.arguments,
                 idempotency_key=op.idempotency_key,
             )
+            # A promotion whose new instances failed their health check reports
+            # itself as a completed workflow with a failed status rather than by
+            # throwing, because nothing went wrong with the promotion machinery:
+            # it correctly declined to route traffic. The operation still has to
+            # come out failed, or an approved production promotion that never
+            # actually went live would be recorded as having done so.
+            if isinstance(result, dict) and result.get("status") == "failed":
+                op.status = OperationStatus.FAILED
+                op.result = result
+                op.error = str(
+                    result.get("reason") or result.get("message") or "step failed"
+                )
+                op.decided_iso = workflow.now().isoformat()
+                self._log("failed", op, {"error": op.error})
+                self._propagate_child_terminal(op)
+                return
             op.status = OperationStatus.COMPLETED
             op.result = result
             op.decided_iso = workflow.now().isoformat()
             self._log("completed", op)
-        except ActivityError as err:
+        except TOOL_STEP_ERRORS as err:
             op.status = OperationStatus.FAILED
             op.error = str(err)
             self._log("failed", op, {"error": str(err)})
             self._propagate_child_terminal(op)
 
-    async def _execute_tool_activity(
+    async def _execute_tool_step(
         self, tool_name: str, arguments: dict, idempotency_key: str
     ) -> dict:
+        """Run one tool step, whatever shape that step happens to have.
+
+        Every caller in this file goes through here, so cutting a release means
+        the same thing whether CASE-1's operator asked for it directly or the
+        CASE-2a pipeline did it as part of a longer sequence.
+
+        Two shapes:
+
+        - cut_release and promote_release are Child Workflows. Each is several
+          real steps -- tag, archive, hash; deploy, health check, route, note --
+          and running them as children gives each its own Event History, its own
+          independently retryable steps, and its own id in the Web UI. Same
+          namespace, same task queue, same team: this is depth, not a boundary.
+        - everything else is a single Activity against the deployment backend,
+          which is all those tools are.
+
+        Both are awaited the same way, and the result is normalized to a dict so
+        the operation record, the ledger, and the dashboard do not have to know
+        or care which shape ran.
+        """
+        if tool_name == "cut_release":
+            cut = await workflow.execute_child_workflow(
+                CutReleaseChildWorkflow.run,
+                CutReleaseInput(
+                    service=str(arguments.get("service", "")),
+                    version=str(arguments.get("version", "")),
+                    idempotency_key=idempotency_key,
+                ),
+                id=self._child_id("cut-release", arguments),
+                execution_timeout=RELEASE_CHILD_TIMEOUT,
+            )
+            return dataclasses.asdict(cut)
+
+        if tool_name == "promote_release":
+            promotion = await workflow.execute_child_workflow(
+                PromoteReleaseChildWorkflow.run,
+                PromoteReleaseInput(
+                    service=str(arguments.get("service", "")),
+                    version=str(arguments.get("version", "")),
+                    environment=str(arguments.get("environment", "")),
+                    idempotency_key=idempotency_key,
+                ),
+                id=self._child_id("promote-release", arguments),
+                execution_timeout=RELEASE_CHILD_TIMEOUT,
+            )
+            return dataclasses.asdict(promotion)
+
         return await workflow.execute_activity(
             invoke_tool,
             InvokeToolInput(
@@ -1010,6 +1168,29 @@ class AgenticChainWorkflow:
             start_to_close_timeout=INVOKE_TIMEOUT,
             retry_policy=RetryPolicy(maximum_attempts=5),
         )
+
+    @staticmethod
+    def _child_id(prefix: str, arguments: dict) -> str:
+        """A legible, unique id for a release Child Workflow.
+
+        Named after what it is doing so the Web UI's workflow list reads as a
+        release history rather than a column of hashes, and suffixed with a
+        workflow-safe random value so a genuine re-run (an explicit replay after
+        an approval) starts its own execution instead of colliding with the one
+        that already ran. Repeating the underlying mutation is prevented by the
+        idempotency key the child threads down to the deployment backend, not by
+        the id.
+        """
+        parts = [
+            prefix,
+            str(arguments.get("service", "")),
+            str(arguments.get("version", "")),
+        ]
+        environment = str(arguments.get("environment", ""))
+        if environment:
+            parts.append(environment)
+        parts.append(workflow.uuid4().hex[:8])
+        return "::".join(parts)
 
     async def _orchestrate_tool1(
         self,
@@ -1032,15 +1213,24 @@ class AgenticChainWorkflow:
 
             read the deployed production version
             compute the next version from the bump type
-            cut that release
-            promote it to staging                  (skipped for a staging target)
-            run quality gates against staging      (skipped for a staging target)
+            cut that release                       (CutReleaseChildWorkflow)
+            promote it to staging                  (PromoteReleaseChildWorkflow;
+                                                    skipped for a staging target)
+            wait for THAT candidate's gate verdict (skipped for a staging target)
             look for a security scan provider      (allow_scan only)
             -- caller either hands off to the scan, or creates the target
                promotion as the child operation --
 
         A staging target gets the first leg only: the staging promotion is then
         the child, and there is nothing to qualify a candidate for.
+
+        Note what the gate step is and is not. The pipeline does not run the
+        gates; reaching staging is what starts a gate run, whoever caused it,
+        including a CASE-1 operator promoting by hand. What the pipeline does is
+        wait for the verdict belonging to the candidate it just staged, and stop
+        if it is not green. The policy is unchanged from when this ran the gates
+        itself -- a candidate that fails never reaches the approval queue -- only
+        the mechanism for obtaining the verdict is.
 
         allow_scan is set only on the first pass of a controlled, bump-driven
         run. A replay is finishing an approval that was already granted against a
@@ -1081,7 +1271,7 @@ class AgenticChainWorkflow:
         # The bump is always computed from production, whatever the target. "The
         # next minor version" means the next one after what customers are running,
         # not the next one after whatever happens to be sitting on staging.
-        deployed = await self._execute_tool_activity(
+        deployed = await self._execute_tool_step(
             tool_name="get_deployed_version",
             arguments={"environment": PIPELINE_PRODUCTION_ENVIRONMENT},
             idempotency_key=f"{idempotency_key}:{pass_label}:deployed",
@@ -1122,7 +1312,7 @@ class AgenticChainWorkflow:
         # distinct callers would need a per-(service, environment) lease, which is
         # a larger design decision than this change. The gateway's own dedup
         # already covers the case the demo exercises, a caller retrying.
-        cut = await self._execute_tool_activity(
+        cut = await self._execute_tool_step(
             tool_name="cut_release",
             arguments={"service": service, "version": resolved},
             idempotency_key=f"{idempotency_key}:cut",
@@ -1130,7 +1320,11 @@ class AgenticChainWorkflow:
         self._log(
             "tool1_release_cut",
             parent,
-            {"version": resolved, "idempotent_replay": cut.get("idempotent_replay")},
+            {
+                "version": resolved,
+                "commit_sha": cut.get("commit_sha"),
+                "artifact_ref": cut.get("artifact_ref"),
+            },
         )
 
         result = {
@@ -1181,11 +1375,18 @@ class AgenticChainWorkflow:
                 f"{target}. The pipeline supports one approval gate, at its "
                 "target. Promote through the single-step tools instead."
             )
-        staged = await self._execute_tool_activity(
+        staged = await self._execute_tool_step(
             tool_name="promote_release",
             arguments=staging_arguments,
             idempotency_key=f"{idempotency_key}:staging",
         )
+        if staged.get("status") == "failed":
+            # The staging promotion declined to route traffic, so there is
+            # nothing on staging to qualify and nothing to promote onward.
+            raise QualityGateFailure(
+                str(staged.get("reason") or staged.get("message"))
+                or f"the staging promotion of {resolved} did not complete"
+            )
         result["staging_promotion_result"] = staged
         self._log(
             "tool1_staged",
@@ -1193,39 +1394,64 @@ class AgenticChainWorkflow:
             {
                 "version": resolved,
                 "environment": PIPELINE_STAGING_ENVIRONMENT,
-                "idempotent_replay": staged.get("idempotent_replay"),
+                "previous_version": staged.get("previous_version"),
+                "quality_gate_workflow_id": staged.get("quality_gate_workflow_id"),
             },
         )
 
-        # Quality gates deliberately do NOT reuse an idempotency key across
-        # passes. Cutting and promoting are mutations, so a replay must not repeat
-        # them; verifying is a read, so a replay should redo it rather than trust
-        # a stale verdict from before the pause. That asymmetry is also the honest
-        # cost of a Tool1 that cannot suspend: it pays for the gate run twice.
-        gate_arguments = {
-            "service": service,
-            "version": resolved,
-            "environment": PIPELINE_STAGING_ENVIRONMENT,
-        }
-        gates = await self._execute_tool_activity(
-            tool_name="run_quality_gates",
-            arguments=gate_arguments,
-            idempotency_key=f"{idempotency_key}:{pass_label}:gates",
+        # The pipeline does not run the gates. Reaching staging is what starts a
+        # gate run, wherever the promotion came from, and the pipeline's job here
+        # is to wait for the verdict on the exact candidate it just staged and
+        # then act on it.
+        #
+        # Waiting on that SPECIFIC run matters. Gate runs start on every staging
+        # promotion by any route -- an operator doing a CASE-1 manual promotion
+        # in the next tab starts one too -- so "the current gate state" is not a
+        # safe thing to read. The promotion handed back the id of its own gate
+        # workflow, and await_quality_gate refuses a verdict whose
+        # (service, version) does not match, so a crossed or stale result stops
+        # the pipeline rather than being promoted on.
+        #
+        # Deliberately not keyed by idempotency the way the mutations are: the
+        # cut and the staging promotion must not be repeated on a replay, but a
+        # verdict must not be trusted from before the pause, so a replay waits on
+        # the gate run its own staging promotion started.
+        gate_workflow_id = str(staged.get("quality_gate_workflow_id") or "")
+        if not gate_workflow_id:
+            raise QualityGateFailure(
+                f"{resolved} reached {PIPELINE_STAGING_ENVIRONMENT} without a "
+                "quality gate run, so the candidate is unqualified"
+            )
+        gates = await workflow.execute_activity(
+            await_quality_gate,
+            AwaitQualityGateInput(
+                gate_workflow_id=gate_workflow_id,
+                service=service,
+                version=resolved,
+            ),
+            start_to_close_timeout=QUALITY_GATE_WAIT_TIMEOUT,
+            retry_policy=RetryPolicy(maximum_attempts=3),
         )
         result["quality_gate_result"] = gates
         self._log(
-            "tool1_quality_gates",
+            "tool1_quality_gate_verdict",
             parent,
             {
                 "version": resolved,
+                "gate_workflow_id": gate_workflow_id,
+                "status": gates.get("status"),
                 "passed": gates.get("passed"),
-                "duration_seconds": gates.get("duration_seconds"),
             },
         )
         if not gates.get("passed"):
+            failed = [
+                str(check.get("check_name"))
+                for check in (gates.get("checks") or [])
+                if not check.get("passed")
+            ]
             raise QualityGateFailure(
-                str(gates.get("message"))
-                or f"quality gates failed for {resolved}"
+                f"quality gates failed for {resolved}"
+                + (": " + ", ".join(failed) if failed else "")
             )
 
         # The candidate is qualified. Before the pipeline opens the production
@@ -1284,7 +1510,7 @@ class AgenticChainWorkflow:
         protects production is still there.
         """
         try:
-            status = await self._execute_tool_activity(
+            status = await self._execute_tool_step(
                 tool_name=SCAN_CAPABILITY_TOOL,
                 arguments={
                     "service": service,
@@ -1324,7 +1550,7 @@ class AgenticChainWorkflow:
         """Pass a qualified release to the Security team, and park the pipeline.
 
         This is where CASE-2b stops being the same shape as CASE-2a. Up to here
-        every step was Waypoint's own work, correctly modeled as ordinary
+        every step was the Waypoint team's own work, correctly modeled as ordinary
         Activities inside this workflow, because one team genuinely owns cutting
         and staging and gating a release. A pre-prod security scan is not that. It
         is another team's system, and what happens next is a real handoff to it.
@@ -1440,7 +1666,7 @@ class AgenticChainWorkflow:
                     "replay": replay,
                 },
             )
-            resume_result = await self._execute_tool_activity(
+            resume_result = await self._execute_tool_step(
                 tool_name=f"{parent.tool_name}_resume",
                 arguments={
                     **parent.arguments,
@@ -1463,7 +1689,7 @@ class AgenticChainWorkflow:
             }
             parent.decided_iso = workflow.now().isoformat()
             self._log("tool1_completed", parent)
-        except ActivityError as err:
+        except TOOL_STEP_ERRORS as err:
             parent.status = OperationStatus.FAILED
             parent.error = str(err)
             parent.decided_iso = workflow.now().isoformat()
@@ -1633,6 +1859,14 @@ class AgenticChainWorkflow:
             # The child is the operation the external Tool1 was told to wait on,
             # so its terminal status is what gets delivered back.
             callback_workflow_id=req.callback_workflow_id,
+            # Which team's check gated this promotion decides who is allowed to
+            # approve it. A promotion the Security team's scan asked for may only
+            # be approved by the Security team; a pipeline the Waypoint team ran
+            # for itself carries no restriction and stays approvable by anyone in
+            # GATEWAY_APPROVERS, exactly as before.
+            required_approver_team=CALLER_SERVICE_APPROVER_TEAMS.get(
+                str(req.correlation.caller_service or "").lower()
+            ),
         )
 
     def _response_for(self, op: Operation) -> ToolCallResponse:
@@ -1805,6 +2039,7 @@ class AgenticChainWorkflow:
                     controlled_tool=op.controlled_tool,
                     replay_safe=op.replay_safe,
                     checkpoint=op.checkpoint,
+                    required_approver_team=op.required_approver_team,
                 )
             )
         return ChainSummary(
