@@ -7,27 +7,27 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
-    from release_safety.models import (
-        CanaryAnalysisInput,
-        CanaryResult,
-        CanaryState,
-        CanaryStatusView,
-        CanaryTickInput,
-        CANARY_THRESHOLD,
-        PublishCanaryStateInput,
+    from security_scan.models import (
+        SecurityScanInput,
+        ScanCheckInput,
+        ScanResult,
+        ScanState,
+        ScanStatusView,
+        SCAN_FINDING_SEVERITY_THRESHOLD,
+        PublishScanStateInput,
     )
-    from release_safety.nexus_contracts import (
+    from security_scan.nexus_contracts import (
         AGENT_GATEWAY_ENDPOINT,
         AgentGatewayService,
         ProtectedActionRequest,
         ToolOutcomeReport,
     )
-    from release_safety.canary_activities import (
-        publish_canary_state,
-        run_canary_tick,
+    from security_scan.security_scan_activities import (
+        publish_scan_state,
+        run_scan_check,
     )
 
-TICK_TIMEOUT = timedelta(seconds=15)
+CHECK_TIMEOUT = timedelta(seconds=15)
 PUBLISH_TIMEOUT = timedelta(seconds=10)
 # The gateway holds this open across a human decision, so there is no useful
 # upper bound short of the approval window itself plus slack.
@@ -36,27 +36,35 @@ REPORT_TIMEOUT = timedelta(seconds=30)
 
 
 @workflow.defn
-class CanaryAnalysisWorkflow:
-    """Release Safety's canary window, and the checkpoint that outlives a pause.
+class SecurityScanWorkflow:
+    """The Security team's pre-prod scan, and the checkpoint that outlives a pause.
 
     This is Tool1 in the requirements document's sense: a tool that is owned and
-    operated by another team, is independently durable, and can therefore be
-    told "waiting_for_approval" and survive it. Nothing about that is simulated
-    here. This workflow runs in the release-safety namespace, on the
-    release-safety-tq task queue, in a worker process the Agent Gateway team does
-    not deploy. It is not a child workflow of the chain: the two are peers,
-    correlated by a shared workflow_id value that is passed in explicitly.
+    operated by another team, is independently durable, and can therefore be told
+    "waiting_for_approval" and survive it. Nothing about that is simulated here.
+    This workflow runs in the security namespace, on the security-tq task queue,
+    in a worker process the Agent Gateway team does not deploy. It is not a child
+    workflow of the chain: the two are peers, correlated by a shared workflow_id
+    value that is passed in explicitly.
+
+    A scan is the honest version of this claim. It is genuinely long-running and
+    genuinely variable -- a dependency scan against a fresh advisory feed, an
+    image scan over a rebuilt base layer, and every so often a flagged finding
+    that stops the whole thing until a reviewer looks at it. Something that has to
+    hold its place across that cannot be a request-scoped process, and the
+    Security team's platform was durable long before Agent Gateway existed.
 
     The shape of the run is:
 
-        watch the canary window, tick by tick, entirely on its own
-        if any tick is over threshold, stop; the gateway is never asked
+        run the scan stages, one at a time, entirely on its own
+        if any stage finds something at or above the threshold, stop; the gateway
+            is never asked
         otherwise, call Agent Gateway's Nexus endpoint to request the promotion
         SUSPEND on that operation until a human somewhere decides
 
     The stop is the whole point, and it is a real suspension of this workflow's
     own execution rather than of Agent Gateway's. Kill this worker while the
-    operation is pending and the window's results, the verdict, and the pending
+    operation is pending and the stage results, the verdict, and the pending
     operation all come back on replay, with the wait resuming exactly where it
     was.
 
@@ -68,53 +76,53 @@ class CanaryAnalysisWorkflow:
     """
 
     @workflow.init
-    def __init__(self, input: CanaryAnalysisInput) -> None:
+    def __init__(self, input: SecurityScanInput) -> None:
         self._input = input
-        self._state = CanaryState(
-            phase="running_canary",
-            window_ticks=input.window_ticks,
+        self._state = ScanState(
+            phase="running_scan",
+            stage_count=input.stage_count,
             gateway_workflow_id=input.workflow_id,
         )
 
     @workflow.run
-    async def run(self, input: CanaryAnalysisInput) -> CanaryResult:
+    async def run(self, input: SecurityScanInput) -> ScanResult:
         await self._publish()
 
-        # Phase 1: the canary window. Entirely local to Release Safety; Agent
-        # Gateway does not know this is happening and does not need to. Each tick
-        # is its own Activity so it lands in Event History individually: a worker
-        # restart mid-window resumes at the next un-run tick instead of starting
-        # the window over, which is the property being demonstrated when the
-        # container is killed between tick 2 and tick 3.
-        for tick_number in range(1, input.window_ticks + 1):
-            tick = await workflow.execute_activity(
-                run_canary_tick,
-                CanaryTickInput(
+        # Phase 1: the scan itself. Entirely local to the Security team; Agent
+        # Gateway does not know this is happening and does not need to. Each
+        # stage is its own Activity so it lands in Event History individually: a
+        # worker restart mid-scan resumes at the next un-run stage instead of
+        # rescanning from the top, which is the property being demonstrated when
+        # the container is killed between the second and third stage.
+        for stage_number in range(1, input.stage_count + 1):
+            stage = await workflow.execute_activity(
+                run_scan_check,
+                ScanCheckInput(
                     service=input.service,
                     version=input.version,
-                    tick_number=tick_number,
-                    window_ticks=input.window_ticks,
+                    stage_number=stage_number,
+                    stage_count=input.stage_count,
                     scripted_outcome=input.scripted_outcome,
-                    canary_workflow_id=workflow.info().workflow_id,
+                    scan_workflow_id=workflow.info().workflow_id,
                     environment=input.environment,
                 ),
-                start_to_close_timeout=TICK_TIMEOUT,
+                start_to_close_timeout=CHECK_TIMEOUT,
                 retry_policy=RetryPolicy(maximum_attempts=3),
             )
-            self._state.tick_results.append(tick)
-            self._state.ticks_completed = tick_number
-            if not tick["passed"]:
-                return await self._fail_window(tick)
+            self._state.stage_results.append(stage)
+            self._state.stages_completed = stage_number
+            if not stage["passed"]:
+                return await self._fail_scan(stage)
             await self._publish()
-            if tick_number < input.window_ticks:
-                await workflow.sleep(timedelta(seconds=input.tick_seconds))
+            if stage_number < input.stage_count:
+                await workflow.sleep(timedelta(seconds=input.check_seconds))
 
         self._state.verdict = "pass"
 
-        # Phase 2: the nested call. Canary is now itself a tool caller, and it
+        # Phase 2: the nested call. The scan is now itself a tool caller, and it
         # goes through Agent Gateway rather than promoting anything directly,
-        # because promoting to production is a protected action and canary has no
-        # more right to do it unsupervised than anyone else does.
+        # because promoting to production is a protected action and the Security
+        # team has no more right to do it unsupervised than anyone else does.
         #
         # Straight from workflow code. No Activity, no client, no credentials for
         # anyone else's namespace: a Nexus call to a published endpoint.
@@ -134,14 +142,15 @@ class CanaryAnalysisWorkflow:
                 idempotency_key=(
                     input.idempotency_key or workflow.info().workflow_id
                 ),
-                caller_service="release-safety",
+                caller_service="security",
                 caller_principal=input.requester,
                 caller_workflow_id=workflow.info().workflow_id,
                 origin_operation_id=input.origin_operation_id,
                 justification=(
-                    f"Canary passed {input.window_ticks} consecutive ticks for "
-                    f"{input.service} {input.version}, all under the "
-                    f"{CANARY_THRESHOLD:.0%} error-rate threshold"
+                    f"Pre-prod security scan cleared all {input.stage_count} "
+                    f"stages for {input.service} {input.version} with no "
+                    f"findings at or above {SCAN_FINDING_SEVERITY_THRESHOLD} "
+                    f"severity"
                 ),
             ),
             schedule_to_close_timeout=PROTECTED_ACTION_TIMEOUT,
@@ -154,11 +163,11 @@ class CanaryAnalysisWorkflow:
         # Phase 3: the checkpoint. Execution genuinely stops here, on a pending
         # Nexus operation, for as long as it takes a person to decide.
         #
-        # Everything above this line -- every tick, the verdict, the outbound
+        # Everything above this line -- every stage, the verdict, the outbound
         # operation -- is already in this workflow's own Event History, in this
-        # namespace, under this team's retention policy. Kill the release-safety
+        # namespace, under this team's retention policy. Kill the security scan
         # worker now and replay rebuilds all of it without re-running a single
-        # tick, and this await picks up exactly where it left off.
+        # stage, and this await picks up exactly where it left off.
         outcome = await handle
         self._state.gateway_operation_id = outcome.operation_id
 
@@ -187,16 +196,16 @@ class CanaryAnalysisWorkflow:
     # this workflow is suspended on simply completes.
 
     @workflow.query
-    def get_status(self) -> CanaryStatusView:
-        return CanaryStatusView(
-            canary_workflow_id=workflow.info().workflow_id,
+    def get_status(self) -> ScanStatusView:
+        return ScanStatusView(
+            scan_workflow_id=workflow.info().workflow_id,
             service=self._input.service,
             version=self._input.version,
             environment=self._input.environment,
             phase=self._state.phase,
-            ticks_completed=self._state.ticks_completed,
-            window_ticks=self._state.window_ticks,
-            tick_results=list(self._state.tick_results),
+            stages_completed=self._state.stages_completed,
+            stage_count=self._state.stage_count,
+            stage_results=list(self._state.stage_results),
             verdict=self._state.verdict,
             gateway_workflow_id=self._state.gateway_workflow_id,
             gateway_operation_token=self._state.gateway_operation_token,
@@ -207,20 +216,22 @@ class CanaryAnalysisWorkflow:
 
     # -------------------------------------------------------------- helpers
 
-    async def _fail_window(self, tick: dict) -> CanaryResult:
-        """One tick over threshold ends the window.
+    async def _fail_scan(self, stage: dict) -> ScanResult:
+        """One finding at or above the threshold ends the scan.
 
-        Deliberately not averaged, retried past, or given a second chance. The
-        gateway is never called, so a release that failed its canary never
+        Deliberately not averaged, rescanned past, or given a second chance. The
+        gateway is never called, so a release that failed its security scan never
         reaches the approval queue at all -- the same fail-closed shape the
         quality gate already has, one checkpoint further along.
         """
-        self._state.phase = "canary_failed"
+        self._state.phase = "scan_failed"
         self._state.verdict = "fail"
+        finding_word = "finding" if stage["findings"] == 1 else "findings"
         self._state.error = (
-            f"Tick {tick['tick']} of {self._state.window_ticks} reported an "
-            f"error rate of {tick['error_rate']:.1%}, over the "
-            f"{tick['threshold']:.1%} threshold"
+            f"{stage['stage_name']} (stage {stage['stage']} of "
+            f"{self._state.stage_count}) reported {stage['findings']} "
+            f"{finding_word} at {stage['max_severity']} severity, at or above "
+            f"the {SCAN_FINDING_SEVERITY_THRESHOLD} threshold"
         )
         await self._publish()
         await self._report_verdict("fail", self._state.error)
@@ -229,10 +240,10 @@ class CanaryAnalysisWorkflow:
     async def _report_verdict(self, verdict: str, reason: str | None) -> None:
         """Tell Agent Gateway the promotion is not coming.
 
-        Only needed when the window closes red. A green window reports itself by
-        requesting the promotion; a red one never asks for anything, and without
-        this the release pipeline operation that handed off would sit waiting on
-        a request that is never going to arrive.
+        Only needed when the scan closes red. A clean scan reports itself by
+        requesting the promotion; a failed one never asks for anything, and
+        without this the release pipeline operation that handed off would sit
+        waiting on a request that is never going to arrive.
 
         Synchronous, because there is nothing to wait for.
         """
@@ -251,42 +262,41 @@ class CanaryAnalysisWorkflow:
                     outcome=verdict,
                     reason=reason,
                     detail={
-                        "tick_results": list(self._state.tick_results),
-                        "threshold": CANARY_THRESHOLD,
+                        "stage_results": list(self._state.stage_results),
+                        "severity_threshold": SCAN_FINDING_SEVERITY_THRESHOLD,
                     },
                 ),
                 schedule_to_close_timeout=REPORT_TIMEOUT,
             )
         except Exception as err:
-            # The window's own verdict is already durable here. Failing to
-            # deliver it does not change what canary observed, so it is recorded
-            # and the workflow still completes with the right answer.
+            # The scan's own verdict is already durable here. Failing to deliver
+            # it does not change what the scan found, so it is recorded and the
+            # workflow still completes with the right answer.
             workflow.logger.error(
-                "could not deliver the canary verdict to Agent Gateway",
+                "could not deliver the scan verdict to Agent Gateway",
                 extra={"error": str(err)},
             )
 
     async def _publish(self) -> None:
-        """Push window progress to the shared observability backend.
+        """Push scan progress to the shared observability backend.
 
-        Visibility only. A publish failure must never fail a canary window, so
+        Visibility only. A publish failure must never fail a security scan, so
         this swallows Activity errors rather than propagating them: whether the
-        dashboard can draw a card has nothing to do with whether the release is
-        safe.
+        dashboard can draw a card has nothing to do with what the scan found.
         """
         try:
             await workflow.execute_activity(
-                publish_canary_state,
-                PublishCanaryStateInput(
-                    canary_workflow_id=workflow.info().workflow_id,
+                publish_scan_state,
+                PublishScanStateInput(
+                    scan_workflow_id=workflow.info().workflow_id,
                     service=self._input.service,
                     version=self._input.version,
                     environment=self._input.environment,
                     phase=self._state.phase,
-                    ticks_completed=self._state.ticks_completed,
-                    window_ticks=self._state.window_ticks,
-                    threshold=CANARY_THRESHOLD,
-                    tick_results=list(self._state.tick_results),
+                    stages_completed=self._state.stages_completed,
+                    stage_count=self._state.stage_count,
+                    severity_threshold=SCAN_FINDING_SEVERITY_THRESHOLD,
+                    stage_results=list(self._state.stage_results),
                     verdict=self._state.verdict,
                     gateway_operation_id=self._state.gateway_operation_id,
                     error=self._state.error,
@@ -296,14 +306,14 @@ class CanaryAnalysisWorkflow:
             )
         except ActivityError as err:
             workflow.logger.warning(
-                "could not publish canary state", extra={"error": str(err)}
+                "could not publish scan state", extra={"error": str(err)}
             )
 
-    def _result(self) -> CanaryResult:
-        return CanaryResult(
+    def _result(self) -> ScanResult:
+        return ScanResult(
             phase=self._state.phase,
             verdict=self._state.verdict,
-            tick_results=list(self._state.tick_results),
+            stage_results=list(self._state.stage_results),
             gateway_operation_id=self._state.gateway_operation_id,
             promotion_result=self._state.promotion_result,
             error=self._state.error,

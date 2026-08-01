@@ -172,7 +172,7 @@ class NestedToolCallRequest:
     callback_workflow_id: str = ""
     # An operation elsewhere in this chain that is waiting on this nested call to
     # resolve. CASE-2b sets it to the release pipeline's own operation, which
-    # handed off to canary analysis and is parked until the promotion lands.
+    # handed off to the security scan and is parked until the promotion lands.
     origin_operation_id: str = ""
 
 
@@ -193,7 +193,7 @@ class ResumeNestedRequest:
 # by the gateway's own workflows in the gateway's own namespace.
 #
 # That split is the whole design. There used to be a set of types here that were
-# hand-mirrored in release_safety/models.py, because both sides had to agree on
+# hand-mirrored in security_scan/models.py, because both sides had to agree on
 # an internal request struct. They do not any more.
 # --------------------------------------------------------------------------
 
@@ -246,19 +246,19 @@ class SignalOperationCallbackInput:
 
 
 @dataclass
-class CanaryVerdict:
+class ScanVerdict:
     """A checkpoint's verdict, signaled to the chain workflow.
 
-    Only a failing verdict needs this: a passing canary reports itself by
-    requesting the promotion. A failing one never asks for anything, so without
-    it the pipeline operation parked on the handoff would wait forever for a
-    request that is not coming.
+    Only a failing verdict needs this: a clean scan reports itself by requesting
+    the promotion. A failing one never asks for anything, so without it the
+    pipeline operation parked on the handoff would wait forever for a request
+    that is not coming.
 
     Raised into the chain by the gateway's own Nexus handler, not by the caller.
     """
 
     origin_operation_id: str
-    canary_workflow_id: str
+    scan_workflow_id: str
     verdict: str
     reason: Optional[str] = None
     detail: dict[str, Any] = field(default_factory=dict)

@@ -16,8 +16,8 @@ EXPOSE 7233 8233
 # start-dev is for development only. --db-filename persists state to the volume so
 # the demo survives container restarts. The Web UI is served on 8233.
 #
-# Two namespaces, not one. "default" is Agent Gateway's; "release-safety" belongs
-# to the Release Safety team, who own canary analysis. Namespace separation is
+# Two namespaces, not one. "default" is Agent Gateway's; "security" belongs to
+# the Security team, who own pre-prod scanning. Namespace separation is
 # the honest boundary for "a different team runs this": independent retention,
 # independent visibility, independent operator ownership, independent failure
 # domain. It also gives the Web UI a namespace selector the demo can switch
@@ -26,5 +26,5 @@ EXPOSE 7233 8233
 CMD ["temporal", "server", "start-dev", \
      "--ip", "0.0.0.0", \
      "--db-filename", "/data/temporal.db", \
-     "--namespace", "release-safety", \
+     "--namespace", "security", \
      "--ui-port", "8233"]

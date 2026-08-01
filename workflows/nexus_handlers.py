@@ -16,7 +16,7 @@ from nexusrpc.handler import service_handler, sync_operation
 from temporalio import nexus
 from temporalio.nexus import WorkflowRunOperationContext, workflow_run_operation
 
-from common.models import CanaryVerdict
+from common.models import ScanVerdict
 from common.nexus_contracts import (
     AgentGatewayService,
     ProtectedActionOutcome,
@@ -26,7 +26,7 @@ from common.nexus_contracts import (
 )
 from workflows.protected_action import ProtectedActionWorkflow
 
-CHAIN_CANARY_VERDICT_SIGNAL = "canary_verdict_reported"
+CHAIN_SCAN_VERDICT_SIGNAL = "scan_verdict_reported"
 
 
 @service_handler(service=AgentGatewayService)
@@ -67,10 +67,10 @@ class AgentGatewayServiceHandler:
         client = nexus.client()
         handle = client.get_workflow_handle(input.gateway_workflow_id)
         await handle.signal(
-            CHAIN_CANARY_VERDICT_SIGNAL,
-            CanaryVerdict(
+            CHAIN_SCAN_VERDICT_SIGNAL,
+            ScanVerdict(
                 origin_operation_id=input.origin_operation_id,
-                canary_workflow_id=input.caller_workflow_id,
+                scan_workflow_id=input.caller_workflow_id,
                 verdict=input.outcome,
                 reason=input.reason,
                 detail=input.detail,

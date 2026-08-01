@@ -248,16 +248,16 @@ async def _prod_requires_approval_for_the_computed_version(
     # Tool1 ran the team's whole pipeline: read production (seeded at 2.2.0),
     # computed the next minor, cut it, put it on staging, and qualified it there.
     # The canned prepare tool is gone from this path.
-    # ...and then looked for a canary provider, found none registered, and
+    # ...and then looked for a security scan provider, found none registered, and
     # opened the production promotion itself. That last step is CASE-2a: with
-    # the Release Safety team's platform not running, the pipeline behaves
-    # exactly as it did before canary existed.
+    # the Security team's platform not running, the pipeline behaves exactly as it
+    # did before the scan existed.
     assert _tool_names() == [
         "get_deployed_version",
         "cut_release",
         "promote_release",
         "run_quality_gates",
-        "get_release_safety_status",
+        "get_security_scan_status",
     ]
     assert "release_orchestrator_prepare" not in _tool_names()
     # The bump always reads production, whatever the target.
@@ -333,7 +333,7 @@ async def _prod_requires_approval_for_the_computed_version(
         "cut_release",
         "promote_release",
         "run_quality_gates",
-        "get_release_safety_status",
+        "get_security_scan_status",
         "promote_release",
         "release_orchestrator_resume",
     ]
@@ -437,7 +437,7 @@ async def _duplicate_call_dedups_without_a_second_cut(
         "cut_release",
         "promote_release",
         "run_quality_gates",
-        "get_release_safety_status",
+        "get_security_scan_status",
     ]
     ledger = await handle.query(AgenticChainWorkflow.get_ledger)
     assert any(entry.event == "dedup_hit" for entry in ledger)

@@ -10,7 +10,6 @@ from temporalio.exceptions import ActivityError
 with workflow.unsafe.imports_passed_through():
     from common.models import (
         ApprovalDecision,
-        CanaryVerdict,
         CancelOperation,
         ChainInput,
         ChainState,
@@ -23,14 +22,15 @@ with workflow.unsafe.imports_passed_through():
         OperationView,
         NestedToolCallRequest,
         ResumeNestedRequest,
+        ScanVerdict,
         SignalOperationCallbackInput,
         ToolCallRequest,
         ToolCallResponse,
     )
     from common.nexus_contracts import (
-        OpenCanaryWindowInput,
-        RELEASE_SAFETY_ENDPOINT,
-        ReleaseSafetyService,
+        SECURITY_ENDPOINT,
+        SecurityScanService,
+        StartSecurityScanInput,
     )
     from common.semver import InvalidVersionError, next_version, normalize_bump
     from activities.gateway_activities import (
@@ -42,11 +42,11 @@ with workflow.unsafe.imports_passed_through():
 
 POLICY_TIMEOUT = timedelta(seconds=10)
 INVOKE_TIMEOUT = timedelta(seconds=60)
-# Opening a canary window with Release Safety. A Nexus call to another team's
-# endpoint, and a short one: their handler starts a workflow and hands back its
-# id rather than waiting for the window to close. See _hand_off_to_canary for
-# why it must not be the other way round.
-CANARY_HANDOFF_TIMEOUT = timedelta(seconds=30)
+# Starting a pre-prod security scan with the Security team. A Nexus call to
+# another team's endpoint, and a short one: their handler starts a workflow and
+# hands back its id rather than waiting for the scan to finish. See
+# _hand_off_to_scan for why it must not be the other way round.
+SCAN_HANDOFF_TIMEOUT = timedelta(seconds=30)
 # Delivering a decision to whatever is holding a request open. Same namespace,
 # but worth retrying hard: it is what wakes a system that is deliberately asleep.
 CALLBACK_TIMEOUT = timedelta(seconds=30)
@@ -91,13 +91,13 @@ LEDGER_RETENTION = 500
 PIPELINE_STAGING_ENVIRONMENT = "staging"
 PIPELINE_PRODUCTION_ENVIRONMENT = "prod"
 
-# The capability lookup the pipeline does after its gates pass. Canary analysis
-# belongs to the Release Safety team, so the pipeline does not have it
-# configured; it asks the shared platform whether that team is currently
-# offering it, and routes through it when they are. Before Release Safety ships
-# canary -- and any time their worker is not running -- the answer is no and the
+# The capability lookup the pipeline does after its gates pass. Pre-prod security
+# scanning belongs to the Security team, so the pipeline does not have it
+# configured; it asks the shared platform whether that team is currently offering
+# it, and routes through it when they are. Before the Security team onboards
+# Waypoint -- and any time their worker is not running -- the answer is no and the
 # pipeline opens the production promotion itself, exactly as it always did.
-CANARY_CAPABILITY_TOOL = "get_release_safety_status"
+SCAN_CAPABILITY_TOOL = "get_security_scan_status"
 
 
 class QualityGateFailure(Exception):
@@ -321,7 +321,7 @@ class AgenticChainWorkflow:
                         parent,
                         req.bump,
                         req.idempotency_key,
-                        allow_canary=req.controlled_tool1,
+                        allow_scan=req.controlled_tool1,
                     )
                     resolved_tool2_arguments = {
                         **req.tool2_arguments,
@@ -399,9 +399,9 @@ class AgenticChainWorkflow:
                 }
             self._log("tool1_checkpointed", parent, {"stage": "waiting_for_tool2"})
 
-            handoff = prepare.get("canary_handoff") if req.bump else None
+            handoff = prepare.get("scan_handoff") if req.bump else None
             if handoff:
-                return await self._hand_off_to_canary(
+                return await self._hand_off_to_scan(
                     parent, req, handoff, resolved_version
                 )
 
@@ -696,16 +696,16 @@ class AgenticChainWorkflow:
         self._propagate_child_terminal(op)
 
     @workflow.signal
-    def canary_verdict_reported(self, verdict: CanaryVerdict) -> None:
-        """Release Safety reporting that no promotion request is coming.
+    def scan_verdict_reported(self, verdict: ScanVerdict) -> None:
+        """The Security team reporting that no promotion request is coming.
 
-        Only the failing verdict arrives this way. A canary that passes reports
+        Only the failing verdict arrives this way. A scan that clears reports
         itself by making the nested promote_release call, which is a request the
-        gateway governs like any other. A canary that fails has nothing to
-        request, and without this the pipeline operation that handed off would
-        wait indefinitely on a call that will never be made.
+        gateway governs like any other. A scan that fails has nothing to request,
+        and without this the pipeline operation that handed off would wait
+        indefinitely on a call that will never be made.
 
-        A failed canary means production was never touched, which is the same
+        A failed scan means production was never touched, which is the same
         fail-closed shape as a failed quality gate, one checkpoint later.
         """
         op = self._state.operations.get(verdict.origin_operation_id)
@@ -717,29 +717,29 @@ class AgenticChainWorkflow:
             # ledger shows the verdict arriving even on the path that does not
             # need it.
             self._log(
-                "canary_passed",
+                "security_scan_passed",
                 op,
-                {"canary_workflow_id": verdict.canary_workflow_id},
+                {"scan_workflow_id": verdict.scan_workflow_id},
             )
             return
         op.status = OperationStatus.FAILED
         op.error = (
-            f"Canary analysis did not pass: {verdict.reason}"
+            f"The pre-prod security scan did not pass: {verdict.reason}"
             if verdict.reason
-            else "Canary analysis did not pass."
+            else "The pre-prod security scan did not pass."
         )
         op.checkpoint = {
             **op.checkpoint,
-            "stage": "canary_failed",
-            "canary_verdict": verdict.verdict,
-            "canary_detail": verdict.detail,
+            "stage": "security_scan_failed",
+            "scan_verdict": verdict.verdict,
+            "scan_detail": verdict.detail,
         }
         op.decided_iso = workflow.now().isoformat()
         self._log(
-            "canary_failed",
+            "security_scan_failed",
             op,
             {
-                "canary_workflow_id": verdict.canary_workflow_id,
+                "scan_workflow_id": verdict.scan_workflow_id,
                 "verdict": verdict.verdict,
                 "reason": verdict.reason,
             },
@@ -885,17 +885,17 @@ class AgenticChainWorkflow:
         return origin
 
     async def _settle_handoffs(self) -> None:
-        """Close the loop with anything that handed work to, or through, canary.
+        """Close the loop with anything that handed work to, or through, the scan.
 
         Two separate obligations, both driven from the main loop rather than from
         the Signal handlers that create them, because handlers here only mutate
         state and never drive Activities:
 
         1. Deliver terminal results back to a durable external Tool1 that is
-           suspended waiting for one. This is the other half of the pause: canary
-           genuinely stopped executing, and this is what starts it again.
-        2. Settle the release pipeline operation that handed off to canary, once
-           the promotion canary requested has actually resolved.
+           suspended waiting for one. This is the other half of the pause: the
+           scan genuinely stopped executing, and this is what starts it again.
+        2. Settle the release pipeline operation that handed off to the scan, once
+           the promotion the scan requested has actually resolved.
 
         Both are idempotent, and both are driven off durable operation state
         rather than an in-memory queue, so a Worker restart mid-notification
@@ -909,7 +909,7 @@ class AgenticChainWorkflow:
                 continue
             if self._needs_callback(op):
                 # Marked before the call, not after. The Activity retries hard on
-                # its own, and a duplicate Signal is harmless (canary ignores a
+                # its own, and a duplicate Signal is harmless (the scan ignores a
                 # resolution it has already taken), but a loop that re-queued the
                 # same notification on every pass would not be.
                 op.callback_notified = True
@@ -952,30 +952,30 @@ class AgenticChainWorkflow:
                 self._settle_origin(origin, op)
 
     def _settle_origin(self, origin: Operation, op: Operation) -> None:
-        """Finish the pipeline operation that handed off to canary."""
+        """Finish the pipeline operation that handed off to the security scan."""
         origin.checkpoint = {
             **origin.checkpoint,
-            "stage": "canary_completed",
-            "canary_operation_id": op.operation_id,
+            "stage": "security_scan_completed",
+            "scan_operation_id": op.operation_id,
         }
         if op.status == OperationStatus.COMPLETED:
             origin.status = OperationStatus.COMPLETED
             origin.result = {
                 "pipeline_result": origin.checkpoint.get("tool1_prepare_result"),
-                "canary_result": op.result,
+                "scan_result": op.result,
                 "resumed_from_checkpoint": True,
             }
         else:
             origin.status = op.status
             origin.error = op.error or (
-                f"Canary analysis ended {op.status.value} before the promotion."
+                f"The security scan ended {op.status.value} before the promotion."
             )
         origin.decided_iso = workflow.now().isoformat()
         self._log(
-            "canary_pipeline_settled",
+            "security_scan_pipeline_settled",
             origin,
             {
-                "canary_operation_id": op.operation_id,
+                "scan_operation_id": op.operation_id,
                 "status": origin.status.value,
             },
         )
@@ -1018,7 +1018,7 @@ class AgenticChainWorkflow:
         idempotency_key: str,
         pass_label: str = "prepare",
         expect_version: str = "",
-        allow_canary: bool = False,
+        allow_scan: bool = False,
     ) -> tuple[dict, str]:
         """Run the release pipeline up to the target promotion, and report it.
 
@@ -1035,14 +1035,14 @@ class AgenticChainWorkflow:
             cut that release
             promote it to staging                  (skipped for a staging target)
             run quality gates against staging      (skipped for a staging target)
-            look for a canary provider             (allow_canary only)
-            -- caller either hands off to canary, or creates the target
+            look for a security scan provider      (allow_scan only)
+            -- caller either hands off to the scan, or creates the target
                promotion as the child operation --
 
         A staging target gets the first leg only: the staging promotion is then
         the child, and there is nothing to qualify a candidate for.
 
-        allow_canary is set only on the first pass of a controlled, bump-driven
+        allow_scan is set only on the first pass of a controlled, bump-driven
         run. A replay is finishing an approval that was already granted against a
         promotion that already exists, so there is nothing left to hand off; and
         an uncontrolled caller cannot be parked waiting on another system's
@@ -1229,26 +1229,26 @@ class AgenticChainWorkflow:
             )
 
         # The candidate is qualified. Before the pipeline opens the production
-        # promotion itself, it asks whether anyone is offering canary analysis
-        # for this service. This is a lookup, not a setting: Release Safety owns
-        # that capability, advertises it while their platform is running, and the
-        # pipeline routes through it when it is there. When it is not, the next
+        # promotion itself, it asks whether anyone is offering a pre-prod security
+        # scan for this service. This is a lookup, not a setting: the Security team
+        # owns that capability, advertises it while their platform is running, and
+        # the pipeline routes through it when it is there. When it is not, the next
         # line of this function is the production promotion, which is what the
-        # pipeline did for its whole life before canary existed.
+        # pipeline did for its whole life before the Security team onboarded it.
         handoff = None
-        if allow_canary:
-            handoff = await self._canary_capability(
+        if allow_scan:
+            handoff = await self._scan_capability(
                 parent, service, resolved, target, idempotency_key, pass_label
             )
-        result["canary_handoff"] = handoff
+        result["scan_handoff"] = handoff
 
         if handoff:
             result["message"] = (
                 f"Tool1 read {current} from production, computed {resolved} for "
                 f"a {kind} bump, cut it, promoted it to "
                 f"{PIPELINE_STAGING_ENVIRONMENT}, passed quality gates, and "
-                f"handed off to {handoff['provider']} for canary analysis "
-                f"before the protected {target} promotion"
+                f"handed off to {handoff['provider']} for a pre-prod "
+                f"security scan before the protected {target} promotion"
             )
             return result, resolved
 
@@ -1260,7 +1260,7 @@ class AgenticChainWorkflow:
         )
         return result, resolved
 
-    async def _canary_capability(
+    async def _scan_capability(
         self,
         parent: Operation,
         service: str,
@@ -1269,78 +1269,79 @@ class AgenticChainWorkflow:
         idempotency_key: str,
         pass_label: str,
     ) -> dict | None:
-        """Ask the shared platform whether canary analysis is on offer.
+        """Ask the shared platform whether pre-prod security scanning is on offer.
 
         Keyed per pass, like the gate run and the production read, because it is
-        a read of something that moves: Release Safety can ship canary, or take
-        their platform down for a deploy, between one pipeline run and the next.
+        a read of something that moves: the Security team can onboard a service, or
+        take their platform down for a deploy, between one pipeline run and the
+        next.
 
         A failure to reach the registry is not a reason to stop the release. It
-        means the pipeline could not learn that canary exists, so it behaves the
-        way it behaves when canary does not exist, and the production promotion
+        means the pipeline could not learn that the scan exists, so it behaves the
+        way it behaves when the scan does not exist, and the production promotion
         still goes in front of a human either way. Nothing is skipped by
         failing this lookup; a checkpoint is skipped, and the one that actually
         protects production is still there.
         """
         try:
             status = await self._execute_tool_activity(
-                tool_name=CANARY_CAPABILITY_TOOL,
+                tool_name=SCAN_CAPABILITY_TOOL,
                 arguments={
                     "service": service,
                     "version": version,
                     "environment": target,
                 },
-                idempotency_key=f"{idempotency_key}:{pass_label}:canary-status",
+                idempotency_key=f"{idempotency_key}:{pass_label}:scan-status",
             )
         except ActivityError as err:
             self._log(
-                "canary_capability_unavailable",
+                "scan_capability_unavailable",
                 parent,
                 {"error": str(err)},
             )
             return None
         if not status.get("available"):
             return None
-        # Just who is offering, and nothing about how they do it. The window's
-        # length, its threshold, and which versions it rejects all used to be
-        # relayed through here, which meant the caller was telling the canary
-        # what verdict to reach. They live behind the endpoint now.
-        handoff = {"provider": str(status.get("provider", "release-safety"))}
+        # Just who is offering, and nothing about how they do it. Which stages
+        # run, the severity threshold, and which versions it rejects all used to be
+        # relayed through here, which meant the caller was telling the scan what
+        # verdict to reach. They live behind the endpoint now.
+        handoff = {"provider": str(status.get("provider", "security"))}
         self._log(
-            "canary_capability_discovered",
+            "scan_capability_discovered",
             parent,
             {"version": version, **handoff},
         )
         return handoff
 
-    async def _hand_off_to_canary(
+    async def _hand_off_to_scan(
         self,
         parent: Operation,
         req: NestedToolCallRequest,
         handoff: dict,
         version: str,
     ) -> ToolCallResponse:
-        """Pass a qualified release to Release Safety, and park the pipeline.
+        """Pass a qualified release to the Security team, and park the pipeline.
 
         This is where CASE-2b stops being the same shape as CASE-2a. Up to here
         every step was Waypoint's own work, correctly modeled as ordinary
         Activities inside this workflow, because one team genuinely owns cutting
-        and staging and gating a release. Canary analysis is not that. It is
-        another team's system, and what happens next is a real handoff to it.
+        and staging and gating a release. A pre-prod security scan is not that. It
+        is another team's system, and what happens next is a real handoff to it.
 
         The handoff is a Nexus call, straight from workflow code, to an endpoint
-        Release Safety owns. Notice everything this workflow does not know: not
-        their namespace, not their task queue, not their workflow type, not how
-        long a canary window runs, and not what would make one fail. It knows an
-        endpoint name and an operation contract, and they can change everything
-        behind it without this file being edited.
+        the Security team owns. Notice everything this workflow does not know: not
+        their namespace, not their task queue, not their workflow type, not which
+        stages a scan runs, and not what would make one fail. It knows an endpoint
+        name and an operation contract, and they can change everything behind it
+        without this file being edited.
 
-        The operation is deliberately synchronous, returning as soon as the
-        window is open. An asynchronous operation awaited for the whole window
-        would read better right up until this workflow continued-as-new, which it
-        does on Temporal's suggestion and will certainly do across an open-ended
-        human approval. Nexus operation handles do not survive Continue-As-New;
-        a workflow id does, because it is data. So the pipeline takes the id and
+        The operation is deliberately synchronous, returning as soon as the scan
+        has started. An asynchronous operation awaited for the whole scan would
+        read better right up until this workflow continued-as-new, which it does
+        on Temporal's suggestion and will certainly do across an open-ended human
+        approval. Nexus operation handles do not survive Continue-As-New; a
+        workflow id does, because it is data. So the pipeline takes the id and
         parks on its own state, which is the same reason approval deadlines here
         are absolute timestamps rather than Timers.
 
@@ -1348,62 +1349,62 @@ class AgenticChainWorkflow:
         workflow is blocked meanwhile: the chain keeps taking tool calls and
         approvals for anything else the operator is doing.
 
-        A canary that cannot be started stops the release. The alternative is
+        A scan that cannot be started stops the release. The alternative is
         promoting to production having skipped a checkpoint the pipeline just
         confirmed was in force, which is exactly the thing the gate machinery
         exists to refuse.
         """
-        canary = workflow.create_nexus_client(
-            service=ReleaseSafetyService, endpoint=RELEASE_SAFETY_ENDPOINT
+        security = workflow.create_nexus_client(
+            service=SecurityScanService, endpoint=SECURITY_ENDPOINT
         )
         try:
-            opened = await canary.execute_operation(
-                ReleaseSafetyService.open_canary_window,
-                OpenCanaryWindowInput(
+            opened = await security.execute_operation(
+                SecurityScanService.start_security_scan,
+                StartSecurityScanInput(
                     gateway_workflow_id=self._state.workflow_id,
                     origin_operation_id=parent.operation_id,
                     service=str(parent.arguments.get("service", "")),
                     version=version,
                     environment=str(parent.arguments.get("environment", "")),
-                    idempotency_key=f"{req.idempotency_key}:canary",
+                    idempotency_key=f"{req.idempotency_key}:security-scan",
                     requester=parent.requester or "",
                 ),
-                schedule_to_close_timeout=CANARY_HANDOFF_TIMEOUT,
+                schedule_to_close_timeout=SCAN_HANDOFF_TIMEOUT,
             )
         except Exception as err:
             parent.status = OperationStatus.FAILED
             parent.error = (
-                f"Could not open a canary window with "
+                f"Could not start a pre-prod security scan with "
                 f"{handoff['provider']}: {err}. The release stops here rather "
                 "than promoting to production without one."
             )
             parent.decided_iso = workflow.now().isoformat()
-            self._log("canary_handoff_failed", parent, {"error": str(err)})
+            self._log("security_scan_handoff_failed", parent, {"error": str(err)})
             return self._response_for(parent)
 
         parent.status = OperationStatus.WAITING_FOR_DEPENDENCY
         parent.checkpoint = {
             **parent.checkpoint,
-            "stage": "awaiting_canary",
-            "canary_provider": handoff["provider"],
-            "canary_endpoint": RELEASE_SAFETY_ENDPOINT,
-            "canary_workflow_id": opened.canary_workflow_id,
+            "stage": "awaiting_security_scan",
+            "scan_provider": handoff["provider"],
+            "scan_endpoint": SECURITY_ENDPOINT,
+            "scan_workflow_id": opened.scan_workflow_id,
         }
         self._log(
-            "canary_handoff",
+            "security_scan_handoff",
             parent,
             {
                 "version": version,
                 "provider": handoff["provider"],
-                "endpoint": RELEASE_SAFETY_ENDPOINT,
-                "canary_workflow_id": opened.canary_workflow_id,
+                "endpoint": SECURITY_ENDPOINT,
+                "scan_workflow_id": opened.scan_workflow_id,
             },
         )
         response = self._response_for(parent)
         response.message = (
-            f"Quality gates passed. {handoff['provider']} is running canary "
-            f"analysis for {version}; the production promotion will be "
-            "requested for approval once the canary window closes."
+            f"Quality gates passed. {handoff['provider']} is running a "
+            f"pre-prod security scan for {version}; the production promotion "
+            "will be requested for approval once the scan clears."
         )
         return response
 

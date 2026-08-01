@@ -25,16 +25,16 @@ Keep this terminal open. The useful endpoints are:
 
 - Approval dashboard: http://localhost:8080
 - Temporal UI: http://localhost:8233 (two namespaces: `default` and
-  `release-safety`)
+  `security`)
 - MCP endpoint: http://localhost:8080/mcp
 
-One service deliberately does **not** start: `release-safety-worker`, the Release
-Safety team's canary platform. It belongs to step 7, and starting it early gives
-away the CASE-2b reveal. If you have run this walkthrough before, check with
+One service deliberately does **not** start: `security-scan-worker`, the Security
+team's pre-prod scanning platform. It belongs to step 7, and starting it early
+gives away the CASE-2b reveal. If you have run this walkthrough before, check with
 `docker compose ps` and stop it before you begin.
 
 If you have changed any code since you last ran this, build with the profile or
-the canary worker keeps a stale image:
+the security scan worker keeps a stale image:
 
 ```bash
 docker compose --profile '*' build
@@ -329,7 +329,7 @@ The pipeline runs its first leg and stops: cut, staging, done. The gates do not
 run, because nothing is being qualified for production yet. `environment` is how
 far to go, not where to put it.
 
-## 7. CASE-2b: canary analysis, and a second team
+## 7. CASE-2b: a pre-prod security scan, and a second team
 
 Everything in step 6 was still one team's work. Cutting a release, staging it,
 and gating it are genuinely Waypoint's job, and running them as Activities inside
@@ -337,17 +337,22 @@ the chain workflow is the right way to write them. But notice what has *not*
 happened yet: there is one workflow, one namespace, one worker, one owner. No
 tool has called another tool across a system boundary, whatever the labels say.
 
-This step is the same team later still, plus a second team. Release Safety owns
-canary analysis. Their platform is durable for reasons that predate this demo: a
-canary window needs an auditable record of what was observed, independent of who
-asked for the release, and it has to survive their own deploys. Ship it, live:
+This step is the same team later still, plus a second team. The Security team owns
+pre-prod scanning, and a candidate that has cleared Waypoint's quality gates still
+has to clear their scan before anything reaches production. Two things about that
+need no argument: a security team can block any team's release regardless of
+reporting line, and a scan takes real, variable time -- dependency advisories,
+container image CVEs, secret detection, SAST, and every so often a flagged finding
+that stops the whole thing until a reviewer looks at it. Their platform was
+durable long before this demo, because that is what holding a scan open across a
+human requires. Bring it up, live:
 
 ```bash
-docker compose up -d release-safety-worker
+docker compose up -d security-scan-worker
 ```
 
 ```text
-release safety worker started, namespace 'release-safety', task queue 'release-safety-tq'
+security scan worker started, namespace 'security', task queue 'security-tq'
 ```
 
 Narrate that as the roadmap beat it is. Nothing about Waypoint's pipeline
@@ -364,34 +369,38 @@ Same tool, same words, no flags. Up to the gates it is identical to step 6. Then
 
 ```text
 status: processing
-message: Quality gates passed. release-safety is running canary analysis for
+message: Quality gates passed. security is running a pre-prod security scan for
          <computed version>; the production promotion will be requested for
-         approval once the canary window closes.
+         approval once the scan clears.
 ```
 
 Not `waiting_for_approval`. Nothing is on the approval queue yet, because the
 promotion has not been *requested* yet. The pipeline asked the shared platform
-whether anyone was offering canary analysis, found that somebody now is, called
-their **Nexus Endpoint**, and parked itself. The ledger shows
-`canary_capability_discovered` then `canary_handoff`.
+whether anyone was offering a pre-prod security scan, found that somebody now is,
+called their **Nexus Endpoint**, and parked itself. The ledger shows
+`scan_capability_discovered` then `security_scan_handoff`.
 
-The pipeline is not configured for canary. It looks to see whether canary is
+The pipeline is not configured for the scan. It looks to see whether the scan is
 there. That is why step 6 worked before you ran the command above, and why
-`docker compose stop release-safety-worker` puts it back -- give the
+`docker compose stop security-scan-worker` puts it back -- give the
 registration about twenty seconds to expire, and the next run goes straight to
 the production promotion again.
 
 ### B. Two systems, on screen
 
-The canary card animates into the dashboard between the gate and production. It
-is the only card on that row with an owner printed on it, and it ticks four times
-over fifteen seconds while you talk.
+The security scan card animates into the dashboard between the gate and
+production. It is the only card on that row with an owner printed on it, and it
+works through four stages over fifteen seconds while you talk -- naming each one
+(`dependency_scan`, `container_image_scan`, `secret_detection`,
+`static_analysis`) and the highest severity it turned up. On a clean run that
+reads `none`, `low`, `none`, `none`: the `low` is a real finding and it does not
+block, because the threshold is medium and above.
 
 Meanwhile, open the Temporal UI at http://localhost:8233 and **switch the
-namespace selector to `release-safety`**. There is a workflow there:
+namespace selector to `security`**. There is a workflow there:
 
 ```text
-release-safety::canary::delivery-matching-service::<computed version>::a1b2c3d4
+security::scan::delivery-matching-service::<computed version>::a1b2c3d4
 ```
 
 Different namespace, different task queue, different worker identity, different
@@ -402,63 +411,63 @@ Now say the part that matters. Grep the gateway's code for any of that and you
 will not find it:
 
 ```bash
-grep -rn "release-safety-tq\|CanaryAnalysisWorkflow" workflows/ activities/ common/
+grep -rn "security-tq\|SecurityScanWorkflow" workflows/ activities/ common/
 ```
 
-Nothing. The pipeline called an endpoint named `release-safety` and learned none
-of it. Release Safety can rename that workflow, move task queues, or change
-namespace tomorrow and no gateway code changes. This is the point where "another
-team's tool" stops being a label on a code comment.
+Nothing. The pipeline called an endpoint named `security` and learned none of it.
+The Security team can rename that workflow, move task queues, or change namespace
+tomorrow and no gateway code changes. This is the point where "another team's
+tool" stops being a label on a code comment.
 
 ### C. The nested call, in the other direction
 
-When the window closes green, canary calls Agent Gateway's `agent-gateway`
+When every stage clears, the scan calls Agent Gateway's `agent-gateway`
 endpoint -- straight from workflow code, no client, no credentials for the
 gateway's namespace. Only then does the production promotion appear on the
 approval queue, and its call path reads:
 
 ```text
-release-safety -> release_safety_canary -> promote_release
+security -> security_scan -> promote_release
 ```
 
-One `workflow_id`, two namespaces, three operations. Canary did not promote
+One `workflow_id`, two namespaces, three operations. The scan did not promote
 anything itself, and it has no more right to than anyone else does: it made a
 governed request, carrying the original chain's `workflow_id`, and the gateway
 gated it exactly as it gates everything else.
 
 Switch the namespace selector back to `default` and there is now a second
-workflow alongside the chain: `protected-action::release-safety::promote_release::...`.
-That is the gateway's Nexus handler holding canary's request open. It exists because a Nexus operation
+workflow alongside the chain: `protected-action::security::promote_release::...`.
+That is the gateway's Nexus handler holding the scan's request open. It exists because a Nexus operation
 backed by a workflow starts a *new* workflow, while the request has to reach the
 chain that is already running; it is short-lived, gateway-owned, and everything
 it does to the chain is a same-namespace call.
 
 ### D. The checkpoint that survives its own worker
 
-This is the beat the whole scenario exists for. Canary is currently suspended,
+This is the beat the whole scenario exists for. The scan is currently suspended,
 holding its own state. Kill it:
 
 ```bash
-docker compose stop release-safety-worker
+docker compose stop security-scan-worker
 ```
 
 Now approve the promotion in the dashboard anyway. It works: production rolls
-over to the canaried version, and in the `default` namespace the
+over to the scanned version, and in the `default` namespace the
 `protected-action::...` workflow completes. Completing it completes the Nexus
 operation belonging to a workflow whose worker is not running.
 
-Bring Release Safety back:
+Bring the Security team back:
 
 ```bash
-docker compose start release-safety-worker
+docker compose start security-scan-worker
 ```
 
-Canary resumes on the operation that completed while it was gone, records the
+The scan resumes on the operation that completed while it was gone, records the
 promotion it never performed and never watched happen, and finishes. Open its
 Event History:
 
 ```text
-run_canary_tick  x4
+run_scan_check  x4
 NexusOperationScheduled     request_protected_action
 NexusOperationStarted
     ... the entire approval happens in this gap, including the worker
@@ -467,49 +476,51 @@ NexusOperationCompleted
 WorkflowExecutionCompleted
 ```
 
-(`publish_canary_state` calls are interleaved throughout; they are what feed the
+(`publish_scan_state` calls are interleaved throughout; they are what feed the
 dashboard card and have no bearing on the verdict.)
 
-Four ticks, not eight. Nothing re-ran. And notice what is *not* in that history:
-no Signal handler, no callback, no polling loop. The workflow suspended on an
-outbound operation and the operation finished.
+Four stage checks, not eight. Nothing re-ran. And notice what is *not* in that
+history: no Signal handler, no callback, no polling loop. The workflow suspended
+on an outbound operation and the operation finished.
 
-Say the sentence out loud: *that history belongs to Release Safety, not to Agent
-Gateway.* In step 6 the gateway was pausing in the middle of doing its own work
-and then continuing it. Here a genuinely separate system checkpointed its own
+Say the sentence out loud: *that history belongs to the Security team, not to
+Agent Gateway.* In step 6 the gateway was pausing in the middle of doing its own
+work and then continuing it. Here a genuinely separate system checkpointed its own
 work, stopped, and was resumed. That is the distinction the requirements document
 is drawing, and it is the first time in this walkthrough it has actually been
 true.
 
-### E. A red window never reaches the approver
+### E. A blocking finding never reaches the approver
 
-Tell the canary team's worker which version to fail:
+Tell the Security team's worker which version to fail:
 
 ```bash
-CANARY_FAIL_VERSIONS=<next version> \
-  docker compose up -d --force-recreate release-safety-worker
+SCAN_FAIL_VERSIONS=<next version> \
+  docker compose up -d --force-recreate security-scan-worker
 ```
 
-Note where that knob is. Not on `mock-tool`, not on the pipeline: on the canary
-team's own worker, because which release fails canary is their decision. Under
+Note where that knob is. Not on `mock-tool`, not on the pipeline: on the Security
+team's own worker, because which release fails the scan is their decision. Under
 the earlier design the caller relayed it in, which meant the pipeline was telling
 the checkpoint what verdict to reach. It also means this recreate does **not**
 reset the fleet the way step 6C's `mock-tool` restart does, so the version you
 compute stays the version you get.
 
-Run the pipeline again. The gate card goes green, canary opens its window, and
-the first tick comes in over threshold. The window dies there: one bad reading
-fails it, it is not averaged out or retried past. Canary reports the outcome back
-through the same endpoint, the pipeline operation fails, and **nothing reaches
-the approval queue**. Production is untouched.
+Run the pipeline again. The gate card goes green, the scan starts, and
+`dependency_scan` comes back with a high-severity finding. The scan stops there:
+one finding at or above the threshold fails it, it is not averaged out or
+rescanned past. The card reads `failed at stage 1` with `dependency_scan  1 ·
+high` in red. The scan reports the outcome back through the same endpoint, the
+pipeline operation fails, and **nothing reaches the approval queue**. Production
+is untouched.
 
 Same shape as the failing gate in step 6C, one checkpoint later, and now enforced
 by a system Waypoint does not own. Restore with
-`docker compose up -d --force-recreate release-safety-worker`.
+`docker compose up -d --force-recreate security-scan-worker`.
 
 ## 8. CASE-2b safety boundary: a Tool1 that cannot suspend
 
-Step 7 works because canary has somewhere to keep its state. This step is the
+Step 7 works because the scan has somewhere to keep its state. This step is the
 same job done by something that does not, and then the cost of that difference.
 
 Everything below runs on the host rather than through Claude Code, because nobody
@@ -520,23 +531,24 @@ gateway is reached over HTTP at `localhost:8080`.
 ### A. A caller that genuinely has no memory
 
 ```bash
-python -m release_safety.legacy_canary_script \
+python -m security_scan.legacy_security_scan_script \
   --service delivery-matching-service \
   --version <the version prod is on, bumped> \
   --gateway-workflow-id wf-legacy
 ```
 
-This is the old canary check that still gates a couple of services predating
-Release Safety's platform. It imports no `temporalio`. No workflow, no task
-queue, no worker, no supervisor. It runs the same window against the same
-thresholds and calls the same gateway. `--gateway-workflow-id` opens its own
-chain, separate from your Claude Code session; the script authenticates with
-`tok_dustin` by default, which is what lets it name a `workflow_id` at all.
+This is an old scanner that a handful of services still gate through, because they
+predate the Security team's platform migration -- it is on the list, and it is not
+what the Security team runs today. It imports no `temporalio`. No workflow, no task
+queue, no worker, no supervisor. It runs the same stages against the same severity
+threshold and calls the same gateway. `--gateway-workflow-id` opens its own chain,
+separate from your Claude Code session; the script authenticates with `tok_dustin`
+by default, which is what lets it name a `workflow_id` at all.
 
 ```text
-tick 1/4: error_rate=0.004 threshold=0.020
+stage 1/4 dependency_scan: max_severity=none threshold=medium
 ...
-Canary passed. Requesting the production promotion via Agent Gateway.
+Security scan passed. Requesting the production promotion via Agent Gateway.
 
 Approval is required and this script cannot wait for it.
 Record these to finish the promotion by hand once it is approved:
@@ -594,10 +606,10 @@ python gateway_call.py run_release_orchestration \
   tool1_mode=uncontrolled replay_safe=true
 ```
 
-An uncontrolled caller is never handed to canary, for the same reason this whole
+An uncontrolled caller is never handed to the scan, for the same reason this whole
 step exists: being parked waiting on another system's verdict is something only a
 caller that can hold state can do. So this runs the step 6 pipeline and stops at
-the promotion, whether or not Release Safety's worker is up. The pipeline runs in
+the promotion, whether or not the Security team's worker is up. The pipeline runs in
 full, the gate card goes green, and it stops with:
 
 ```text
@@ -763,20 +775,22 @@ Look for events such as:
 
 For a CASE-2b run, the handoff and its resolution are in the same ledger:
 
-- `canary_capability_discovered`, then `canary_handoff` with the canary workflow
-  id and the **endpoint** it was reached on. No namespace is recorded, because
-  the pipeline was never told one
+- `scan_capability_discovered`, then `security_scan_handoff` with the scan
+  workflow id and the **endpoint** it was reached on. No namespace is recorded,
+  because the pipeline was never told one
 - `controlled_caller_notified` when the decision was handed to the workflow
   holding the request open, or `controlled_caller_unreachable` if it could not
   be. Both are same-namespace: the boundary is crossed by the Nexus operation
   completing, not by this
-- `canary_pipeline_settled` when the parked pipeline operation was closed out
-- `canary_failed` when Release Safety reported a red window instead
+- `security_scan_pipeline_settled` when the parked pipeline operation was closed
+  out
+- `security_scan_failed` when the Security team reported a blocking finding
+  instead
 
 The same execution history is visible in the Temporal UI at
 http://localhost:8233. For CASE-2b there are three executions across two
 namespaces: the chain and its `protected-action::...` adapter under `default`,
-and canary's own under `release-safety`. None is a subset of the others, which is
+and the scan's own under `security`. None is a subset of the others, which is
 the point -- each team's system keeps its own record of what it did, under its
 own retention policy.
 
@@ -807,30 +821,29 @@ from a blocking response to asynchronous recovery.
 
 ### Step 6 returns `processing` instead of `waiting_for_approval`
 
-Release Safety's worker is already running, so the pipeline found a canary
+The Security team's worker is already running, so the pipeline found a scan
 provider and handed off. That is step 7 arriving a step early. Check with
 `docker compose ps`, and see "Start over" below for why plain
 `docker compose down` leaves it up.
 
-### Step 7 fails with "Could not open a canary window"
+### Step 7 fails with "Could not start a pre-prod security scan"
 
-The Nexus operation timed out, which means nothing was polling
-`release-safety-tq` in the `release-safety` namespace for Nexus tasks. Two
-causes, in order of likelihood:
+The Nexus operation timed out, which means nothing was polling `security-tq` in
+the `security` namespace for Nexus tasks. Two causes, in order of likelihood:
 
 **A stale image.** `docker compose build` skips services behind a profile, so
-`release-safety-worker` can be running last week's code. Check that the Nexus
+`security-scan-worker` can be running last week's code. Check that the Nexus
 handler is even in the image:
 
 ```bash
-docker compose exec release-safety-worker ls /app/release_safety/
+docker compose exec security-scan-worker ls /app/security_scan/
 ```
 
 If `nexus_handlers.py` is missing, rebuild properly:
 
 ```bash
-docker compose --profile '*' build release-safety-worker
-docker compose up -d --force-recreate release-safety-worker
+docker compose --profile '*' build security-scan-worker
+docker compose up -d --force-recreate security-scan-worker
 ```
 
 **Missing endpoints.** Confirm both are registered:
@@ -839,67 +852,67 @@ docker compose up -d --force-recreate release-safety-worker
 docker compose exec temporal temporal operator nexus endpoint list --address temporal:7233
 ```
 
-You want `agent-gateway` → `default`/`agentic-gateway` and `release-safety` →
-`release-safety`/`release-safety-tq`. If they are absent, rerun the registration
+You want `agent-gateway` → `default`/`agentic-gateway` and `security` →
+`security`/`security-tq`. If they are absent, rerun the registration
 with `docker compose up nexus-endpoints`.
 
 ### Step 7 returns `waiting_for_approval` instead of `processing`
 
-No canary provider was found, so the pipeline opened the production promotion
+No scan provider was found, so the pipeline opened the production promotion
 itself. Either the worker is not running, or it has not advertised itself yet.
 Confirm it started:
 
 ```bash
-docker compose logs release-safety-worker
+docker compose logs security-scan-worker
 ```
 
 ```text
-release safety worker started, namespace 'release-safety', task queue 'release-safety-tq'
+security scan worker started, namespace 'security', task queue 'security-tq'
 ```
 
 Then ask the registry directly:
 
 ```bash
 curl -s -X POST localhost:9000/invoke -H 'content-type: application/json' \
-  -d '{"tool_name":"get_release_safety_status","arguments":{}}'
+  -d '{"tool_name":"get_security_scan_status","arguments":{}}'
 ```
 
-`available: true` means the pipeline will route through canary on its next run.
+`available: true` means the pipeline will route through the scan on its next run.
 Note how little the answer contains -- a provider and an endpoint, no namespace
 and no task queue -- which is the same restraint the code shows. Registration is
 a heartbeat with a TTL, so give it about five seconds after the worker starts,
 and expect the same delay after any `mock-tool` recreate.
 
-### The canary card is stuck partway through its window
+### The security scan card is stuck partway through
 
-The window itself is fifteen seconds, so give it that first. If it stays put,
-the release-safety worker is not processing tasks. The chain is unaffected --
-canary's workflow keeps its place and picks up where it left off when a worker
+The scan itself is fifteen seconds, so give it that first. If it stays put, the
+security scan worker is not processing tasks. The chain is unaffected -- the
+scan's workflow keeps its place and picks up where it left off when a worker
 returns, which is exactly what step 7D demonstrates on purpose:
 
 ```bash
-docker compose logs release-safety-worker
-docker compose start release-safety-worker
+docker compose logs security-scan-worker
+docker compose start security-scan-worker
 ```
 
 ### A pipeline operation is stuck in `waiting_for_dependency`
 
-It handed off to canary and is waiting on a verdict. Note that a canary worker
+It handed off to the scan and is waiting on a verdict. Note that a scan worker
 which was never running at all does **not** produce this: the handoff operation
 has a thirty second schedule-to-close timeout, so that case fails fast with
-"Could not open a canary window" instead (see above).
+"Could not start a pre-prod security scan" instead (see above).
 
-This state means the window was opened and then stopped progressing -- the
-canary worker died after the handler ran. The window itself has no deadline, so
-the operation waits indefinitely. Bring the worker back and canary resumes where
+This state means the scan was started and then stopped progressing -- the scan
+worker died after the handler ran. The scan itself has no deadline, so the
+operation waits indefinitely. Bring the worker back and the scan resumes where
 it left off:
 
 ```bash
-docker compose logs release-safety-worker
-docker compose start release-safety-worker
+docker compose logs security-scan-worker
+docker compose start security-scan-worker
 ```
 
-If canary's workflow has completed or failed and the pipeline operation still
+If the scan's workflow has completed or failed and the pipeline operation still
 has not moved, look for `controlled_caller_unreachable` in the chain ledger.
 
 ### Start over
@@ -919,10 +932,10 @@ docker compose --profile '*' down -v
 The `-v` command permanently removes the demo's Temporal volume.
 
 The `--profile '*'` matters, and forgetting it is the most likely way to spoil a
-second run-through. `release-safety-worker` sits behind a Compose profile so it
+second run-through. `security-scan-worker` sits behind a Compose profile so it
 does not start with the stack, and plain `docker compose down` leaves services
 from inactive profiles running. If it is still up when you start step 6, the
-pipeline finds a canary provider and hands off, and the CASE-2b reveal in step 7
+pipeline finds a scan provider and hands off, and the CASE-2b reveal in step 7
 happens a step early. Check with `docker compose ps` if step 6 returns
 `processing` instead of `waiting_for_approval`.
 

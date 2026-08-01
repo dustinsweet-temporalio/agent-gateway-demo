@@ -118,7 +118,7 @@ async def submit_nested_tool_call(
     client = await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
     handle = client.get_workflow_handle(input.gateway_workflow_id)
     request = NestedToolCallRequest(
-        tool1_name=f"{input.caller_service.replace('-', '_')}_canary",
+        tool1_name=f"{input.caller_service.replace('-', '_')}_scan",
         tool1_arguments={
             **input.arguments,
             "caller_workflow_id": input.caller_workflow_id,
@@ -135,7 +135,7 @@ async def submit_nested_tool_call(
             runtime="nexus",
             call_path=[
                 input.caller_service,
-                f"{input.caller_service.replace('-', '_')}_canary",
+                f"{input.caller_service.replace('-', '_')}_scan",
             ],
         ),
         requested_action=(
@@ -167,8 +167,8 @@ async def signal_operation_callback(input: SignalOperationCallbackInput) -> None
 
     The other half of the pause. Something is suspended waiting for this --
     in CASE-2b a ProtectedActionWorkflow, which is in turn the handler for a
-    Nexus operation another team's canary is suspended on. Delivering it here
-    completes that chain of waits without anyone polling.
+    Nexus operation another team's security scan is suspended on. Delivering it
+    here completes that chain of waits without anyone polling.
     """
     client = await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
     handle = client.get_workflow_handle(input.callback_workflow_id)

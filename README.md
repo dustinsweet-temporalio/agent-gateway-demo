@@ -18,8 +18,8 @@ gateway pauses it and a human approves or rejects before it proceeds.
 ## Architecture
 
 ```
-namespace: default                              namespace: release-safety
-=============================================   =========================
+namespace: default                              namespace: security
+=============================================   ===================
 
 Claude Code -------------MCP/HTTP-----> Agent Gateway
                                               |
@@ -32,18 +32,18 @@ Google ADK Web -> TemporalAdkSessionWorkflow -> MCP Activity
          Chain entity workflow            Autonomous-agent workflow
       (CASE-1, CASE-2a, CASE-2b)             (CASE-3 checkpoint)
                    |                                 |
-                   |  Nexus: open_canary_window      |
-                   |  (endpoint "release-safety")    |
-                   +-------------------------------> CanaryAnalysisWorkflow
+                   |  Nexus: start_security_scan     |
+                   |  (endpoint "security")          |
+                   +-------------------------------> SecurityScanWorkflow
                                                      task queue:
-                                                     release-safety-tq
+                                                     security-tq
                                                           |
         ProtectedActionWorkflow <-------------------------+
         (Nexus handler, endpoint     Nexus: request_protected_action
          "agent-gateway")            (endpoint "agent-gateway")
                    |                     ...suspends until a human decides,
                    | Update              then the operation COMPLETES and
-                   v                     canary resumes. No callback Signal.
+                   v                     the scan resumes. No callback Signal.
          Chain entity workflow
                    |
                    +------- Activities -> Mock Deploy Backend
@@ -75,32 +75,35 @@ target namespace and task queue; callers address it by name and learn neither.
   durable result. Uncontrolled Tool1 calls fail closed. An approved Tool2 is not
   executed until the caller explicitly retries, and replay is refused unless
   Tool1 advertised replay safety.
-- Canary analysis (CASE-2b) is a second, independently owned system, not a
-  module. `CanaryAnalysisWorkflow` runs in the `release-safety` namespace, on the
-  `release-safety-tq` task queue, in a worker the gateway team does not deploy,
-  from a Python package that imports nothing from `gateway/`, `workflows/`,
+- The pre-prod security scan (CASE-2b) is a second, independently owned system,
+  not a module. `SecurityScanWorkflow` runs in the `security` namespace, on the
+  `security-tq` task queue, in a worker the gateway team does not deploy, from a
+  Python package that imports nothing from `gateway/`, `workflows/`,
   `activities/`, or `common/`. It is **not** a child workflow: a child shares its
   parent's namespace and lifecycle, and would look separated without being
-  separated.
-- **Both directions cross on a Nexus Endpoint.** The pipeline calls
-  `release-safety`; canary calls `agent-gateway`. Neither side's code names the
-  other's namespace, task queue, or workflow type, so either team can restructure
-  behind their endpoint without the other deploying. That property is asserted in
-  `tests/test_release_safety_contract.py`, not just claimed.
-- Canary is the first Tool1 in this demo that genuinely calls Tool2 *through* the
-  gateway. Once its window closes green it starts a Nexus operation carrying the
-  original `workflow_id`, so one user-visible task spans two namespaces, and then
+  separated. A security team is the clearest case for this shape: it can block any
+  team's release regardless of reporting line, and its platform was durable long
+  before Agent Gateway existed, because a dependency/image/SAST sweep is genuinely
+  long-running and sometimes stops on a human reviewing a flagged finding.
+- **Both directions cross on a Nexus Endpoint.** The pipeline calls `security`;
+  the scan calls `agent-gateway`. Neither side's code names the other's namespace,
+  task queue, or workflow type, so either team can restructure behind their
+  endpoint without the other deploying. That property is asserted in
+  `tests/test_security_scan_contract.py`, not just claimed.
+- The scan is the first Tool1 in this demo that genuinely calls Tool2 *through*
+  the gateway. Once it clears it starts a Nexus operation carrying the original
+  `workflow_id`, so one user-visible task spans two namespaces, and then
   **suspends on that operation** for as long as the approval takes. There is no
   callback Signal and nothing to poll: the operation completing is the answer.
-  Kill Release Safety's worker mid-pause and its ticks, verdict, and pending
-  operation all come back from its own Event History.
+  Kill the Security team's worker mid-pause and its stage results, verdict, and
+  pending operation all come back from its own Event History.
 - `ProtectedActionWorkflow` is the gateway's Nexus handler for that request. It
   exists because a workflow-backed Nexus operation starts a *new* workflow, while
   the thing that must service the request is the already-running chain. It is
   short-lived, entirely gateway-owned, and everything it does to the chain is a
   same-namespace call.
 - **The handoff is a *synchronous* Nexus operation on purpose.** An async one
-  awaited for the whole window would put a Nexus operation handle inside
+  awaited for the whole scan would put a Nexus operation handle inside
   `AgenticChainWorkflow`, which continues-as-new on Temporal's suggestion and
   will certainly do so across an open-ended approval. Handles do not survive
   Continue-As-New — a pending operation is orphaned and its result dropped. A
@@ -109,13 +112,14 @@ target namespace and task queue; callers address it by name and learn neither.
 - Workflow code makes the Nexus calls directly; no client, no Activity. The two
   Activities that remain (`submit_nested_tool_call`, `signal_operation_callback`)
   connect only to their own namespace.
-- The pipeline discovers canary rather than being configured for it. After the
+- The pipeline discovers the scan rather than being configured for it. After the
   quality gates pass it asks the shared platform whether anyone is offering
-  canary analysis; Release Safety's worker heartbeats that registration while it
-  runs, and the entry expires on its own when it stops. The answer is *who*, and
-  nothing about how: window length, threshold, and which versions fail all live
-  behind the endpoint. With no provider, the pipeline opens the production
-  promotion itself, exactly as it did before canary existed.
+  pre-prod security scanning; the Security team's worker heartbeats that
+  registration while it runs, and the entry expires on its own when it stops. The
+  answer is *who*, and nothing about how: which stages run, the severity
+  threshold, and which versions fail all live behind the endpoint. With no
+  provider, the pipeline opens the production promotion itself, exactly as it did
+  before the Security team onboarded it.
 - Each ADK Web session maps to one running `TemporalAdkSessionWorkflow`. ADK Web
   submits later user turns as Updates to that same workflow, which owns one ADK
   runner and its conversation state. A new workflow ID is created only when no
@@ -141,17 +145,17 @@ target namespace and task queue; callers address it by name and learn neither.
 | --- | --- | --- |
 | CASE-1: simple tool | `promote_release` | Policy gate, wait payload, approve/reject/expire/cancel, invoke, poll result |
 | CASE-2a: pipeline and gates | `run_release_orchestration` (the pipeline) or `run_nested_release` (explicit version) | Fixed release pipeline, quality gates, full call path, child operation, controlled checkpoint/resume, uncontrolled fail-closed/retry |
-| CASE-2b: canary as a separate Tool1 | same pipeline, with Release Safety's worker running | Nexus handoff to another team's endpoint, a real nested Tool1 -> Tool2 call back into the same `workflow_id`, Tool1 suspending on a pending Nexus operation across the approval, fail-closed on a red window |
-| CASE-2b: uncontrolled Tool1 | `release_safety/legacy_canary_script.py` | A stateless process that cannot hold the pause: prints the operation id, exits non-zero, and requires a human `resume_nested_release` |
+| CASE-2b: security scan as a separate Tool1 | same pipeline, with the Security team's worker running | Nexus handoff to another team's endpoint, a real nested Tool1 -> Tool2 call back into the same `workflow_id`, Tool1 suspending on a pending Nexus operation across the approval, fail-closed on a blocking finding |
+| CASE-2b: uncontrolled Tool1 | `security_scan/legacy_security_scan_script.py` | A stateless process that cannot hold the pause: prints the operation id, exits non-zero, and requires a human `resume_nested_release` |
 | CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run correlation, plan checkpoint, gateway-owned decision, protected action then dependent action |
 
 Services in `docker-compose.yml`: `temporal` (dev server plus Web UI, with both
-the `default` and `release-safety` namespaces), `nexus-endpoints` (registers the
+the `default` and `security` namespaces), `nexus-endpoints` (registers the
 two Nexus Endpoints, then exits), `worker`, `gateway`, `mock-tool` (the pretend
 deployment backend), `adk-agent` (Google ADK Web for CASE-3), and
-`release-safety-worker` (Release Safety's canary platform).
+`security-scan-worker` (the Security team's scanning platform).
 
-`release-safety-worker` sits behind a Compose profile, so **two commands need
+`security-scan-worker` sits behind a Compose profile, so **two commands need
 `--profile '*'`** or they silently skip it:
 
 ```
@@ -160,19 +164,19 @@ docker compose --profile '*' down -v    # or it keeps running after teardown
 ```
 
 Both failure modes are quiet. A stale image runs last week's code against this
-week's endpoints; a surviving container carries the canary capability into your
+week's endpoints; a surviving container carries the scan capability into your
 next run-through and gives away the CASE-2b reveal before you get to it.
 
-`release-safety-worker` sits behind a Compose profile and does **not** start with
+`security-scan-worker` sits behind a Compose profile and does **not** start with
 `docker compose up`. That is the CASE-2b beat: for CASE-1 and CASE-2a the
-capability does not exist, and you ship it live, mid-demo, with
+capability does not exist, and you bring it up live, mid-demo, with
 
 ```
-docker compose up -d release-safety-worker
+docker compose up -d security-scan-worker
 ```
 
-after which the next pipeline run routes through canary and the card animates
-into the dashboard. `docker compose stop release-safety-worker` takes it away
+after which the next pipeline run routes through the scan and the card animates
+into the dashboard. `docker compose stop security-scan-worker` takes it away
 again.
 
 ## Tools
@@ -200,12 +204,12 @@ again.
   staging. Deliberately **not** exposed as an MCP tool: the pipeline calls it
   internally, so an agent cannot run the gates itself and then promote around
   them. Its last result is what the dashboard's gate card renders.
-- Canary analysis has no MCP tool at all, and could not have one: it is not
+- The security scan has no MCP tool at all, and could not have one: it is not
   Agent Gateway's capability to expose. It is started by the pipeline in another
   team's namespace, and the only thing that surfaces on the MCP side is the
-  `promote_release` request canary itself makes once its window closes green.
-  The same reasoning as the gates, one step further: an agent cannot run the
-  canary and then promote around it, because an agent cannot run the canary.
+  `promote_release` request the scan itself makes once it clears. The same
+  reasoning as the gates, one step further: an agent cannot run the scan and then
+  promote around it, because an agent cannot run the scan.
 - `resume_nested_release(workflow_id, operation_id)` explicitly retries an
   approved uncontrolled nested call; it succeeds only when `replay_safe=true`.
 - `start_google_adk_release_run(..., agent_run_id)` starts or recovers CASE-3.
@@ -524,7 +528,7 @@ The dashboard's quality gate card is keyed on whether gate state exists, so it i
 absent for the whole of CASE-1 and appears the first time the pipeline reaches it.
 Restarting `mock-tool` restores that "before" state for the next run-through.
 
-### CASE-2b: canary analysis, owned by a different team
+### CASE-2b: a pre-prod security scan, owned by a different team
 
 Everything above is still one team's work. Cutting a release, staging it, and
 gating it are genuinely Waypoint's own job, and modelling those steps as ordinary
@@ -532,74 +536,84 @@ Activities inside the chain workflow is the honest way to write them. Nothing so
 far is a nested call between two systems, whatever the labels say: there is one
 workflow, one namespace, one worker, one owner.
 
-CASE-2b is the same team later still, plus a second team. Release Safety owns
-canary analysis. Their platform is durable for reasons that have nothing to do
-with this demo -- a canary window needs an auditable record of what was observed,
-independent of who asked for the release, and has to survive their own deploys.
-So this is where a real Tool1 shows up, and where the requirements document's
-checkpoint/resume contract finally has something to describe.
+CASE-2b is the same team later still, plus a second team. The Security team owns
+pre-prod scanning, and a candidate that has cleared Waypoint's own quality gates
+still has to clear their scan before Agent Gateway will promote it. Two things
+about that need no argument from anyone: a security team can block any team's
+release regardless of reporting line, and a scan takes real, variable time --
+dependency advisories, container image CVEs, secret detection, SAST, and every so
+often a flagged finding that stops the whole thing until a reviewer looks at it.
+Their platform was durable long before Agent Gateway existed, because that is
+what holding a scan open across a human requires. So this is where a real Tool1
+shows up, and where the requirements document's checkpoint/resume contract finally
+has something to describe.
 
 ```
-docker compose up -d release-safety-worker
+docker compose up -d security-scan-worker
 ```
 
 1. Say `Deploy the next minor version.` again. Same tool, same prompt, no flags.
    The pipeline does exactly what it did in CASE-2a up to the gates.
 2. After the gates pass, the pipeline asks the shared platform whether anyone is
-   offering canary analysis. This run, somebody is, so it calls the
-   `release-safety` **Nexus Endpoint** straight from workflow code. The ledger
-   shows `canary_capability_discovered` and then `canary_handoff`, and the
+   offering a pre-prod security scan. This run, somebody is, so it calls the
+   `security` **Nexus Endpoint** straight from workflow code. The ledger shows
+   `scan_capability_discovered` and then `security_scan_handoff`, and the
    response is `processing` rather than `waiting_for_approval` -- nothing has been
    asked of an approver, because the promotion has not been requested yet.
 3. The pipeline operation parks in `waiting_for_dependency` and a workflow appears
    **in the other namespace**, named
-   `release-safety::canary::delivery-matching-service::2.4.0::a1b2c3d4`. Switch
-   the Temporal UI's namespace selector to `release-safety` to watch it. The
-   pipeline did not choose that namespace, that task queue, or that workflow
-   type, and cannot see any of them. It called an endpoint.
-4. The canary card animates into the dashboard between the gate and production,
-   labelled with its owner, and ticks four times over fifteen seconds.
-5. Only when the window closes green does canary call Agent Gateway's
+   `security::scan::delivery-matching-service::2.4.0::a1b2c3d4`. Switch the
+   Temporal UI's namespace selector to `security` to watch it. The pipeline did
+   not choose that namespace, that task queue, or that workflow type, and cannot
+   see any of them. It called an endpoint.
+4. The security scan card animates into the dashboard between the gate and
+   production, labelled with its owner, and works through four stages over
+   fifteen seconds -- `dependency_scan`, `container_image_scan`,
+   `secret_detection`, `static_analysis` -- naming each stage and the highest
+   severity it found.
+5. Only when every stage clears does the scan call Agent Gateway's
    `agent-gateway` endpoint, carrying the *original* `workflow_id`, and only then
    does the production promotion reach the approval queue. Its call path reads
-   `release-safety -> release_safety_canary -> promote_release`: one chain, two
-   systems. Canary is now suspended on a pending Nexus operation.
-6. **Kill Release Safety's worker while canary is suspended.**
-   `docker compose stop release-safety-worker`. Approve the promotion anyway. The
+   `security -> security_scan -> promote_release`: one chain, two systems. The
+   scan is now suspended on a pending Nexus operation.
+6. **Kill the Security team's worker while the scan is suspended.**
+   `docker compose stop security-scan-worker`. Approve the promotion anyway. The
    promotion runs, the fleet panel rolls production over, and
    `ProtectedActionWorkflow` completes in the gateway's namespace -- which
    completes the Nexus operation belonging to a workflow whose worker is not
    even running.
-7. `docker compose start release-safety-worker`. Canary resumes on the completed
+7. `docker compose start security-scan-worker`. The scan resumes on the completed
    operation, records the promotion it never performed and never saw happen, and
-   finishes. Its Event History reads: four ticks,
+   finishes. Its Event History reads: four stage checks,
    `NexusOperationScheduled`/`Started`, a long gap spanning the entire approval,
-   `NexusOperationCompleted`, done. No re-run ticks, no Signal handler, no
+   `NexusOperationCompleted`, done. No re-run stages, no Signal handler, no
    client. That history is the checkpoint the requirements document is asking
-   for, and it belongs to Release Safety, not to Agent Gateway.
-8. To show the fail-closed path, set `CANARY_FAIL_VERSIONS` on
-   `release-safety-worker` and run the pipeline again. The window dies on its
-   first bad reading, canary reports the outcome through the same endpoint, the
-   pipeline operation fails, and production is never touched. Nobody is asked to
-   approve anything: the same shape as a failed quality gate, one checkpoint
-   later. Note where that knob lives -- on the canary team's worker, not on the
-   shared backend. Which release fails canary is their decision, not their
-   caller's, and recreating their worker no longer resets the fleet.
+   for, and it belongs to the Security team, not to Agent Gateway.
+8. To show the fail-closed path, set `SCAN_FAIL_VERSIONS` on
+   `security-scan-worker` and run the pipeline again. `dependency_scan` turns up a
+   high-severity finding, the scan stops there, reports the outcome through the
+   same endpoint, the pipeline operation fails, and production is never touched.
+   Nobody is asked to approve anything: the same shape as a failed quality gate,
+   one checkpoint later. Note where that knob lives -- on the Security team's
+   worker, not on the shared backend. Which release fails the scan is their
+   decision, not their caller's, and recreating their worker no longer resets the
+   fleet.
 
 ### CASE-2b: a Tool1 that genuinely cannot suspend
 
 The contrast case is not a flag. It is a different program.
-`release_safety/legacy_canary_script.py` is the old canary check that still gates
-a couple of services that predate Release Safety's platform. It imports no
-`temporalio`, has no workflow, no task queue, no worker, and no supervisor.
+`security_scan/legacy_security_scan_script.py` is an old scanner that a handful of
+services still gate through, because they predate the Security team's platform
+migration. It imports no `temporalio`, has no workflow, no task queue, no worker,
+and no supervisor.
 
 ```
-.venv/bin/python -m release_safety.legacy_canary_script \
+.venv/bin/python -m security_scan.legacy_security_scan_script \
     --service delivery-matching-service --version 2.5.0 \
     --gateway-workflow-id wf-legacy
 ```
 
-It runs the same window, calls the same gateway, and is told the same
+It runs the same stages, calls the same gateway, and is told the same
 `waiting_for_approval`. Then it prints the operation id and exits `2`, because
 there is nothing else it can do. The process is gone; if nobody writes the id
 down, the approved promotion is orphaned. Finishing it needs a human running
@@ -678,13 +692,13 @@ its five second reload, which pauses while a transition is playing.
 
 Two cards on that path exist only once the capability behind them has run. The
 quality gate card appears the first time the pipeline reaches its gates, and the
-canary card appears the first time Release Safety opens a window, each animating
-into place between staging and production. Neither is a display toggle: the panel
-keys on whether the backend holds any state for them, so "the team has not built
-this yet" and "the team built it" are the same code path with different state.
-That is what lets one live run tell the roadmap in order. The canary card is the
-only one that names an owner, because it is the only one that has a different
-one. Restarting `mock-tool` restores the "before" picture for both.
+security scan card appears the first time the Security team scans something, each
+animating into place between staging and production. Neither is a display toggle:
+the panel keys on whether the backend holds any state for them, so "the team has
+not built this yet" and "the team built it" are the same code path with different
+state. That is what lets one live run tell the roadmap in order. The security scan
+card is the only one that names an owner, because it is the only one that has a
+different one. Restarting `mock-tool` restores the "before" picture for both.
 
 `GET /fleet` is a read only projection of the same in-memory state the tools
 mutate, proxied from the deployment backend (`MOCK_TOOL_STATE_URL`) and gated on
@@ -740,18 +754,18 @@ last known fleet on screen and marks itself stale rather than blanking.
   must not hold one across the boundary. The chain takes a workflow id back from
   a synchronous operation instead, for the same reason its approval deadlines are
   absolute timestamps rather than Timers.
-- Peers, not parent and child. `CanaryAnalysisWorkflow` is started by the canary
+- Peers, not parent and child. `SecurityScanWorkflow` is started by the Security
   team's own Nexus handler, in their namespace, with no parent/child link to the
   chain. A child workflow would have been easier and would have quietly
   reintroduced shared ownership and a shared lifecycle.
-- Signal handlers still only mutate state. The chain's `canary_verdict_reported`
+- Signal handlers still only mutate state. The chain's `scan_verdict_reported`
   handler and the adapter's `operation_resolved` handler each record and return;
   the Activities that follow are driven from the main loop, off durable operation
   state rather than an in-memory queue, so a Worker restart mid-notification
   picks the work back up.
 - Published interfaces, not mirrored internals. Each side declares the same Nexus
   service contract -- endpoint names, operation names, payload field names -- and
-  `tests/test_release_safety_contract.py` checks they agree and that neither side
+  `tests/test_security_scan_contract.py` checks they agree and that neither side
   has reacquired knowledge of the other's topology.
 
 ## Honest caveats
@@ -782,23 +796,23 @@ last known fleet on screen and marks itself stale rather than blanking.
   runtime secrets belong to the worker. A production deployment should inject
   them from its platform secret store and replace ADK Web's local SQLite session
   database with a supported durable session service.
-- Canary is scripted, not sampled. `run_canary_tick` returns a fixed per-tick
-  error-rate sequence so a demo run is repeatable. In a real Release Safety
-  platform that Activity queries a metrics store; nothing else about the workflow
-  changes.
-- Canary acts on the requester's behalf. The protected-action request carries the
+- The scan is scripted, not real. `run_scan_check` returns a fixed per-stage
+  severity sequence so a demo run is repeatable. In a real Security platform that
+  Activity invokes the actual dependency, image, secret, and SAST scanners; nothing
+  else about the workflow changes.
+- The scan acts on the requester's behalf. The protected-action request carries the
   chain owner as `caller_principal`, because the gateway checks a nested call
-  against the chain's owner, with canary's own identity alongside it in
+  against the chain's owner, with the scan's own identity alongside it in
   `caller_service` and the call path. A production system would model this as
-  explicit delegation -- canary holding its own principal and the gateway
+  explicit delegation -- the scan holding its own principal and the gateway
   authorizing it to act for the requester -- rather than relaying the identity.
   Nexus makes this cleaner than it was but does not solve it: an endpoint
   authorizes a caller to reach a service, not to act as a particular person.
-- A parked pipeline operation has no deadline of its own. A canary workflow that
-  is never scheduled (no worker ever starts on `release-safety-tq`) leaves the
-  pipeline operation waiting. The handoff operation has a schedule-to-close
-  timeout, but that only covers opening the window, not the window itself.
-  Production should give the parked operation its own deadline.
+- A parked pipeline operation has no deadline of its own. A scan workflow that is
+  never scheduled (no worker ever starts on `security-tq`) leaves the pipeline
+  operation waiting. The handoff operation has a schedule-to-close timeout, but
+  that only covers starting the scan, not the scan itself. Production should give
+  the parked operation its own deadline.
 - Two namespaces on one dev server is the right shape but not the full claim.
   Real independent ownership also means separate deployments, separate retention
   policy, separate operators, and endpoint-level authorization; this demo gets
@@ -844,31 +858,32 @@ Set via environment in `docker-compose.yml`.
 - `GOOGLE_API_KEY` Gemini API credential injected into the worker at runtime. It
   is deliberately absent from the Docker image and ADK Web container.
 - `TEMPORAL_NAMESPACE` the namespace a worker serves, and the only one it
-  connects to. `default` for the gateway worker, `release-safety` for the canary
+  connects to. `default` for the gateway worker, `security` for the security scan
   worker. There is no configuration for reaching the *other* team, because
   reaching them is a Nexus Endpoint, and endpoint names are part of the contract
-  in `common/nexus_contracts.py` and `release_safety/nexus_contracts.py`.
-- `RELEASE_SAFETY_METRICS_URL` shared observability backend the canary reports
-  window progress and its capability heartbeat to. Default
+  in `common/nexus_contracts.py` and `security_scan/nexus_contracts.py`.
+- `SECURITY_SCAN_BACKEND_URL` shared observability backend the scan reports stage
+  progress and its capability heartbeat to. Default
   `http://mock-tool:9000/invoke`.
-- `RELEASE_SAFETY_HEARTBEAT_SECONDS` how often the Release Safety worker
-  re-advertises canary analysis. Default `5`; the registration's TTL is four
+- `SECURITY_SCAN_HEARTBEAT_SECONDS` how often the Security team's worker
+  re-advertises pre-prod scanning. Default `5`; the registration's TTL is four
   times this, so stopping the worker withdraws the capability within ~20s.
-- `CANARY_FAIL_VERSIONS` comma separated versions whose canary window fails, so
-  the fail-closed path can be shown on demand. Empty by default. Set on
-  `release-safety-worker`, not on `mock-tool`: it is the canary team's verdict
+- `SCAN_FAIL_VERSIONS` comma separated versions whose scan fails, so the
+  fail-closed path can be shown on demand. Empty by default. Set on
+  `security-scan-worker`, not on `mock-tool`: it is the Security team's verdict
   rule, and putting it anywhere else would let the caller decide its own result.
 
 The idle timeout is not an environment variable. It is the `IDLE_TIMEOUT_SECONDS`
 constant in `workflows/chain.py`, set to 24 hours, kept in code so every Worker
 agrees on it. Lower it and rebuild the worker to demo the idle close.
 
-The canary window is not an environment variable either. It is
-`CANARY_TICK_SECONDS` and `CANARY_WINDOW_TICKS` in `release_safety/models.py`,
-four ticks five seconds apart, read by their Nexus handler when it opens a
-window. How long a canary window runs is the Release Safety team's decision, so
-it is not on the wire at all: `OpenCanaryWindowInput` has no field for it, and
-the pipeline could not set it if it wanted to.
+The scan's shape is not an environment variable either. It is
+`SCAN_CHECK_SECONDS`, `SCAN_CHECK_COUNT`, `SCAN_STAGE_NAMES`, and
+`SCAN_FINDING_SEVERITY_THRESHOLD` in `security_scan/models.py` -- four stages five
+seconds apart, medium and above blocking -- read by their Nexus handler when it
+starts a scan. How a scan runs is the Security team's decision, so it is not on
+the wire at all: `StartSecurityScanInput` has no field for any of it, and the
+pipeline could not set it if it wanted to.
 
 ## Production notes
 
@@ -896,22 +911,25 @@ workflows/protected_action.py  short-lived adapter: holds one external tool's
 adk_agents/release_approval_agent/  Dashy agent, Temporal integration, Web proxy
 adk_agents/run_temporal_session.py  CLI client for the same ADK session workflow
 activities/gateway_activities.py  evaluate_policy, invoke_tool, and the two
-                            Activities that reach into the release-safety namespace
+                            Activities that serve another team's Nexus request,
+                            both inside the gateway's own namespace
 worker.py                   registers the workflow and activities
 gateway/server.py           MCP HTTP server, deployment tools, approver UI
 mock_tool/server.py         pretend deploy backend with idempotency and continuity
 tests/                      Temporal scenarios, gateway contract, and ADK agent tests
 
-release_safety/             the Release Safety team's canary platform. A separate
-                            package, a separate namespace, a separate worker, and
-                            no imports from anything above this line.
-  models.py                 their dataclasses, and their window's shape
+security_scan/              the Security team's pre-prod scanning platform. A
+                            separate package, a separate namespace, a separate
+                            worker, and no imports from anything above this line.
+  models.py                 their dataclasses, and their scan's shape
   nexus_contracts.py        their half of the Nexus boundary, declared
                             independently of the gateway's
-  nexus_handlers.py         their Nexus front door: open_canary_window
-  canary_workflow.py        CanaryAnalysisWorkflow: the window, the nested call,
+  nexus_handlers.py         their Nexus front door: start_security_scan
+  security_scan_workflow.py SecurityScanWorkflow: the stages, the nested call,
                             and the suspension that outlives their worker
-  canary_activities.py      the tick, and reporting progress for the dashboard
-  worker.py                 release-safety-tq worker and its capability heartbeat
-  legacy_canary_script.py   the uncontrolled Tool1: a plain process, no temporalio
+  security_scan_activities.py  one scan stage, and reporting progress for the
+                            dashboard
+  worker.py                 security-tq worker and its capability heartbeat
+  legacy_security_scan_script.py  the uncontrolled Tool1: a plain process, no
+                            temporalio
 ```

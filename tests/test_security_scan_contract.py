@@ -1,4 +1,4 @@
-"""The Nexus boundary between Agent Gateway and Release Safety.
+"""The Nexus boundary between Agent Gateway and the Security team.
 
 The previous version of this file greped the other team's source code to check
 that two hand-copied dataclasses had not drifted apart. That test was a
@@ -22,7 +22,7 @@ from pathlib import Path
 import nexusrpc
 
 import common.nexus_contracts as gateway_contracts
-import release_safety.nexus_contracts as safety_contracts
+import security_scan.nexus_contracts as security_contracts
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,8 +43,8 @@ def _code_only(path: Path) -> str:
     """Source with docstrings and comments stripped.
 
     The checks below are about what the code depends on, not about what the
-    prose is allowed to explain. A comment in release_safety/ describing why the
-    canary window is opened synchronously has to be able to name
+    prose is allowed to explain. A comment in security_scan/ describing why the
+    scan is started synchronously has to be able to name
     AgenticChainWorkflow and Continue-As-New, because that is the reason, and a
     reader who cannot be told the reason is worse off than one who can.
     """
@@ -67,11 +67,11 @@ def _code_only(path: Path) -> str:
 def test_both_sides_declare_the_same_endpoints() -> None:
     assert (
         gateway_contracts.AGENT_GATEWAY_ENDPOINT
-        == safety_contracts.AGENT_GATEWAY_ENDPOINT
+        == security_contracts.AGENT_GATEWAY_ENDPOINT
     )
     assert (
-        gateway_contracts.RELEASE_SAFETY_ENDPOINT
-        == safety_contracts.RELEASE_SAFETY_ENDPOINT
+        gateway_contracts.SECURITY_ENDPOINT
+        == security_contracts.SECURITY_ENDPOINT
     )
 
 
@@ -82,25 +82,25 @@ def test_both_sides_declare_the_same_operations() -> None:
     is the one that would strand a suspended workflow rather than erroring
     loudly at deploy time.
     """
-    for gateway_service, safety_service in (
-        (gateway_contracts.AgentGatewayService, safety_contracts.AgentGatewayService),
+    for gateway_service, security_service in (
+        (gateway_contracts.AgentGatewayService, security_contracts.AgentGatewayService),
         (
-            gateway_contracts.ReleaseSafetyService,
-            safety_contracts.ReleaseSafetyService,
+            gateway_contracts.SecurityScanService,
+            security_contracts.SecurityScanService,
         ),
     ):
-        assert _operations(gateway_service) == _operations(safety_service)
+        assert _operations(gateway_service) == _operations(security_service)
 
 
 def test_payload_field_names_match_on_both_sides() -> None:
     """Field names are the contract; the payload converter matches on them."""
     pairs = [
-        (gateway_contracts.ProtectedActionRequest, safety_contracts.ProtectedActionRequest),
-        (gateway_contracts.ProtectedActionOutcome, safety_contracts.ProtectedActionOutcome),
-        (gateway_contracts.ToolOutcomeReport, safety_contracts.ToolOutcomeReport),
-        (gateway_contracts.ToolOutcomeAck, safety_contracts.ToolOutcomeAck),
-        (gateway_contracts.OpenCanaryWindowInput, safety_contracts.OpenCanaryWindowInput),
-        (gateway_contracts.CanaryWindowOpened, safety_contracts.CanaryWindowOpened),
+        (gateway_contracts.ProtectedActionRequest, security_contracts.ProtectedActionRequest),
+        (gateway_contracts.ProtectedActionOutcome, security_contracts.ProtectedActionOutcome),
+        (gateway_contracts.ToolOutcomeReport, security_contracts.ToolOutcomeReport),
+        (gateway_contracts.ToolOutcomeAck, security_contracts.ToolOutcomeAck),
+        (gateway_contracts.StartSecurityScanInput, security_contracts.StartSecurityScanInput),
+        (gateway_contracts.SecurityScanStarted, security_contracts.SecurityScanStarted),
     ]
     for ours, theirs in pairs:
         assert _fields(ours) == _fields(theirs), ours.__name__
@@ -114,7 +114,7 @@ def test_the_correlation_token_survives_the_boundary() -> None:
     second chain, which is precisely the failure the requirements document's
     correlation section exists to prevent.
     """
-    assert "gateway_workflow_id" in _fields(gateway_contracts.OpenCanaryWindowInput)
+    assert "gateway_workflow_id" in _fields(gateway_contracts.StartSecurityScanInput)
     assert "gateway_workflow_id" in _fields(gateway_contracts.ProtectedActionRequest)
     assert "gateway_workflow_id" in _fields(gateway_contracts.ToolOutcomeReport)
 
@@ -128,18 +128,18 @@ def _imported_packages(path: Path) -> set[str]:
     return packages
 
 
-def test_release_safety_does_not_import_the_gateway() -> None:
+def test_the_security_team_does_not_import_the_gateway() -> None:
     forbidden = {"common", "workflows", "activities", "gateway", "mock_tool"}
-    for path in sorted((REPO_ROOT / "release_safety").glob("*.py")):
+    for path in sorted((REPO_ROOT / "security_scan").glob("*.py")):
         leaked = _imported_packages(path) & forbidden
         assert not leaked, f"{path.name} imports {sorted(leaked)} from the gateway"
 
 
-def test_the_gateway_does_not_import_release_safety() -> None:
+def test_the_gateway_does_not_import_the_security_package() -> None:
     for module in ("workflows", "activities", "gateway", "common"):
         for path in sorted((REPO_ROOT / module).glob("*.py")):
-            assert "release_safety" not in _imported_packages(path), (
-                f"{module}/{path.name} imports the release_safety package"
+            assert "security_scan" not in _imported_packages(path), (
+                f"{module}/{path.name} imports the security_scan package"
             )
 
 
@@ -155,14 +155,14 @@ def test_neither_side_names_the_other_topology() -> None:
     for module in ("workflows", "activities", "common"):
         for path in (REPO_ROOT / module).glob("*.py"):
             code = _code_only(path)
-            assert "release-safety-tq" not in code, path.name
-            assert "CanaryAnalysisWorkflow" not in code, path.name
+            assert "security-tq" not in code, path.name
+            assert "SecurityScanWorkflow" not in code, path.name
 
-    for path in (REPO_ROOT / "release_safety").glob("*.py"):
+    for path in (REPO_ROOT / "security_scan").glob("*.py"):
         # The legacy script is the uncontrolled caller and deliberately talks to
         # the gateway's public MCP endpoint. Everything else must not know the
         # gateway exists beyond its Nexus endpoint name.
-        if path.name == "legacy_canary_script.py":
+        if path.name == "legacy_security_scan_script.py":
             continue
         code = _code_only(path)
         assert "agentic-gateway" not in code, path.name

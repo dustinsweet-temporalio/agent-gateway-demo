@@ -1,6 +1,11 @@
-"""Legacy canary check, for services that predate Release Safety's platform.
+"""Legacy pre-prod scanner, for services that predate the Security team's platform.
 
-This script has no memory. It runs, it checks, and it either finishes or it does
+A handful of Waypoint services still gate through this old scanner rather than
+the workflow next door. It is on the list to be migrated and it is not what the
+Security team runs today; it is here because comparing the two at the pause is
+the entire point of this file.
+
+This script has no memory. It runs, it scans, and it either finishes or it does
 not. There is no workflow, no Event History, no task queue, no worker, and no
 supervisor that brings it back. Nothing here imports temporalio, and that is the
 whole point: it is the requirements document's uncontrolled tool, the kind that
@@ -10,10 +15,10 @@ execution, retry safely, or accept a later resumed result".
 If Agent Gateway pauses the promotion this script triggers, the script cannot
 wait for a human. It prints the operation id it was given and exits non-zero.
 Somebody has to come back later and finish the promotion by hand. Compare
-release_safety/canary_workflow.py, which checkpoints and resumes, and which is
-the same job done by a system that can hold its own state.
+security_scan/security_scan_workflow.py, which checkpoints and resumes, and which
+is the same job done by a system that can hold its own state.
 
-    python -m release_safety.legacy_canary_script \\
+    python -m security_scan.legacy_security_scan_script \\
         --service delivery-matching-service --version 2.3.0 \\
         --gateway-workflow-id wf-abc123
 
@@ -38,29 +43,50 @@ from mcp.client.streamable_http import streamablehttp_client
 GATEWAY_MCP_URL = os.getenv("GATEWAY_MCP_URL", "http://localhost:8080/mcp")
 GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "tok_dustin")
 
-THRESHOLD = 0.02
-# The same scripted sequences the platform canary uses, so the two paths are
+SEVERITY_ORDER = ["none", "low", "medium", "high", "critical"]
+SEVERITY_THRESHOLD = "medium"
+STAGE_NAMES = [
+    "dependency_scan",
+    "container_image_scan",
+    "secret_detection",
+    "static_analysis",
+]
+# The same scripted sequences the platform scan uses, so the two paths are
 # compared on how they behave at the pause and nothing else.
 SCHEDULE = {
-    "pass": [0.004, 0.006, 0.003, 0.002],
-    "fail": [0.031, 0.0, 0.0, 0.0],
+    "pass": ["none", "low", "none", "none"],
+    "fail": ["high", "none", "none", "none"],
 }
 
 
-def run_window(scripted_outcome: str, tick_seconds: int, window_ticks: int) -> bool:
-    rates = SCHEDULE[scripted_outcome]
-    for tick in range(1, window_ticks + 1):
-        error_rate = rates[min(tick - 1, len(rates) - 1)]
+def _blocking(severity: str) -> bool:
+    try:
+        return SEVERITY_ORDER.index(severity) >= SEVERITY_ORDER.index(
+            SEVERITY_THRESHOLD
+        )
+    except ValueError:
+        return True
+
+
+def run_scan(scripted_outcome: str, check_seconds: int, stage_count: int) -> bool:
+    severities = SCHEDULE[scripted_outcome]
+    for stage in range(1, stage_count + 1):
+        name = STAGE_NAMES[min(stage - 1, len(STAGE_NAMES) - 1)]
+        max_severity = severities[min(stage - 1, len(severities) - 1)]
         print(
-            f"tick {tick}/{window_ticks}: error_rate={error_rate:.3f} "
-            f"threshold={THRESHOLD:.3f}",
+            f"stage {stage}/{stage_count} {name}: max_severity={max_severity} "
+            f"threshold={SEVERITY_THRESHOLD}",
             flush=True,
         )
-        if error_rate > THRESHOLD:
-            print(f"CANARY FAILED at tick {tick}. Stopping.", flush=True)
+        if _blocking(max_severity):
+            print(
+                f"SECURITY SCAN FAILED at {name} (1 finding, {max_severity}). "
+                f"Stopping.",
+                flush=True,
+            )
             return False
-        if tick < window_ticks:
-            time.sleep(tick_seconds)
+        if stage < stage_count:
+            time.sleep(check_seconds)
     return True
 
 
@@ -88,7 +114,7 @@ async def request_promotion(
                     "tool1_mode": "uncontrolled",
                     "workflow_id": gateway_workflow_id,
                     "justification": (
-                        f"Legacy canary passed for {service} {version}"
+                        f"Legacy security scan passed for {service} {version}"
                     ),
                 },
             )
@@ -105,17 +131,18 @@ def main() -> None:
     parser.add_argument("--environment", default="prod")
     parser.add_argument("--scripted-outcome", default="pass", choices=sorted(SCHEDULE))
     parser.add_argument("--gateway-workflow-id", required=True)
-    parser.add_argument("--tick-seconds", type=int, default=5)
-    parser.add_argument("--window-ticks", type=int, default=4)
+    parser.add_argument("--check-seconds", type=int, default=5)
+    parser.add_argument("--stage-count", type=int, default=4)
     parser.add_argument("--url", default=GATEWAY_MCP_URL)
     parser.add_argument("--token", default=GATEWAY_TOKEN)
     args = parser.parse_args()
 
-    if not run_window(args.scripted_outcome, args.tick_seconds, args.window_ticks):
+    if not run_scan(args.scripted_outcome, args.check_seconds, args.stage_count):
         sys.exit(1)
 
     print(
-        "Canary passed. Requesting the production promotion via Agent Gateway.",
+        "Security scan passed. Requesting the production promotion via Agent "
+        "Gateway.",
         flush=True,
     )
     body = asyncio.run(

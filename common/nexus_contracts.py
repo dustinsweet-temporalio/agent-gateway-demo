@@ -1,12 +1,12 @@
-"""Agent Gateway's view of the Nexus boundary with the Release Safety team.
+"""Agent Gateway's view of the Nexus boundary with the Security team.
 
 Two services cross this boundary, in opposite directions:
 
-  AgentGatewayService    handled here, called by Release Safety. How another
+  AgentGatewayService    handled here, called by the Security team. How another
                          team's tool asks the gateway to perform a protected
                          action, and how it learns what a human decided.
-  ReleaseSafetyService   handled by Release Safety, called from here. How the
-                         release pipeline opens a canary window.
+  SecurityScanService    handled by the Security team, called from here. How the
+                         release pipeline starts a pre-prod security scan.
 
 What is deliberately absent from this file is as important as what is in it:
 there is no namespace, no task queue, and no workflow type name belonging to the
@@ -14,7 +14,7 @@ other team. A Nexus Endpoint is the only thing either side addresses, and the
 team that owns an endpoint can re-point it, rename their workflows, or move
 namespaces without anyone on the other side editing code.
 
-release_safety/nexus_contracts.py declares the mirror image of this file. The
+security_scan/nexus_contracts.py declares the mirror image of this file. The
 two are duplicated on purpose -- they are the published interface between two
 services, which is exactly the thing that is legitimate to state twice, unlike
 an internal request struct copied field by field.
@@ -30,7 +30,7 @@ import nexusrpc
 # Endpoint names, registered with the cluster at startup. These, plus the
 # operation names below, are the entire integration surface.
 AGENT_GATEWAY_ENDPOINT = "agent-gateway"
-RELEASE_SAFETY_ENDPOINT = "release-safety"
+SECURITY_ENDPOINT = "security"
 
 
 # ------------------------------------------------- gateway's inbound service
@@ -103,16 +103,16 @@ class AgentGatewayService:
     report_tool_outcome: nexusrpc.Operation[ToolOutcomeReport, ToolOutcomeAck]
 
 
-# --------------------------------------------- Release Safety's service, ours
-#                                                to call and theirs to change
+# ------------------------------------------- the Security team's service, ours
+#                                              to call and theirs to change
 
 
 @dataclass
-class OpenCanaryWindowInput:
-    """Ask Release Safety to watch a release under live traffic.
+class StartSecurityScanInput:
+    """Ask the Security team to scan a staged release before it reaches prod.
 
-    Note what this does not carry: how long the window runs, how many ticks it
-    takes, or what threshold it applies. Those are the canary team's decisions
+    Note what this does not carry: which stages run, how long they take, or what
+    severity threshold blocks a release. Those are the Security team's decisions
     about their own product, and the pipeline has no business relaying them.
     """
 
@@ -126,14 +126,16 @@ class OpenCanaryWindowInput:
 
 
 @dataclass
-class CanaryWindowOpened:
-    """The handle the pipeline records so an operator can find the window."""
+class SecurityScanStarted:
+    """The handle the pipeline records so an operator can find the scan."""
 
-    canary_workflow_id: str
+    scan_workflow_id: str
 
 
 @nexusrpc.service
-class ReleaseSafetyService:
-    """Handled by the Release Safety team, in their namespace."""
+class SecurityScanService:
+    """Handled by the Security team, in their namespace."""
 
-    open_canary_window: nexusrpc.Operation[OpenCanaryWindowInput, CanaryWindowOpened]
+    start_security_scan: nexusrpc.Operation[
+        StartSecurityScanInput, SecurityScanStarted
+    ]

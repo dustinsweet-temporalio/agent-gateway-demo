@@ -1,4 +1,4 @@
-"""Release Safety's view of the Nexus boundary with Agent Gateway.
+"""The Security team's view of the Nexus boundary with Agent Gateway.
 
 The mirror image of common/nexus_contracts.py, declared independently because
 this team does not have Agent Gateway's Python package on its path and does not
@@ -22,7 +22,7 @@ from typing import Any, Optional
 import nexusrpc
 
 AGENT_GATEWAY_ENDPOINT = "agent-gateway"
-RELEASE_SAFETY_ENDPOINT = "release-safety"
+SECURITY_ENDPOINT = "security"
 
 
 # ------------------------------------------ Agent Gateway's service, ours to
@@ -77,7 +77,7 @@ class AgentGatewayService:
 
 
 @dataclass
-class OpenCanaryWindowInput:
+class StartSecurityScanInput:
     gateway_workflow_id: str
     origin_operation_id: str
     service: str
@@ -88,10 +88,12 @@ class OpenCanaryWindowInput:
 
 
 @dataclass
-class CanaryWindowOpened:
-    canary_workflow_id: str
+class SecurityScanStarted:
+    scan_workflow_id: str
 
 
 @nexusrpc.service
-class ReleaseSafetyService:
-    open_canary_window: nexusrpc.Operation[OpenCanaryWindowInput, CanaryWindowOpened]
+class SecurityScanService:
+    start_security_scan: nexusrpc.Operation[
+        StartSecurityScanInput, SecurityScanStarted
+    ]

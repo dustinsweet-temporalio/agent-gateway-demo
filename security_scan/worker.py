@@ -1,11 +1,11 @@
-"""Release Safety's worker. A separate process from Agent Gateway's.
+"""The Security team's worker. A separate process from Agent Gateway's.
 
 Separate namespace, separate task queue, separate container, separate identity in
-the Temporal UI. None of that is decoration: the claim CASE-2b makes is that
-canary analysis is another team's independently durable system, and a class name
-in someone else's worker would not be that.
+the Temporal UI. None of that is decoration: the claim CASE-2b makes is that the
+pre-prod security scan is another team's independently durable system, and a class
+name in someone else's worker would not be that.
 
-Run it with:  python -m release_safety.worker
+Run it with:  python -m security_scan.worker
 """
 
 from __future__ import annotations
@@ -18,31 +18,31 @@ import requests
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from release_safety.canary_activities import publish_canary_state, run_canary_tick
-from release_safety.canary_workflow import CanaryAnalysisWorkflow
-from release_safety.nexus_handlers import ReleaseSafetyServiceHandler
-from release_safety.models import CANARY_NAMESPACE, CANARY_TASK_QUEUE
-from release_safety.nexus_contracts import RELEASE_SAFETY_ENDPOINT
+from security_scan.security_scan_activities import publish_scan_state, run_scan_check
+from security_scan.security_scan_workflow import SecurityScanWorkflow
+from security_scan.nexus_handlers import SecurityScanServiceHandler
+from security_scan.models import SECURITY_NAMESPACE, SECURITY_TASK_QUEUE
+from security_scan.nexus_contracts import SECURITY_ENDPOINT
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
-NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", CANARY_NAMESPACE)
-TASK_QUEUE = os.getenv("TASK_QUEUE", CANARY_TASK_QUEUE)
-REGISTRY_URL = os.getenv("RELEASE_SAFETY_METRICS_URL", "http://mock-tool:9000/invoke")
+NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", SECURITY_NAMESPACE)
+TASK_QUEUE = os.getenv("TASK_QUEUE", SECURITY_TASK_QUEUE)
+REGISTRY_URL = os.getenv("SECURITY_SCAN_BACKEND_URL", "http://mock-tool:9000/invoke")
 # How often this worker tells the shared platform it is here. The registration
 # carries a TTL on the other side, so stopping this container makes the
 # capability go away on its own rather than lingering as a stale advertisement.
-HEARTBEAT_SECONDS = float(os.getenv("RELEASE_SAFETY_HEARTBEAT_SECONDS", "5"))
+HEARTBEAT_SECONDS = float(os.getenv("SECURITY_SCAN_HEARTBEAT_SECONDS", "5"))
 
 
 async def _announce_forever() -> None:
-    """Advertise canary analysis to the shared platform, on a heartbeat.
+    """Advertise pre-prod security scanning to the shared platform, on a heartbeat.
 
     This is how Waypoint's release pipeline discovers that the capability exists
-    at all. Before Release Safety shipped it, the pipeline went from green
-    quality gates straight to opening the production promotion, because there was
-    nothing else to route through. It still does exactly that whenever this
-    worker is not running. The pipeline is not configured for canary; it looks to
-    see whether canary is there.
+    at all. Before the Security team onboarded Waypoint, the pipeline went from
+    green quality gates straight to opening the production promotion, because
+    there was nothing else to route through. It still does exactly that whenever
+    this worker is not running. The pipeline is not configured for the scan; it
+    looks to see whether the scan is there.
     """
     while True:
         try:
@@ -50,14 +50,14 @@ async def _announce_forever() -> None:
                 lambda: requests.post(
                     REGISTRY_URL,
                     json={
-                        "tool_name": "register_canary_capability",
+                        "tool_name": "register_security_scan_capability",
                         "arguments": {
-                            "provider": "release-safety",
+                            "provider": "security",
                             # The endpoint, not the namespace or task queue
                             # behind it. Advertising those would hand callers
                             # exactly the coupling the endpoint exists to
                             # prevent.
-                            "endpoint": RELEASE_SAFETY_ENDPOINT,
+                            "endpoint": SECURITY_ENDPOINT,
                             "ttl_seconds": HEARTBEAT_SECONDS * 4,
                         },
                     },
@@ -72,22 +72,22 @@ async def _announce_forever() -> None:
 async def main() -> None:
     client = await Client.connect(TEMPORAL_ADDRESS, namespace=NAMESPACE)
     heartbeat = asyncio.create_task(_announce_forever())
-    # run_canary_tick and publish_canary_state are synchronous, so they need a
+    # run_scan_check and publish_scan_state are synchronous, so they need a
     # thread pool; the two gateway-facing Activities are async and do not.
     with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
-            workflows=[CanaryAnalysisWorkflow],
-            activities=[run_canary_tick, publish_canary_state],
+            workflows=[SecurityScanWorkflow],
+            activities=[run_scan_check, publish_scan_state],
             # This team's Nexus front door. Agent Gateway reaches it through the
-            # `release-safety` Endpoint and never learns what is behind it.
-            nexus_service_handlers=[ReleaseSafetyServiceHandler()],
+            # `security` Endpoint and never learns what is behind it.
+            nexus_service_handlers=[SecurityScanServiceHandler()],
             activity_executor=executor,
-            identity=f"release-safety-worker@{os.getenv('HOSTNAME', 'local')}",
+            identity=f"security-scan-worker@{os.getenv('HOSTNAME', 'local')}",
         )
         print(
-            f"release safety worker started, namespace {NAMESPACE!r}, "
+            f"security scan worker started, namespace {NAMESPACE!r}, "
             f"task queue {TASK_QUEUE!r}",
             flush=True,
         )

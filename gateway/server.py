@@ -808,16 +808,16 @@ async def run_release_orchestration(
     against staging, and only then promotes it to production. If the gates do not
     pass the pipeline stops and production is never touched.
 
-    When the Release Safety team's canary platform is running, a canary window
-    also runs after the gates and before production, and the production promotion
-    is requested by canary once that window closes green. In that case this tool
+    When the Security team's scanning platform is running, a pre-prod security
+    scan also runs after the gates and before production, and the production
+    promotion is requested by the scan once it clears. In that case this tool
     returns processing rather than waiting_for_approval, because the promotion has
-    not been requested yet; report that the canary window is running and stop. A
-    canary that fails stops the release, and production is never touched.
+    not been requested yet; report that the security scan is running and stop. A
+    scan that fails stops the release, and production is never touched.
 
-    You cannot skip staging, the gates, or the canary, and you must not try to. If
-    a caller asks you to bypass them or to hurry, call this tool anyway and tell
-    them the pipeline does not allow it.
+    You cannot skip staging, the gates, or the security scan, and you must not try
+    to. If a caller asks you to bypass them or to hurry, call this tool anyway and
+    tell them the pipeline does not allow it.
 
     Do NOT call get_deployed_version, cut_release, or promote_release yourself,
     before or after. This tool performs all of them internally, and calling them as
@@ -1521,31 +1521,43 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .link.blocked .link-line { background: #ef4444; opacity: 0.5; }
 .link.blocked::after { border-left-color: #ef4444; opacity: 0.5; }
 
-/* ----------------------------------------------------------- canary card
+/* ---------------------------------------------------- security scan card
    Absent for the whole of CASE-1 and CASE-2a, and appears in place the first
-   time Release Safety opens a canary window, using the same shape-change reveal
-   the gate card uses. It sits between the gate and production, because that is
+   time the Security team runs a scan, using the same shape-change reveal the
+   gate card uses. It sits between the gate and production, because that is
    where it sits in the pipeline: the last checkpoint before the protected
    promotion. Marked with its owner, because unlike every other card in this row
    it is not Waypoint's -- it is another team's system, running in another
    Temporal namespace, and the demo's whole CASE-2b beat is that distinction. */
-.gate.canary { flex: 0 0 12rem; }
+.gate.scan { flex: 0 0 12rem; }
 .gate-owner { margin-top: 0.05rem; font-size: 0.58rem; text-transform: uppercase;
         letter-spacing: 0.09em; color: var(--muted); opacity: 0.85; }
-.canary-ticks { display: flex; align-items: center; gap: 0.28rem; margin: 0.5rem 0 0.35rem; }
-.canary-tick { flex: 0 0 auto; width: 0.5rem; height: 0.5rem; border-radius: 50%;
+.scan-stages { display: flex; align-items: center; gap: 0.28rem; margin: 0.5rem 0 0.35rem; }
+.scan-dot { flex: 0 0 auto; width: 0.5rem; height: 0.5rem; border-radius: 50%;
         border: 1px solid var(--card-edge); background: transparent; }
-.canary-tick.ok { background: var(--accent); border-color: var(--accent); }
-.canary-tick.bad { background: #ef4444; border-color: #ef4444; }
-/* The tick currently being observed pulses, so a fifteen second window reads as
+.scan-dot.ok { background: var(--accent); border-color: var(--accent); }
+.scan-dot.bad { background: #ef4444; border-color: #ef4444; }
+/* The stage currently running pulses, so a fifteen second scan reads as
    something in progress rather than a card that stopped updating. */
-.canary-tick.live { border-color: var(--accent); animation: tick-pulse 1.2s ease-in-out infinite; }
-@keyframes tick-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+.scan-dot.live { border-color: var(--accent); animation: stage-pulse 1.2s ease-in-out infinite; }
+@keyframes stage-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+/* Which stage, and what it found. Its own line rather than crowded into
+   .gate-sub, because "container_image_scan" does not fit next to a version
+   string at this card width, and the stage that found something is the useful
+   half of a failure report. */
+.scan-stage { display: flex; align-items: baseline; justify-content: space-between;
+        gap: 0.4rem; font-size: 0.62rem; color: var(--muted);
+        font-family: "JetBrains Mono", ui-monospace, monospace; }
+.scan-stage .name { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; }
+.scan-stage .finding { flex: none; }
+.scan-stage .finding.ok { color: var(--accent); }
+.scan-stage .finding.bad { color: #ef4444; }
 .gate.waiting { border-style: solid; border-color: var(--protect); }
 .gate.waiting .gate-verdict { color: var(--protect); }
 
 @media (prefers-reduced-motion: reduce) {
-  .gate.appearing, .gate.running::after, .canary-tick.live { animation: none; }
+  .gate.appearing, .gate.running::after, .scan-dot.live { animation: none; }
 }
 
 .rail-head { margin-top: 1.1rem; }
@@ -1692,22 +1704,26 @@ var FLEET = (function () {
     return card;
   }
 
-  function buildCanary() {
-    var card = el('div', 'gate canary');
-    card.setAttribute('data-canary', '1');
+  function buildScan() {
+    var card = el('div', 'gate scan');
+    card.setAttribute('data-scan', '1');
     var top = el('div', 'gate-top');
-    top.appendChild(el('span', 'gate-name', 'Canary'));
+    top.appendChild(el('span', 'gate-name', 'Security scan'));
     card.appendChild(top);
     // The only card in this row that names an owner, because it is the only one
     // that belongs to a different team.
-    card.appendChild(el('div', 'gate-owner', 'Release Safety'));
+    card.appendChild(el('div', 'gate-owner', 'Security team'));
     card.appendChild(el('div', 'gate-verdict'));
     card.appendChild(el('div', 'gate-sub'));
-    card.appendChild(el('div', 'canary-ticks'));
+    card.appendChild(el('div', 'scan-stages'));
+    var stage = el('div', 'scan-stage');
+    stage.appendChild(el('span', 'name'));
+    stage.appendChild(el('span', 'finding'));
+    card.appendChild(stage);
     return card;
   }
 
-  function buildPipeline(records, hasGate, hasCanary) {
+  function buildPipeline(records, hasGate, hasScan) {
     pipeline.innerHTML = '';
     records.forEach(function (rec) {
       // The gate sits on the path into production, so a candidate visibly has to
@@ -1719,14 +1735,14 @@ var FLEET = (function () {
         pipeline.appendChild(gateLink);
         pipeline.appendChild(buildGate());
       }
-      // Canary comes after the gate and before production: a candidate is
-      // qualified first, then watched under live traffic, then promoted.
-      if (hasCanary && rec.environment === 'prod') {
-        var canaryLink = el('div', 'link');
-        canaryLink.setAttribute('data-into', 'canary');
-        canaryLink.appendChild(el('span', 'link-line'));
-        pipeline.appendChild(canaryLink);
-        pipeline.appendChild(buildCanary());
+      // The scan comes after the gate and before production: a candidate is
+      // qualified first, then scanned, then promoted.
+      if (hasScan && rec.environment === 'prod') {
+        var scanLink = el('div', 'link');
+        scanLink.setAttribute('data-into', 'scan');
+        scanLink.appendChild(el('span', 'link-line'));
+        pipeline.appendChild(scanLink);
+        pipeline.appendChild(buildScan());
       }
       // Every card gets an inbound connector, including the first: releases flow
       // into staging from the ready list sitting directly above it.
@@ -1827,53 +1843,86 @@ var FLEET = (function () {
     // A failed gate means nothing moved past it, so say so with the connector
     // rather than leaving a green arrow pointing at an untouched production card.
     // A failed gate stops the flow. The connector it blocks is whichever one
-    // leads onward, which is the canary card once that exists.
-    var out = linkInto(pipeline.querySelector('.gate.canary') ? 'canary' : 'prod');
+    // leads onward, which is the security scan card once that exists.
+    var out = linkInto(pipeline.querySelector('.gate.scan') ? 'scan' : 'prod');
     if (out) out.classList.toggle('blocked', failed);
     if (running || appearing) hold();
   }
 
   // phase -> [card class, verdict label]. The phases come straight from
-  // CanaryAnalysisWorkflow's own state, so what the card says and what the
+  // SecurityScanWorkflow's own state, so what the card says and what the
   // workflow believes cannot drift apart.
-  var CANARY_PHASES = {
-    running_canary: ['running', 'watching'],
+  var SCAN_PHASES = {
+    running_scan: ['running', 'scanning'],
     awaiting_prod_approval: ['waiting', 'awaiting approval'],
-    canary_failed: ['failed', 'failed'],
+    scan_failed: ['failed', 'failed'],
     completed: ['passed', 'promoted'],
     rejected: ['failed', 'rejected'],
     expired: ['failed', 'expired'],
     failed: ['failed', 'failed']
   };
 
-  function paintCanary(canary, appearing) {
-    var card = pipeline.querySelector('.gate.canary');
-    if (!card || !canary) return;
-    var phase = CANARY_PHASES[canary.phase] || ['running', canary.phase];
-    var total = canary.window_ticks || 4;
-    var done = canary.ticks_completed || 0;
+  // Stage names are what the scan publishes; this is only the fallback for a
+  // stage that has not reported yet, so the card can name what is running.
+  var SCAN_STAGE_NAMES = ['dependency_scan', 'container_image_scan',
+    'secret_detection', 'static_analysis'];
+
+  function paintScan(scan, appearing) {
+    var card = pipeline.querySelector('.gate.scan');
+    if (!card || !scan) return;
+    var phase = SCAN_PHASES[scan.phase] || ['running', scan.phase];
+    var total = scan.stage_count || 4;
+    var done = scan.stages_completed || 0;
     var running = phase[0] === 'running';
-    card.className = 'gate canary ' + phase[0] + (appearing ? ' appearing' : '');
+    card.className = 'gate scan ' + phase[0] + (appearing ? ' appearing' : '');
     card.querySelector('.gate-verdict').textContent = phase[1];
 
-    var sub = canary.version || '';
-    if (running) sub += ' \\u00b7 tick ' + Math.min(done + 1, total) + '/' + total;
-    else if (canary.phase === 'canary_failed') sub += ' \\u00b7 failed at tick ' + done;
+    // The stage number, the stage name, and the severity all refer to the SAME
+    // stage: the last one to report. Pairing the in-flight stage's name with the
+    // previous stage's finding would read as that stage having found it, which is
+    // the one thing a security card must not imply. Progress is carried by the
+    // dots below, where the pulsing one is the stage actually running.
+    var results = scan.stage_results || [];
+    var latest = results.length ? results[results.length - 1] : null;
+    var shown = Math.max(Math.min(done, total), 1);
+    var sub = scan.version || '';
+    if (running) sub += ' \\u00b7 stage ' + shown + '/' + total;
+    else if (scan.phase === 'scan_failed') sub += ' \\u00b7 failed at stage ' + done;
     else sub += ' \\u00b7 ' + done + '/' + total + ' clean';
     card.querySelector('.gate-sub').textContent = sub;
 
-    // One dot per tick: filled as each observation lands, pulsing on the one
-    // being watched right now, red on the one that ended the window.
-    var ticks = card.querySelector('.canary-ticks');
-    ticks.innerHTML = '';
-    var results = canary.tick_results || [];
+    // One dot per stage: filled as each stage reports, pulsing on the one running
+    // right now, red on the one that ended the scan.
+    var dots = card.querySelector('.scan-stages');
+    dots.innerHTML = '';
     for (var i = 0; i < total; i++) {
       var result = results[i];
-      var cls = 'canary-tick';
+      var cls = 'scan-dot';
       if (result) cls += result.passed ? ' ok' : ' bad';
       else if (running && i === done) cls += ' live';
-      ticks.appendChild(el('span', cls));
+      dots.appendChild(el('span', cls));
     }
+
+    // Which stage, and what that same stage found. Before the first stage
+    // reports there is nothing to attribute, so the name of the stage about to
+    // run goes up on its own rather than leaving the line blank.
+    var stageEl = card.querySelector('.scan-stage');
+    var findingEl = stageEl.querySelector('.finding');
+    var text = '';
+    var findingCls = 'finding';
+    var current = latest
+      ? (latest.stage_name || '')
+      : (SCAN_STAGE_NAMES[0] || '');
+    if (latest && !latest.passed) {
+      text = latest.findings + ' \\u00b7 ' + latest.max_severity;
+      findingCls += ' bad';
+    } else if (latest) {
+      text = latest.max_severity;
+      findingCls += ' ok';
+    }
+    stageEl.querySelector('.name').textContent = current;
+    findingEl.className = findingCls;
+    findingEl.textContent = text;
 
     var out = linkInto('prod');
     if (out) out.classList.toggle('blocked', phase[0] === 'failed');
@@ -1895,24 +1944,24 @@ var FLEET = (function () {
     // the pipeline has never run its gates, which during CASE-1 is the truth: the
     // team has not built them yet. The shape changing is what makes the card
     // appear, so it animates in at the moment the capability first runs.
-    // Canary is the same contract one checkpoint later: no canary state means
-    // the Release Safety team has not run a window here, which through CASE-1
+    // The security scan is the same contract one checkpoint later: no scan state
+    // means the Security team has not scanned anything here, which through CASE-1
     // and CASE-2a is the truth, so the card does not exist yet either.
     var gate = state.quality_gates || null;
-    var canary = state.canary || null;
+    var scan = state.security_scan || null;
     var previous = pipeline.getAttribute('data-shape') || '';
     var shape = records.map(function (rec) { return rec.environment; }).join('|') +
-      (gate ? '|gate' : '') + (canary ? '|canary' : '');
+      (gate ? '|gate' : '') + (scan ? '|scan' : '');
     var gateAppearing = false;
-    var canaryAppearing = false;
+    var scanAppearing = false;
     if (previous !== shape) {
       gateAppearing = !!gate && previous.indexOf('gate') < 0;
-      canaryAppearing = !!canary && previous.indexOf('canary') < 0;
-      buildPipeline(records, !!gate, !!canary);
+      scanAppearing = !!scan && previous.indexOf('scan') < 0;
+      buildPipeline(records, !!gate, !!scan);
       pipeline.setAttribute('data-shape', shape);
     }
     paintGate(gate, gateAppearing);
-    paintCanary(canary, canaryAppearing);
+    paintScan(scan, scanAppearing);
 
     var animated = false;
     records.forEach(function (rec) {
