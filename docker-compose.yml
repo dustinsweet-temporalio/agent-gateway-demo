@@ -32,6 +32,9 @@ services:
       # Versions the gates reject. Empty by default, so gates pass. Set it to show
       # the fail-closed path, then recreate the service to clear it.
       QUALITY_GATE_FAIL_VERSIONS: "${QUALITY_GATE_FAIL_VERSIONS:-}"
+      # Same idea for canary: versions whose canary window fails. Empty by
+      # default, so a canary that runs passes.
+      CANARY_FAIL_VERSIONS: "${CANARY_FAIL_VERSIONS:-}"
     ports:
       - "9000:9000"
 
@@ -52,6 +55,43 @@ services:
       AGENT_GATEWAY_TOKEN: "tok_adk"
       ADK_MODEL: "${ADK_MODEL:-gemini-3.6-flash}"
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+      # Where to reach the Release Safety team's platform. The gateway worker
+      # only ever needs a namespace, a task queue, and a workflow type name;
+      # their code is not on this image's path.
+      RELEASE_SAFETY_NAMESPACE: "release-safety"
+      RELEASE_SAFETY_TASK_QUEUE: "release-safety-tq"
+
+  # The Release Safety team's canary platform. A separate process on purpose, so
+  # the Temporal UI shows two workers with two identities in two namespaces
+  # rather than one worker wearing two hats.
+  #
+  # Deliberately NOT started by default. Canary analysis is the CASE-2b beat: for
+  # CASE-1 and CASE-2a this team has not shipped it yet, the pipeline's capability
+  # lookup comes back empty, and the release goes from green gates straight to the
+  # production approval exactly as it always did. Ship it live, mid-demo, with:
+  #
+  #     docker compose up -d release-safety-worker
+  #
+  # and the next pipeline run routes through canary and the card animates in.
+  # Stopping the container takes the capability away again, because the
+  # registration it heartbeats expires on its own.
+  release-safety-worker:
+    profiles: ["release-safety"]
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    command: ["python", "-m", "release_safety.worker"]
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      TEMPORAL_ADDRESS: "temporal:7233"
+      TEMPORAL_NAMESPACE: "release-safety"
+      TASK_QUEUE: "release-safety-tq"
+      # Agent Gateway's namespace, for the nested call back into the chain.
+      AGENT_GATEWAY_NAMESPACE: "default"
+      # The shared observability backend canary reports window progress to.
+      RELEASE_SAFETY_METRICS_URL: "http://mock-tool:9000/invoke"
 
   gateway:
     build:

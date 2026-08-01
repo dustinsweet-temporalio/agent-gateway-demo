@@ -808,9 +808,16 @@ async def run_release_orchestration(
     against staging, and only then promotes it to production. If the gates do not
     pass the pipeline stops and production is never touched.
 
-    You cannot skip staging or the gates, and you must not try to. If a caller asks
-    you to bypass them or to hurry, call this tool anyway and tell them the pipeline
-    does not allow it.
+    When the Release Safety team's canary platform is running, a canary window
+    also runs after the gates and before production, and the production promotion
+    is requested by canary once that window closes green. In that case this tool
+    returns processing rather than waiting_for_approval, because the promotion has
+    not been requested yet; report that the canary window is running and stop. A
+    canary that fails stops the release, and production is never touched.
+
+    You cannot skip staging, the gates, or the canary, and you must not try to. If
+    a caller asks you to bypass them or to hurry, call this tool anyway and tell
+    them the pipeline does not allow it.
 
     Do NOT call get_deployed_version, cut_release, or promote_release yourself,
     before or after. This tool performs all of them internally, and calling them as
@@ -1514,8 +1521,31 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .link.blocked .link-line { background: #ef4444; opacity: 0.5; }
 .link.blocked::after { border-left-color: #ef4444; opacity: 0.5; }
 
+/* ----------------------------------------------------------- canary card
+   Absent for the whole of CASE-1 and CASE-2a, and appears in place the first
+   time Release Safety opens a canary window, using the same shape-change reveal
+   the gate card uses. It sits between the gate and production, because that is
+   where it sits in the pipeline: the last checkpoint before the protected
+   promotion. Marked with its owner, because unlike every other card in this row
+   it is not Waypoint's -- it is another team's system, running in another
+   Temporal namespace, and the demo's whole CASE-2b beat is that distinction. */
+.gate.canary { flex: 0 0 12rem; }
+.gate-owner { margin-top: 0.05rem; font-size: 0.58rem; text-transform: uppercase;
+        letter-spacing: 0.09em; color: var(--muted); opacity: 0.85; }
+.canary-ticks { display: flex; align-items: center; gap: 0.28rem; margin: 0.5rem 0 0.35rem; }
+.canary-tick { flex: 0 0 auto; width: 0.5rem; height: 0.5rem; border-radius: 50%;
+        border: 1px solid var(--card-edge); background: transparent; }
+.canary-tick.ok { background: var(--accent); border-color: var(--accent); }
+.canary-tick.bad { background: #ef4444; border-color: #ef4444; }
+/* The tick currently being observed pulses, so a fifteen second window reads as
+   something in progress rather than a card that stopped updating. */
+.canary-tick.live { border-color: var(--accent); animation: tick-pulse 1.2s ease-in-out infinite; }
+@keyframes tick-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 1; } }
+.gate.waiting { border-style: solid; border-color: var(--protect); }
+.gate.waiting .gate-verdict { color: var(--protect); }
+
 @media (prefers-reduced-motion: reduce) {
-  .gate.appearing, .gate.running::after { animation: none; }
+  .gate.appearing, .gate.running::after, .canary-tick.live { animation: none; }
 }
 
 .rail-head { margin-top: 1.1rem; }
@@ -1662,7 +1692,22 @@ var FLEET = (function () {
     return card;
   }
 
-  function buildPipeline(records, hasGate) {
+  function buildCanary() {
+    var card = el('div', 'gate canary');
+    card.setAttribute('data-canary', '1');
+    var top = el('div', 'gate-top');
+    top.appendChild(el('span', 'gate-name', 'Canary'));
+    card.appendChild(top);
+    // The only card in this row that names an owner, because it is the only one
+    // that belongs to a different team.
+    card.appendChild(el('div', 'gate-owner', 'Release Safety'));
+    card.appendChild(el('div', 'gate-verdict'));
+    card.appendChild(el('div', 'gate-sub'));
+    card.appendChild(el('div', 'canary-ticks'));
+    return card;
+  }
+
+  function buildPipeline(records, hasGate, hasCanary) {
     pipeline.innerHTML = '';
     records.forEach(function (rec) {
       // The gate sits on the path into production, so a candidate visibly has to
@@ -1673,6 +1718,15 @@ var FLEET = (function () {
         gateLink.appendChild(el('span', 'link-line'));
         pipeline.appendChild(gateLink);
         pipeline.appendChild(buildGate());
+      }
+      // Canary comes after the gate and before production: a candidate is
+      // qualified first, then watched under live traffic, then promoted.
+      if (hasCanary && rec.environment === 'prod') {
+        var canaryLink = el('div', 'link');
+        canaryLink.setAttribute('data-into', 'canary');
+        canaryLink.appendChild(el('span', 'link-line'));
+        pipeline.appendChild(canaryLink);
+        pipeline.appendChild(buildCanary());
       }
       // Every card gets an inbound connector, including the first: releases flow
       // into staging from the ready list sitting directly above it.
@@ -1772,8 +1826,57 @@ var FLEET = (function () {
     });
     // A failed gate means nothing moved past it, so say so with the connector
     // rather than leaving a green arrow pointing at an untouched production card.
-    var out = linkInto('prod');
+    // A failed gate stops the flow. The connector it blocks is whichever one
+    // leads onward, which is the canary card once that exists.
+    var out = linkInto(pipeline.querySelector('.gate.canary') ? 'canary' : 'prod');
     if (out) out.classList.toggle('blocked', failed);
+    if (running || appearing) hold();
+  }
+
+  // phase -> [card class, verdict label]. The phases come straight from
+  // CanaryAnalysisWorkflow's own state, so what the card says and what the
+  // workflow believes cannot drift apart.
+  var CANARY_PHASES = {
+    running_canary: ['running', 'watching'],
+    awaiting_prod_approval: ['waiting', 'awaiting approval'],
+    canary_failed: ['failed', 'failed'],
+    completed: ['passed', 'promoted'],
+    rejected: ['failed', 'rejected'],
+    expired: ['failed', 'expired'],
+    failed: ['failed', 'failed']
+  };
+
+  function paintCanary(canary, appearing) {
+    var card = pipeline.querySelector('.gate.canary');
+    if (!card || !canary) return;
+    var phase = CANARY_PHASES[canary.phase] || ['running', canary.phase];
+    var total = canary.window_ticks || 4;
+    var done = canary.ticks_completed || 0;
+    var running = phase[0] === 'running';
+    card.className = 'gate canary ' + phase[0] + (appearing ? ' appearing' : '');
+    card.querySelector('.gate-verdict').textContent = phase[1];
+
+    var sub = canary.version || '';
+    if (running) sub += ' \\u00b7 tick ' + Math.min(done + 1, total) + '/' + total;
+    else if (canary.phase === 'canary_failed') sub += ' \\u00b7 failed at tick ' + done;
+    else sub += ' \\u00b7 ' + done + '/' + total + ' clean';
+    card.querySelector('.gate-sub').textContent = sub;
+
+    // One dot per tick: filled as each observation lands, pulsing on the one
+    // being watched right now, red on the one that ended the window.
+    var ticks = card.querySelector('.canary-ticks');
+    ticks.innerHTML = '';
+    var results = canary.tick_results || [];
+    for (var i = 0; i < total; i++) {
+      var result = results[i];
+      var cls = 'canary-tick';
+      if (result) cls += result.passed ? ' ok' : ' bad';
+      else if (running && i === done) cls += ' live';
+      ticks.appendChild(el('span', cls));
+    }
+
+    var out = linkInto('prod');
+    if (out) out.classList.toggle('blocked', phase[0] === 'failed');
     if (running || appearing) hold();
   }
 
@@ -1792,16 +1895,24 @@ var FLEET = (function () {
     // the pipeline has never run its gates, which during CASE-1 is the truth: the
     // team has not built them yet. The shape changing is what makes the card
     // appear, so it animates in at the moment the capability first runs.
+    // Canary is the same contract one checkpoint later: no canary state means
+    // the Release Safety team has not run a window here, which through CASE-1
+    // and CASE-2a is the truth, so the card does not exist yet either.
     var gate = state.quality_gates || null;
+    var canary = state.canary || null;
+    var previous = pipeline.getAttribute('data-shape') || '';
     var shape = records.map(function (rec) { return rec.environment; }).join('|') +
-      (gate ? '|gate' : '');
-    var appearing = false;
-    if (pipeline.getAttribute('data-shape') !== shape) {
-      appearing = !!gate && (pipeline.getAttribute('data-shape') || '').indexOf('gate') < 0;
-      buildPipeline(records, !!gate);
+      (gate ? '|gate' : '') + (canary ? '|canary' : '');
+    var gateAppearing = false;
+    var canaryAppearing = false;
+    if (previous !== shape) {
+      gateAppearing = !!gate && previous.indexOf('gate') < 0;
+      canaryAppearing = !!canary && previous.indexOf('canary') < 0;
+      buildPipeline(records, !!gate, !!canary);
       pipeline.setAttribute('data-shape', shape);
     }
-    paintGate(gate, appearing);
+    paintGate(gate, gateAppearing);
+    paintCanary(canary, canaryAppearing);
 
     var animated = false;
     records.forEach(function (rec) {

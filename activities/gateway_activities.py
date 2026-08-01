@@ -1,13 +1,31 @@
 from __future__ import annotations
 
 import os
+import uuid
 from typing import Any
 
 import requests
 from temporalio import activity
+from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 
-from common.models import EvaluatePolicyInput, InvokeToolInput, PolicyDecision
+from common.models import (
+    CanaryAnalysisStarted,
+    EvaluatePolicyInput,
+    InvokeToolInput,
+    PolicyDecision,
+    SignalReleaseSafetyInput,
+    StartCanaryAnalysisInput,
+)
+
+TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
+# Release Safety's namespace. The gateway team does not deploy anything into it
+# and cannot see inside their code; it knows a namespace, a task queue, a
+# workflow type name, and a signal name, all of which Release Safety publishes.
+RELEASE_SAFETY_NAMESPACE = os.getenv("RELEASE_SAFETY_NAMESPACE", "release-safety")
+RELEASE_SAFETY_TASK_QUEUE = os.getenv("RELEASE_SAFETY_TASK_QUEUE", "release-safety-tq")
+RELEASE_SAFETY_WORKFLOW_TYPE = "CanaryAnalysisWorkflow"
+RELEASE_SAFETY_RESOLUTION_SIGNAL = "gateway_operation_resolved"
 
 
 def _protected_environments() -> set[str]:
@@ -65,3 +83,94 @@ def invoke_tool(input: InvokeToolInput) -> dict[str, Any]:
 
     resp.raise_for_status()
     return resp.json()
+
+
+# ---------------------------------------------------------- Release Safety edge
+#
+# Two Activities that reach into another team's Temporal namespace. Both create
+# their own Client, scoped to that namespace, inside the Activity. Workflow code
+# never holds a client: it has to replay deterministically, and a network call
+# cannot.
+
+
+@activity.defn
+async def start_canary_analysis(
+    input: StartCanaryAnalysisInput,
+) -> CanaryAnalysisStarted:
+    """Hand a qualified release to Release Safety's canary platform.
+
+    Started by id and workflow type name, not by importing their workflow class,
+    because their code is not on this worker's path and should not be. This is
+    also deliberately NOT a child workflow: a child shares its parent's namespace
+    and is torn down with it, which would make canary look separated without
+    being separated. The two workflows are peers, in different namespaces,
+    correlated by the chain workflow_id carried in the input.
+
+    The workflow id is shaped to be unmistakable in the Temporal UI's workflow
+    list, so that switching namespaces during the demo visibly lands you in
+    another team's system rather than in more of the same.
+    """
+    client = await Client.connect(TEMPORAL_ADDRESS, namespace=RELEASE_SAFETY_NAMESPACE)
+    canary_workflow_id = (
+        f"release-safety::canary::{input.service}::{input.version}::"
+        f"{uuid.uuid4().hex[:8]}"
+    )
+    handle = await client.start_workflow(
+        RELEASE_SAFETY_WORKFLOW_TYPE,
+        {
+            "workflow_id": input.gateway_workflow_id,
+            "service": input.service,
+            "version": input.version,
+            "environment": input.environment,
+            "scripted_outcome": input.scripted_outcome,
+            "tick_seconds": input.tick_seconds,
+            "window_ticks": input.window_ticks,
+            "idempotency_key": input.idempotency_key,
+            "origin_operation_id": input.origin_operation_id,
+            "requester": input.requester,
+            "gateway_namespace": input.gateway_namespace,
+        },
+        id=canary_workflow_id,
+        task_queue=RELEASE_SAFETY_TASK_QUEUE,
+    )
+    activity.logger.info(
+        "opened canary window %s in namespace %s",
+        canary_workflow_id,
+        RELEASE_SAFETY_NAMESPACE,
+    )
+    return CanaryAnalysisStarted(
+        canary_workflow_id=canary_workflow_id,
+        canary_run_id=handle.result_run_id or "",
+        namespace=RELEASE_SAFETY_NAMESPACE,
+        task_queue=RELEASE_SAFETY_TASK_QUEUE,
+    )
+
+
+@activity.defn
+async def signal_release_safety_workflow(input: SignalReleaseSafetyInput) -> None:
+    """Deliver a terminal operation result back to the durable Tool1 that asked.
+
+    The counterpart of the pause. Canary stopped its own execution waiting for
+    this, and this is what wakes it, whether the answer is approved, rejected, or
+    timed out. It runs on the gateway's own worker, in the gateway's namespace,
+    and reaches out to Release Safety's -- the gateway is the one that knows the
+    decision, so the gateway is the one that delivers it.
+    """
+    namespace = input.callback_namespace or RELEASE_SAFETY_NAMESPACE
+    client = await Client.connect(TEMPORAL_ADDRESS, namespace=namespace)
+    handle = client.get_workflow_handle(input.callback_workflow_id)
+    await handle.signal(
+        RELEASE_SAFETY_RESOLUTION_SIGNAL,
+        {
+            "operation_id": input.operation_id,
+            "status": input.status,
+            "result": input.result,
+            "reason": input.reason,
+        },
+    )
+    activity.logger.info(
+        "notified %s that %s is %s",
+        input.callback_workflow_id,
+        input.operation_id,
+        input.status,
+    )

@@ -60,6 +60,30 @@ _autonomous_followups: set[str] = set()
 # when the team builds it. Restarting this service restores the "before" picture.
 _quality_gates: dict | None = None
 
+# Last canary window, or None if canary analysis has never run. Same contract as
+# _quality_gates above: the fleet panel renders the canary card only once this
+# exists, so the card is absent for CASE-1 and CASE-2a and appears the first time
+# Release Safety's platform opens a window. Restarting this service restores the
+# "before" picture for both cards.
+_canary: dict | None = None
+
+# Who is currently offering canary analysis, and when they last said so. The
+# Release Safety worker heartbeats into this while it is running; the entry goes
+# stale on its own once it stops, so the capability disappears when their
+# platform goes away rather than lingering as an advertisement for something
+# nobody is serving. This is the shared platform's service registry, and it is
+# what makes "Release Safety shipped canary" a thing that happens by starting
+# their container rather than by editing a config flag.
+_canary_provider: dict | None = None
+
+# Demo knob, mirroring QUALITY_GATE_FAIL_VERSIONS: canary fails for these
+# versions, so the fail-closed path can be shown on demand. Empty by default.
+CANARY_FAIL_VERSIONS = {
+    item.strip()
+    for item in os.getenv("CANARY_FAIL_VERSIONS", "").split(",")
+    if item.strip()
+}
+
 # How long a gate run takes. Long enough to watch the card work and to trip the
 # gateway's sync budget honestly, short enough to stay well inside the invoke
 # Activity's request timeout.
@@ -248,6 +272,105 @@ def _handle(tool_name: str, arguments: dict) -> dict:
             ),
         }
 
+    if tool_name == "register_canary_capability":
+        global _canary_provider
+        _canary_provider = {
+            "provider": str(arguments.get("provider", "release-safety")),
+            "namespace": str(arguments.get("namespace", "release-safety")),
+            "task_queue": str(arguments.get("task_queue", "release-safety-tq")),
+            "workflow_type": str(
+                arguments.get("workflow_type", "CanaryAnalysisWorkflow")
+            ),
+            "tick_seconds": int(arguments.get("tick_seconds", 5)),
+            "window_ticks": int(arguments.get("window_ticks", 4)),
+            "ttl_seconds": float(arguments.get("ttl_seconds", 20.0)),
+            "last_seen": time.time(),
+        }
+        return {
+            "registered": True,
+            "provider": _canary_provider["provider"],
+            "message": (
+                f"{_canary_provider['provider']} is offering canary analysis"
+            ),
+        }
+
+    if tool_name == "get_release_safety_status":
+        # The release pipeline's capability lookup. Available means somebody is
+        # currently running a canary platform, not that somebody once did: a
+        # registration that has not been refreshed inside its TTL is treated as
+        # gone, so stopping the Release Safety worker takes the capability with
+        # it and the pipeline goes back to opening the promotion itself.
+        version = str(arguments.get("version", ""))
+        record = _canary_provider
+        fresh = bool(
+            record
+            and (time.time() - record["last_seen"]) <= record["ttl_seconds"]
+        )
+        if not fresh:
+            return {
+                "available": False,
+                "message": "no canary analysis provider is currently registered",
+            }
+        return {
+            "available": True,
+            "provider": record["provider"],
+            "namespace": record["namespace"],
+            "task_queue": record["task_queue"],
+            "workflow_type": record["workflow_type"],
+            "tick_seconds": record["tick_seconds"],
+            "window_ticks": record["window_ticks"],
+            "scripted_outcome": (
+                "fail" if version in CANARY_FAIL_VERSIONS else "pass"
+            ),
+            "message": (
+                f"{record['provider']} is offering canary analysis for {version}"
+            ),
+        }
+
+    if tool_name == "record_canary_state":
+        # Visibility only. Release Safety publishes window progress here so the
+        # approval dashboard can draw it next to the gate card; nothing about the
+        # canary's own verdict depends on this call succeeding.
+        global _canary
+        _canary = {
+            "canary_workflow_id": str(arguments.get("canary_workflow_id", "")),
+            "service": str(arguments.get("service", "")),
+            "version": str(arguments.get("version", "")),
+            "environment": str(arguments.get("environment", "prod")),
+            "phase": str(arguments.get("phase", "running_canary")),
+            "ticks_completed": int(arguments.get("ticks_completed", 0)),
+            "window_ticks": int(arguments.get("window_ticks", 4)),
+            "threshold": float(arguments.get("threshold", 0.02)),
+            "tick_results": list(arguments.get("tick_results") or []),
+            "verdict": arguments.get("verdict"),
+            "gateway_operation_id": arguments.get("gateway_operation_id"),
+            "error": arguments.get("error"),
+            "updated_at": time.time(),
+        }
+        return {"recorded": True, "phase": _canary["phase"]}
+
+    if tool_name == "release_safety_canary_prepare":
+        return {
+            "checkpointed": True,
+            "service": str(arguments.get("service", "")),
+            "version": str(arguments.get("version", "")),
+            "canary_workflow_id": str(arguments.get("canary_workflow_id", "")),
+            "next_tool": "promote_release",
+            "message": (
+                "Release Safety's canary window closed green and is requesting "
+                "the production promotion"
+            ),
+        }
+
+    if tool_name == "release_safety_canary_resume":
+        return {
+            "resumed": True,
+            "nested_result_received": arguments.get("nested_result") is not None,
+            "message": (
+                "Release Safety's canary run recorded the approved promotion"
+            ),
+        }
+
     if tool_name == "release_orchestrator_prepare":
         return {
             "checkpointed": True,
@@ -314,6 +437,10 @@ async def state(request: Request) -> JSONResponse:
             # gate card on presence, so "the team has not built this yet" and "the
             # team built it" are the same code path with different state.
             "quality_gates": dict(_quality_gates) if _quality_gates else None,
+            # Absent until Release Safety has opened a canary window at least
+            # once. Same "the card exists because the capability ran" contract as
+            # the gate above, one checkpoint further along the pipeline.
+            "canary": dict(_canary) if _canary else None,
             "environments": [
                 {"environment": env, **_deployed[env]}
                 for env in ENVIRONMENTS

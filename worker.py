@@ -7,7 +7,12 @@ import os
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from activities.gateway_activities import evaluate_policy, invoke_tool
+from activities.gateway_activities import (
+    evaluate_policy,
+    invoke_tool,
+    signal_release_safety_workflow,
+    start_canary_analysis,
+)
 from adk_agents.release_approval_agent.temporal_integration import (
     build_google_adk_plugin,
 )
@@ -35,7 +40,15 @@ async def main() -> None:
                 AutonomousAgentWorkflow,
                 TemporalAdkSessionWorkflow,
             ],
-            activities=[evaluate_policy, invoke_tool],
+            activities=[
+                evaluate_policy,
+                invoke_tool,
+                # Both reach into the Release Safety namespace. They run here, on
+                # the gateway's own worker, because the gateway is the side that
+                # knows when to open a canary window and what a human decided.
+                start_canary_analysis,
+                signal_release_safety_workflow,
+            ],
             activity_executor=executor,
         )
         print(f"worker started, polling task queue '{TASK_QUEUE}'", flush=True)

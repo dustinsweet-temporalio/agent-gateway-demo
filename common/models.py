@@ -164,6 +164,17 @@ class NestedToolCallRequest:
     replay_safe: bool = False
     safe_tool1_arguments: dict[str, Any] = field(default_factory=dict)
     safe_tool2_arguments: dict[str, Any] = field(default_factory=dict)
+    # Set when Tool1 is a durable system running somewhere else and wants the
+    # terminal result delivered back to it. The gateway stores it on the nested
+    # operation and signals that workflow once the operation resolves, instead of
+    # the caller having to hold an open request or poll. Empty for every caller
+    # that is not independently durable, which is every CASE-2a caller.
+    callback_workflow_id: str = ""
+    callback_namespace: str = ""
+    # An operation elsewhere in this chain that is waiting on this nested call to
+    # resolve. CASE-2b sets it to the release pipeline's own operation, which
+    # handed off to canary analysis and is parked until the promotion lands.
+    origin_operation_id: str = ""
 
 
 @dataclass
@@ -172,6 +183,98 @@ class ResumeNestedRequest:
 
     operation_id: str
     caller_principal: str
+
+
+# --------------------------------------------------------------------------
+# Release Safety boundary (CASE-2b).
+#
+# Canary analysis is a different team's system, in a different Temporal
+# namespace, deployed on its own cadence. These three dataclasses are the wire
+# contract between the two, and release_safety/models.py deliberately declares
+# its own identical copies rather than importing these. Two independently owned
+# services do not share an internal Python package: they agree on a payload
+# shape and each keeps its own definition of it. The duplication is the point,
+# and it is exactly what makes the boundary real rather than decorative.
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class StartCanaryAnalysisInput:
+    """Ask the Release Safety team's platform to open a canary window.
+
+    Sent from the chain workflow's namespace into release-safety's. Carries the
+    chain workflow_id so that when canary calls back, the nested tool call lands
+    on the same user-visible task, per the requirements document's correlation
+    model (explicit propagation).
+    """
+
+    gateway_workflow_id: str
+    gateway_namespace: str
+    origin_operation_id: str
+    service: str
+    version: str
+    environment: str
+    idempotency_key: str
+    requester: str
+    scripted_outcome: str = "pass"
+    # The window shape Release Safety advertises for itself. The gateway relays
+    # it back rather than choosing it: how long a canary window runs is the
+    # canary team's call, and the pipeline only repeats what they published.
+    tick_seconds: int = 5
+    window_ticks: int = 4
+
+
+@dataclass
+class CanaryAnalysisStarted:
+    """What the Release Safety platform hands back when a window opens."""
+
+    canary_workflow_id: str
+    canary_run_id: str
+    namespace: str
+    task_queue: str
+
+
+@dataclass
+class GatewayOperationResolution:
+    """Terminal operation result delivered back to a durable external Tool1.
+
+    Mirrored by release_safety.models.GatewayOperationResolution. Field names are
+    the contract; the JSON payload converter matches on them.
+    """
+
+    operation_id: str
+    status: str
+    result: Optional[Any] = None
+    reason: Optional[str] = None
+
+
+@dataclass
+class SignalReleaseSafetyInput:
+    """Input for the gateway-side Activity that delivers the resolution Signal."""
+
+    callback_workflow_id: str
+    callback_namespace: str
+    operation_id: str
+    status: str
+    result: Optional[Any] = None
+    reason: Optional[str] = None
+
+
+@dataclass
+class CanaryVerdict:
+    """Canary's own verdict, signaled to the chain workflow.
+
+    Only the failing verdict needs this: a passing canary reports itself by
+    making the nested promote_release call. A failing one never calls, so
+    without this the release pipeline operation that handed off to canary would
+    wait forever for a promotion that is never going to be requested.
+    """
+
+    origin_operation_id: str
+    canary_workflow_id: str
+    verdict: str
+    reason: Optional[str] = None
+    detail: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -232,6 +335,12 @@ class Operation:
     controlled_tool: bool = True
     replay_safe: bool = False
     checkpoint: dict[str, Any] = field(default_factory=dict)
+    # Durable Tool1 running in another system, to be signaled when this operation
+    # reaches a terminal state. See NestedToolCallRequest.callback_workflow_id.
+    callback_workflow_id: str = ""
+    callback_namespace: str = ""
+    callback_notified: bool = False
+    origin_operation_id: str = ""
 
 
 @dataclass

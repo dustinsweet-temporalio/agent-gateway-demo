@@ -1,0 +1,622 @@
+"""CASE-2b: canary analysis as a genuinely separate, durable Tool1.
+
+Everything here runs against two Temporal namespaces and two Worker processes,
+because that is the claim under test. A single-namespace version of this suite
+would pass while proving nothing: the point is not that a canary workflow exists,
+it is that it exists somewhere Agent Gateway does not own, suspends its own
+execution across an approval it does not control, and is woken by a Signal that
+crosses the boundary.
+
+What each test pins down:
+
+  the handoff       the pipeline parks itself and starts a workflow in the other
+                    namespace, rather than opening the production promotion
+  the nested call   canary calls back into the SAME chain workflow_id, so one
+                    user-visible task spans two systems
+  the suspension    canary stops at waiting_for_approval and its state survives
+                    a worker being torn down and replaced underneath it
+  the wake          approval in the gateway signals canary back across the
+                    namespace boundary, and both sides end up consistent
+  fail closed       a canary that fails never calls the gateway at all, so the
+                    promotion is never put in front of a human
+  before 2b         with no canary provider registered, the pipeline behaves
+                    exactly as CASE-2a did
+"""
+
+from __future__ import annotations
+
+import asyncio
+import concurrent.futures
+import copy
+import shutil
+import time
+import uuid
+
+from temporalio import activity
+from temporalio.client import Client, WorkflowHandle
+from temporalio.testing import WorkflowEnvironment
+from temporalio.worker import Worker
+
+import activities.gateway_activities as gateway_activities
+import release_safety.canary_activities as canary_activities
+from activities.gateway_activities import (
+    signal_release_safety_workflow,
+    start_canary_analysis,
+)
+from common.models import (
+    ApprovalDecision,
+    ChainInput,
+    CorrelationContext,
+    EvaluatePolicyInput,
+    InvokeToolInput,
+    NestedToolCallRequest,
+    PolicyDecision,
+)
+from mock_tool import server as backend
+from release_safety.canary_activities import (
+    call_agent_gateway_promote,
+    report_canary_verdict,
+    run_canary_tick,
+)
+from release_safety.canary_workflow import CanaryAnalysisWorkflow
+from release_safety.models import CanaryResult, PublishCanaryStateInput
+from workflows.chain import AgenticChainWorkflow
+
+GATEWAY_TASK_QUEUE = "test-agent-gateway-2b"
+CANARY_TASK_QUEUE = "test-release-safety-tq"
+CANARY_NAMESPACE = "release-safety"
+SERVICE = "delivery-matching-service"
+PRINCIPAL = "requester@example.com"
+
+# A one-second, two-tick window. The real one is four ticks five seconds apart,
+# which is right for a live demo and wrong for a test suite. The shape is
+# advertised by the provider registration, so shortening it here goes through the
+# same path the real worker uses rather than through a test-only branch.
+TEST_TICK_SECONDS = 1
+TEST_WINDOW_TICKS = 2
+
+INVOKE_CALLS: list[tuple[str, dict, str]] = []
+PUBLISHED: list[PublishCanaryStateInput] = []
+
+_PRISTINE_DEPLOYED = copy.deepcopy(backend._deployed)
+_PRISTINE_RELEASES = copy.deepcopy(backend._releases)
+
+
+def _reset_backend(*, canary_available: bool, fail_versions: set[str] | None = None):
+    INVOKE_CALLS.clear()
+    PUBLISHED.clear()
+    backend._deployed.clear()
+    backend._deployed.update(copy.deepcopy(_PRISTINE_DEPLOYED))
+    backend._releases.clear()
+    backend._releases.update(copy.deepcopy(_PRISTINE_RELEASES))
+    backend._seen.clear()
+    backend._quality_gates = None
+    backend._canary = None
+    backend.CANARY_FAIL_VERSIONS = set(fail_versions or set())
+    # Registering a provider is what "the Release Safety team has shipped canary"
+    # means. Not registering one is CASE-2a, and the pipeline cannot tell the
+    # difference between a team that has not built it yet and a team whose worker
+    # is currently down, which is correct: in both cases nobody is offering it.
+    backend._canary_provider = (
+        {
+            "provider": "release-safety",
+            "namespace": CANARY_NAMESPACE,
+            "task_queue": CANARY_TASK_QUEUE,
+            "workflow_type": "CanaryAnalysisWorkflow",
+            "tick_seconds": TEST_TICK_SECONDS,
+            "window_ticks": TEST_WINDOW_TICKS,
+            "ttl_seconds": 300.0,
+            "last_seen": time.time(),
+        }
+        if canary_available
+        else None
+    )
+
+
+def _tool_names() -> list[str]:
+    return [name for name, _, _ in INVOKE_CALLS]
+
+
+@activity.defn(name="evaluate_policy")
+async def fake_evaluate_policy(input: EvaluatePolicyInput) -> PolicyDecision:
+    requires_approval = (
+        input.tool_name == "promote_release"
+        and str(input.arguments.get("environment", "")).lower() == "prod"
+    )
+    return PolicyDecision(
+        requires_approval=requires_approval,
+        reason="Promotion to prod requires human approval."
+        if requires_approval
+        else None,
+    )
+
+
+@activity.defn(name="invoke_tool")
+async def backend_invoke_tool(input: InvokeToolInput) -> dict:
+    INVOKE_CALLS.append((input.tool_name, dict(input.arguments), input.idempotency_key))
+    key = input.idempotency_key
+    if key and key in backend._seen:
+        prior = dict(backend._seen[key])
+        prior["idempotent_replay"] = True
+        return prior
+    result = backend._handle(input.tool_name, dict(input.arguments))
+    result["idempotent_replay"] = False
+    if key:
+        backend._seen[key] = result
+    return result
+
+
+@activity.defn(name="publish_canary_state")
+async def fake_publish_canary_state(input: PublishCanaryStateInput) -> dict:
+    """Stands in for the HTTP post to the observability backend.
+
+    Recorded rather than dropped, because the dashboard card's phases come from
+    here and a phase the workflow never publishes is a card that never updates.
+    """
+    PUBLISHED.append(input)
+    backend._handle(
+        "record_canary_state",
+        {
+            "canary_workflow_id": input.canary_workflow_id,
+            "service": input.service,
+            "version": input.version,
+            "environment": input.environment,
+            "phase": input.phase,
+            "ticks_completed": input.ticks_completed,
+            "window_ticks": input.window_ticks,
+            "threshold": input.threshold,
+            "tick_results": input.tick_results,
+            "verdict": input.verdict,
+            "gateway_operation_id": input.gateway_operation_id,
+            "error": input.error,
+        },
+    )
+    return {"recorded": True}
+
+
+async def _environment() -> WorkflowEnvironment:
+    """A dev server with both namespaces, and the module constants pointed at it.
+
+    The two cross-namespace Activities resolve their addresses from module-level
+    constants read at import time, which is right for a container and wrong for a
+    test against an ephemeral server, so they are repointed here.
+    """
+    temporal = shutil.which("temporal")
+    assert temporal, "Temporal CLI is required for workflow tests"
+    env = await WorkflowEnvironment.start_local(
+        dev_server_existing_path=temporal,
+        dev_server_log_level="error",
+        dev_server_extra_args=["--namespace", CANARY_NAMESPACE],
+    )
+    address = env.client.service_client.config.target_host
+    gateway_activities.TEMPORAL_ADDRESS = address
+    gateway_activities.RELEASE_SAFETY_NAMESPACE = CANARY_NAMESPACE
+    gateway_activities.RELEASE_SAFETY_TASK_QUEUE = CANARY_TASK_QUEUE
+    canary_activities.TEMPORAL_ADDRESS = address
+    canary_activities.GATEWAY_NAMESPACE = env.client.namespace
+    return env
+
+
+def _gateway_worker(env: WorkflowEnvironment) -> Worker:
+    return Worker(
+        env.client,
+        task_queue=GATEWAY_TASK_QUEUE,
+        workflows=[AgenticChainWorkflow],
+        activities=[
+            fake_evaluate_policy,
+            backend_invoke_tool,
+            start_canary_analysis,
+            signal_release_safety_workflow,
+        ],
+    )
+
+
+def _canary_worker(client: Client) -> Worker:
+    """Release Safety's worker. Different client, namespace, and task queue."""
+    return Worker(
+        client,
+        task_queue=CANARY_TASK_QUEUE,
+        workflows=[CanaryAnalysisWorkflow],
+        activities=[
+            run_canary_tick,
+            call_agent_gateway_promote,
+            report_canary_verdict,
+            fake_publish_canary_state,
+        ],
+        # run_canary_tick is synchronous, exactly as it is in the real worker.
+        activity_executor=concurrent.futures.ThreadPoolExecutor(max_workers=8),
+    )
+
+
+async def _canary_client(env: WorkflowEnvironment) -> Client:
+    return await Client.connect(
+        env.client.service_client.config.target_host, namespace=CANARY_NAMESPACE
+    )
+
+
+async def _start_chain(env: WorkflowEnvironment, name: str) -> WorkflowHandle:
+    workflow_id = f"wf-{name}-{uuid.uuid4().hex[:8]}"
+    return await env.client.start_workflow(
+        AgenticChainWorkflow.run,
+        ChainInput(workflow_id=workflow_id, owner_principal=PRINCIPAL),
+        id=workflow_id,
+        task_queue=GATEWAY_TASK_QUEUE,
+    )
+
+
+def _pipeline_request(workflow_id: str, key: str) -> NestedToolCallRequest:
+    tool1_arguments = {"service": SERVICE, "bump": "minor", "environment": "prod"}
+    tool2_arguments = {"service": SERVICE, "environment": "prod"}
+    return NestedToolCallRequest(
+        tool1_name="release_orchestrator",
+        tool1_arguments=tool1_arguments,
+        tool2_name="promote_release",
+        tool2_arguments=tool2_arguments,
+        safe_tool1_arguments=dict(tool1_arguments),
+        safe_tool2_arguments=dict(tool2_arguments),
+        idempotency_key=key,
+        correlation=CorrelationContext(
+            workflow_id=workflow_id,
+            workflow_id_source="explicit_authorized",
+            caller_principal=PRINCIPAL,
+            runtime="ClaudeCode",
+            call_path=["ClaudeCode", "release_orchestrator"],
+        ),
+        requested_action=f"Promote the next minor version of {SERVICE} to prod",
+        parent_operation_id=f"{key}-parent",
+        nested_operation_id=f"{key}-child",
+        bump="minor",
+        controlled_tool1=True,
+    )
+
+
+async def _operation_view(handle: WorkflowHandle, operation_id: str):
+    summary = await handle.query(AgenticChainWorkflow.get_workflow_status)
+    for op in summary.operations:
+        if op.operation_id == operation_id:
+            return op
+    raise AssertionError(f"{operation_id} not found in workflow status")
+
+
+async def _await_condition(check, timeout: float = 20.0):
+    async def poll():
+        while True:
+            value = await check()
+            if value:
+                return value
+            await asyncio.sleep(0.05)
+
+    return await asyncio.wait_for(poll(), timeout=timeout)
+
+
+async def _waiting_promotion(handle: WorkflowHandle):
+    """The production promotion canary asked for, once it reaches the queue."""
+
+    async def check():
+        summary = await handle.query(AgenticChainWorkflow.get_workflow_status)
+        for op in summary.operations:
+            if (
+                op.tool_name == "promote_release"
+                and op.status == "waiting_for_approval"
+            ):
+                return op
+        return None
+
+    return await _await_condition(check)
+
+
+async def _ledger_events(handle: WorkflowHandle) -> list[str]:
+    ledger = await handle.query(AgenticChainWorkflow.get_ledger)
+    return [entry.event for entry in ledger]
+
+
+# --------------------------------------------------------------------- tests
+
+
+def test_canary_passes_suspends_and_resumes_across_two_namespaces() -> None:
+    async def run() -> None:
+        _reset_backend(canary_available=True)
+        async with await _environment() as env:
+            canary_client = await _canary_client(env)
+            async with _gateway_worker(env):
+                # Release Safety's worker runs the window and then goes away
+                # entirely, mid-pause. A replacement comes up afterwards. Two
+                # separate `async with` blocks, not one nested inside the other,
+                # because a worker that is still running has not been killed.
+                async with _canary_worker(canary_client):
+                    handle, promotion, status = await _window_runs_and_suspends(
+                        env, canary_client
+                    )
+                await _resumes_on_a_fresh_worker(
+                    handle, canary_client, promotion, status
+                )
+
+    asyncio.run(run())
+
+
+async def _window_runs_and_suspends(
+    env: WorkflowEnvironment, canary_client: Client
+):
+    handle = await _start_chain(env, "canary-pass")
+    response = await handle.execute_update(
+        AgenticChainWorkflow.request_nested_tool_call,
+        _pipeline_request(handle.id, "canary-pass"),
+    )
+
+    # The pipeline ran its own work and then stopped, because the next
+    # checkpoint is not its own work. Nothing has been put in front of an
+    # approver yet: at this point production is not even being asked about.
+    assert response.status == "processing"
+    assert _tool_names() == [
+        "get_deployed_version",
+        "cut_release",
+        "promote_release",
+        "run_quality_gates",
+        "get_release_safety_status",
+    ]
+    parent = await _operation_view(handle, "canary-pass-parent")
+    assert parent.status == "waiting_for_dependency"
+    assert parent.checkpoint["stage"] == "awaiting_canary"
+    assert parent.checkpoint["canary_provider"] == "release-safety"
+    assert parent.checkpoint["canary_namespace"] == CANARY_NAMESPACE
+    canary_workflow_id = parent.checkpoint["canary_workflow_id"]
+
+    # The workflow it started is in the OTHER namespace, under a workflow id that
+    # does not look like anything Agent Gateway owns.
+    assert canary_workflow_id.startswith("release-safety::canary::")
+    canary = canary_client.get_workflow_handle(canary_workflow_id)
+    describe = await canary.describe()
+    assert describe.workflow_type == "CanaryAnalysisWorkflow"
+    assert describe.task_queue == CANARY_TASK_QUEUE
+
+    # Canary watches its window on its own, then makes the nested call. The
+    # promotion that lands in the approval queue was requested by canary, not by
+    # the pipeline, and it landed on the SAME chain the operator started.
+    promotion = await _waiting_promotion(handle)
+    assert promotion.arguments == {
+        "service": SERVICE,
+        "version": "2.3.0",
+        "environment": "prod",
+    }
+    assert promotion.call_path == [
+        "release-safety",
+        "release_safety_canary",
+        "promote_release",
+    ]
+    assert "Canary passed" in (promotion.justification or "")
+
+    # Canary is now genuinely suspended: its own workflow, in its own namespace,
+    # holding its own checkpoint, waiting on a decision nobody has made yet.
+    status = await _await_condition(
+        lambda: canary.query(CanaryAnalysisWorkflow.get_status)
+    )
+    assert status.phase == "awaiting_prod_approval"
+    assert status.verdict == "pass"
+    assert status.ticks_completed == TEST_WINDOW_TICKS
+    assert status.gateway_workflow_id == handle.id
+    assert status.gateway_operation_id == promotion.operation_id
+    assert backend._deployed["prod"]["version"] == "2.2.0"
+    return handle, promotion, status
+
+
+async def _resumes_on_a_fresh_worker(
+    handle: WorkflowHandle, canary_client: Client, promotion, status
+) -> None:
+    """The canary worker is gone. Bring up a new one and check what survived.
+
+    This is the property the whole case exists for: the window's results, the
+    verdict, and the operation id all come back out of Event History, no tick is
+    re-run, and the wait picks up where it was. If the pause lived inside Agent
+    Gateway's workflow instead of this one, there would be nothing here to
+    survive -- the gateway would simply be resuming its own work.
+    """
+    canary = canary_client.get_workflow_handle(
+        status.canary_workflow_id, result_type=CanaryResult
+    )
+    ticks_before = len([c for c in PUBLISHED if c.phase == "running_canary"])
+
+    async with _canary_worker(canary_client):
+        replayed = await canary.query(CanaryAnalysisWorkflow.get_status)
+        assert replayed.phase == "awaiting_prod_approval"
+        assert replayed.ticks_completed == TEST_WINDOW_TICKS
+        assert replayed.tick_results == status.tick_results
+        assert (
+            len([c for c in PUBLISHED if c.phase == "running_canary"])
+            == ticks_before
+        ), "replay must not re-run canary ticks"
+
+        # Approve on the gateway side, through the mechanism that has not changed
+        # since CASE-1.
+        await handle.signal(
+            AgenticChainWorkflow.approve_operation,
+            ApprovalDecision(
+                operation_id=promotion.operation_id, approver="approver@example.com"
+            ),
+        )
+
+        # The gateway promotes, then signals across the namespace boundary, and
+        # canary wakes and finishes. Its result carries the promotion it was
+        # waiting for, which it never saw happen and never performed itself.
+        result = await asyncio.wait_for(canary.result(), timeout=30)
+        assert result.phase == "completed"
+        assert result.verdict == "pass"
+        assert result.promotion_result["promoted"] is True
+        assert result.promotion_result["environment"] == "prod"
+        assert backend._deployed["prod"]["version"] == "2.3.0"
+
+    # And the pipeline operation that parked itself is settled, so the chain the
+    # operator is watching ends up complete rather than waiting forever on a
+    # handoff that already resolved.
+    settled = await _await_condition(lambda: _settled(handle, "canary-pass-parent"))
+    assert settled.status == "completed"
+    assert settled.checkpoint["stage"] == "canary_completed"
+
+    events = await _ledger_events(handle)
+    for expected in (
+        "canary_capability_discovered",
+        "canary_handoff",
+        "controlled_caller_notified",
+        "canary_pipeline_settled",
+    ):
+        assert expected in events, f"{expected} missing from {events}"
+
+
+def test_rejecting_the_promotion_wakes_canary_with_the_bad_news() -> None:
+    """The pause resolves the other way, and both systems agree about it.
+
+    Worth its own test because it takes a different branch on both sides: the
+    gateway settles the parked pipeline operation from the rejection rather than
+    from a result, and canary wakes into its rejected phase instead of recording
+    a promotion. A suspended workflow that only ever gets woken by approvals is a
+    workflow that hangs the first time somebody says no.
+    """
+
+    async def run() -> None:
+        _reset_backend(canary_available=True)
+        async with await _environment() as env:
+            canary_client = await _canary_client(env)
+            async with _gateway_worker(env), _canary_worker(canary_client):
+                handle = await _start_chain(env, "canary-reject")
+                await handle.execute_update(
+                    AgenticChainWorkflow.request_nested_tool_call,
+                    _pipeline_request(handle.id, "canary-reject"),
+                )
+                promotion = await _waiting_promotion(handle)
+
+                await handle.signal(
+                    AgenticChainWorkflow.reject_operation,
+                    ApprovalDecision(
+                        operation_id=promotion.operation_id,
+                        approver="approver@example.com",
+                        reason="holiday change freeze",
+                    ),
+                )
+
+                parent = await _operation_view(handle, "canary-reject-parent")
+                canary = canary_client.get_workflow_handle(
+                    parent.checkpoint["canary_workflow_id"],
+                    result_type=CanaryResult,
+                )
+                result = await asyncio.wait_for(canary.result(), timeout=30)
+                assert result.phase == "rejected"
+                # Canary's window was green. The release still does not ship,
+                # and canary knows why rather than timing out on a promotion
+                # that silently never happened.
+                assert result.verdict == "pass"
+                assert result.error == "holiday change freeze"
+                assert result.promotion_result is None
+                assert backend._deployed["prod"]["version"] == "2.2.0"
+
+                settled = await _await_condition(
+                    lambda: _settled(handle, "canary-reject-parent")
+                )
+                assert settled.status == "rejected"
+                assert "controlled_caller_notified" in await _ledger_events(handle)
+
+    asyncio.run(run())
+
+
+async def _settled(handle: WorkflowHandle, operation_id: str):
+    op = await _operation_view(handle, operation_id)
+    return op if op.status != "waiting_for_dependency" else None
+
+
+def test_failing_canary_never_reaches_the_approver() -> None:
+    """A red window stops the release without asking anyone.
+
+    Same fail-closed shape the quality gate already has, one checkpoint later:
+    the gateway is never called, so there is no operation to approve, and the
+    parked pipeline operation is failed by the verdict rather than left hanging.
+    """
+
+    async def run() -> None:
+        _reset_backend(canary_available=True, fail_versions={"2.3.0"})
+        async with await _environment() as env:
+            canary_client = await _canary_client(env)
+            async with _gateway_worker(env), _canary_worker(canary_client):
+                handle = await _start_chain(env, "canary-fail")
+                response = await handle.execute_update(
+                    AgenticChainWorkflow.request_nested_tool_call,
+                    _pipeline_request(handle.id, "canary-fail"),
+                )
+                assert response.status == "processing"
+
+                parent = await _await_condition(
+                    lambda: _failed_parent(handle, "canary-fail-parent")
+                )
+                assert parent.status == "failed"
+                assert "Canary analysis did not pass" in (
+                    parent.decision_reason or ""
+                )
+                assert parent.checkpoint["stage"] == "canary_failed"
+
+                # Nothing was ever asked of a human, and production is untouched.
+                summary = await handle.query(
+                    AgenticChainWorkflow.get_workflow_status
+                )
+                assert not [
+                    op
+                    for op in summary.operations
+                    if op.status == "waiting_for_approval"
+                ]
+                assert not [
+                    op
+                    for op in summary.operations
+                    if op.tool_name == "promote_release"
+                    and op.arguments.get("environment") == "prod"
+                ]
+                assert backend._deployed["prod"]["version"] == "2.2.0"
+                assert "canary_failed" in await _ledger_events(handle)
+
+                canary = canary_client.get_workflow_handle(
+                    parent.checkpoint["canary_workflow_id"],
+                    result_type=CanaryResult,
+                )
+                result = await asyncio.wait_for(canary.result(), timeout=30)
+                assert result.phase == "canary_failed"
+                assert result.verdict == "fail"
+                assert result.gateway_operation_id is None
+
+    asyncio.run(run())
+
+
+async def _failed_parent(handle: WorkflowHandle, operation_id: str):
+    parent = await _operation_view(handle, operation_id)
+    return parent if parent.status == "failed" else None
+
+
+def test_without_a_registered_provider_the_pipeline_is_unchanged() -> None:
+    """CASE-2a, verified as still being CASE-2a.
+
+    Before Release Safety ships canary -- and any time their worker is not
+    running -- the pipeline looks for a provider, finds none, and opens the
+    production promotion itself. This is what keeps the two roadmap beats
+    separable in a live demo: the capability appears because someone started it,
+    not because a flag was flipped.
+    """
+
+    async def run() -> None:
+        _reset_backend(canary_available=False)
+        async with await _environment() as env:
+            async with _gateway_worker(env):
+                handle = await _start_chain(env, "no-canary")
+                response = await handle.execute_update(
+                    AgenticChainWorkflow.request_nested_tool_call,
+                    _pipeline_request(handle.id, "no-canary"),
+                )
+
+                assert response.status == "waiting_for_approval"
+                assert response.call_path == [
+                    "ClaudeCode",
+                    "release_orchestrator",
+                    "promote_release",
+                ]
+                parent = await _operation_view(handle, "no-canary-parent")
+                assert parent.status == "waiting_for_dependency"
+                assert parent.checkpoint["stage"] == "waiting_for_tool2"
+                assert "canary_workflow_id" not in parent.checkpoint
+                assert backend._canary is None
+                events = await _ledger_events(handle)
+                assert "canary_handoff" not in events
+
+    asyncio.run(run())

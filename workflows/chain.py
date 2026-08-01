@@ -10,6 +10,7 @@ from temporalio.exceptions import ActivityError
 with workflow.unsafe.imports_passed_through():
     from common.models import (
         ApprovalDecision,
+        CanaryVerdict,
         CancelOperation,
         ChainInput,
         ChainState,
@@ -22,15 +23,26 @@ with workflow.unsafe.imports_passed_through():
         OperationView,
         NestedToolCallRequest,
         ResumeNestedRequest,
+        SignalReleaseSafetyInput,
+        StartCanaryAnalysisInput,
         ToolCallRequest,
         ToolCallResponse,
     )
     from common.semver import InvalidVersionError, next_version, normalize_bump
-    from activities.gateway_activities import evaluate_policy, invoke_tool
+    from activities.gateway_activities import (
+        evaluate_policy,
+        invoke_tool,
+        signal_release_safety_workflow,
+        start_canary_analysis,
+    )
 
 
 POLICY_TIMEOUT = timedelta(seconds=10)
 INVOKE_TIMEOUT = timedelta(seconds=60)
+# Reaching another team's namespace: starting their workflow, and delivering a
+# decision back to it. Both are short calls, and both are worth retrying hard,
+# because the second one is what wakes a system that is deliberately asleep.
+RELEASE_SAFETY_TIMEOUT = timedelta(seconds=30)
 
 # Idle timeout for an agentic chain. A chain that has no pending work and receives
 # no new tool call or decision for this long completes on its own. This is a fixed
@@ -71,6 +83,14 @@ LEDGER_RETENTION = 500
 # this Workflow must agree on the shape it took.
 PIPELINE_STAGING_ENVIRONMENT = "staging"
 PIPELINE_PRODUCTION_ENVIRONMENT = "prod"
+
+# The capability lookup the pipeline does after its gates pass. Canary analysis
+# belongs to the Release Safety team, so the pipeline does not have it
+# configured; it asks the shared platform whether that team is currently
+# offering it, and routes through it when they are. Before Release Safety ships
+# canary -- and any time their worker is not running -- the answer is no and the
+# pipeline opens the production promotion itself, exactly as it always did.
+CANARY_CAPABILITY_TOOL = "get_release_safety_status"
 
 
 class QualityGateFailure(Exception):
@@ -148,6 +168,7 @@ class AgenticChainWorkflow:
             self._reschedule = False
             self._expire_overdue()
             await self._process_approved()
+            await self._settle_handoffs()
 
             if not self._closing and workflow.info().is_continue_as_new_suggested():
                 await self._do_continue_as_new()  # does not return
@@ -290,7 +311,10 @@ class AgenticChainWorkflow:
             try:
                 if req.bump:
                     prepare, resolved_version = await self._orchestrate_tool1(
-                        parent, req.bump, req.idempotency_key
+                        parent,
+                        req.bump,
+                        req.idempotency_key,
+                        allow_canary=req.controlled_tool1,
                     )
                     resolved_tool2_arguments = {
                         **req.tool2_arguments,
@@ -367,6 +391,12 @@ class AgenticChainWorkflow:
                     "version": resolved_version,
                 }
             self._log("tool1_checkpointed", parent, {"stage": "waiting_for_tool2"})
+
+            handoff = prepare.get("canary_handoff") if req.bump else None
+            if handoff:
+                return await self._hand_off_to_canary(
+                    parent, req, handoff, resolved_version
+                )
 
             child = self._new_nested_child(
                 req,
@@ -659,6 +689,56 @@ class AgenticChainWorkflow:
         self._propagate_child_terminal(op)
 
     @workflow.signal
+    def canary_verdict_reported(self, verdict: CanaryVerdict) -> None:
+        """Release Safety reporting that no promotion request is coming.
+
+        Only the failing verdict arrives this way. A canary that passes reports
+        itself by making the nested promote_release call, which is a request the
+        gateway governs like any other. A canary that fails has nothing to
+        request, and without this the pipeline operation that handed off would
+        wait indefinitely on a call that will never be made.
+
+        A failed canary means production was never touched, which is the same
+        fail-closed shape as a failed quality gate, one checkpoint later.
+        """
+        op = self._state.operations.get(verdict.origin_operation_id)
+        if op is None or op.status != OperationStatus.WAITING_FOR_DEPENDENCY:
+            return
+        self._touch()
+        if verdict.verdict == "pass":
+            # Nothing to do: the promotion request is the report. Recorded so the
+            # ledger shows the verdict arriving even on the path that does not
+            # need it.
+            self._log(
+                "canary_passed",
+                op,
+                {"canary_workflow_id": verdict.canary_workflow_id},
+            )
+            return
+        op.status = OperationStatus.FAILED
+        op.error = (
+            f"Canary analysis did not pass: {verdict.reason}"
+            if verdict.reason
+            else "Canary analysis did not pass."
+        )
+        op.checkpoint = {
+            **op.checkpoint,
+            "stage": "canary_failed",
+            "canary_verdict": verdict.verdict,
+            "canary_detail": verdict.detail,
+        }
+        op.decided_iso = workflow.now().isoformat()
+        self._log(
+            "canary_failed",
+            op,
+            {
+                "canary_workflow_id": verdict.canary_workflow_id,
+                "verdict": verdict.verdict,
+                "reason": verdict.reason,
+            },
+        )
+
+    @workflow.signal
     def close_chain(self) -> None:
         # Lets the chain complete gracefully once no work is pending, so it can be
         # queried afterward as a completed (not terminated) workflow.
@@ -709,6 +789,11 @@ class AgenticChainWorkflow:
                 and op.deadline_epoch is not None
                 and now >= op.deadline_epoch
             ):
+                return True
+            # A rejection or a cancellation lands in a Signal handler, which only
+            # mutates state. Waking here is what turns that into a delivered
+            # callback and a settled pipeline operation.
+            if self._needs_callback(op) or self._settles_origin(op) is not None:
                 return True
         return False
 
@@ -771,6 +856,124 @@ class AgenticChainWorkflow:
                     await self._resume_tool1(parent, op)
             self._touch()
 
+    def _needs_callback(self, op: Operation) -> bool:
+        return (
+            bool(op.callback_workflow_id)
+            and not op.callback_notified
+            and op.status in TERMINAL
+        )
+
+    def _settles_origin(self, op: Operation) -> Operation | None:
+        """The parked operation this one has just settled, if any.
+
+        Returns the pipeline operation waiting on op, but only once op itself is
+        terminal and only while the pipeline operation is still parked, so a
+        second sweep over the same pair finds nothing to do.
+        """
+        if not op.origin_operation_id or op.status not in TERMINAL:
+            return None
+        origin = self._state.operations.get(op.origin_operation_id)
+        if origin is None or origin.status != OperationStatus.WAITING_FOR_DEPENDENCY:
+            return None
+        return origin
+
+    async def _settle_handoffs(self) -> None:
+        """Close the loop with anything that handed work to, or through, canary.
+
+        Two separate obligations, both driven from the main loop rather than from
+        the Signal handlers that create them, because handlers here only mutate
+        state and never drive Activities:
+
+        1. Deliver terminal results back to a durable external Tool1 that is
+           suspended waiting for one. This is the other half of the pause: canary
+           genuinely stopped executing, and this is what starts it again.
+        2. Settle the release pipeline operation that handed off to canary, once
+           the promotion canary requested has actually resolved.
+
+        Both are idempotent, and both are driven off durable operation state
+        rather than an in-memory queue, so a Worker restart mid-notification
+        picks the work back up instead of dropping it.
+        """
+        for op_id in list(self._state.operations):
+            # Re-fetched rather than iterated directly: this awaits Activities,
+            # so handlers can run between passes and the map can change.
+            op = self._state.operations.get(op_id)
+            if op is None:
+                continue
+            if self._needs_callback(op):
+                # Marked before the call, not after. The Activity retries hard on
+                # its own, and a duplicate Signal is harmless (canary ignores a
+                # resolution it has already taken), but a loop that re-queued the
+                # same notification on every pass would not be.
+                op.callback_notified = True
+                try:
+                    await workflow.execute_activity(
+                        signal_release_safety_workflow,
+                        SignalReleaseSafetyInput(
+                            callback_workflow_id=op.callback_workflow_id,
+                            callback_namespace=op.callback_namespace,
+                            operation_id=op.operation_id,
+                            status=op.status.value,
+                            result=op.result,
+                            reason=op.error,
+                        ),
+                        start_to_close_timeout=RELEASE_SAFETY_TIMEOUT,
+                        retry_policy=RetryPolicy(maximum_attempts=5),
+                    )
+                    self._log(
+                        "controlled_caller_notified",
+                        op,
+                        {
+                            "callback_workflow_id": op.callback_workflow_id,
+                            "status": op.status.value,
+                        },
+                    )
+                except ActivityError as err:
+                    # The decision is recorded and production already reflects
+                    # it. What failed is telling the other system, so say so
+                    # loudly in the ledger rather than pretending it landed.
+                    self._log(
+                        "controlled_caller_unreachable",
+                        op,
+                        {
+                            "callback_workflow_id": op.callback_workflow_id,
+                            "error": str(err),
+                        },
+                    )
+
+            origin = self._settles_origin(op)
+            if origin is not None:
+                self._settle_origin(origin, op)
+
+    def _settle_origin(self, origin: Operation, op: Operation) -> None:
+        """Finish the pipeline operation that handed off to canary."""
+        origin.checkpoint = {
+            **origin.checkpoint,
+            "stage": "canary_completed",
+            "canary_operation_id": op.operation_id,
+        }
+        if op.status == OperationStatus.COMPLETED:
+            origin.status = OperationStatus.COMPLETED
+            origin.result = {
+                "pipeline_result": origin.checkpoint.get("tool1_prepare_result"),
+                "canary_result": op.result,
+                "resumed_from_checkpoint": True,
+            }
+        else:
+            origin.status = op.status
+            origin.error = op.error or (
+                f"Canary analysis ended {op.status.value} before the promotion."
+            )
+        origin.decided_iso = workflow.now().isoformat()
+        self._log(
+            "canary_pipeline_settled",
+            origin,
+            {
+                "canary_operation_id": op.operation_id,
+                "status": origin.status.value,
+            },
+        )
+
     async def _invoke(self, op: Operation) -> None:
         try:
             result = await self._execute_tool_activity(
@@ -809,6 +1012,7 @@ class AgenticChainWorkflow:
         idempotency_key: str,
         pass_label: str = "prepare",
         expect_version: str = "",
+        allow_canary: bool = False,
     ) -> tuple[dict, str]:
         """Run the release pipeline up to the target promotion, and report it.
 
@@ -825,10 +1029,18 @@ class AgenticChainWorkflow:
             cut that release
             promote it to staging                  (skipped for a staging target)
             run quality gates against staging      (skipped for a staging target)
-            -- caller creates the target promotion as the child operation --
+            look for a canary provider             (allow_canary only)
+            -- caller either hands off to canary, or creates the target
+               promotion as the child operation --
 
         A staging target gets the first leg only: the staging promotion is then
         the child, and there is nothing to qualify a candidate for.
+
+        allow_canary is set only on the first pass of a controlled, bump-driven
+        run. A replay is finishing an approval that was already granted against a
+        promotion that already exists, so there is nothing left to hand off; and
+        an uncontrolled caller cannot be parked waiting on another system's
+        verdict, since not being able to wait is what makes it uncontrolled.
 
         Every step is an ordinary Activity, so the work is in Event History and a
         Worker or gateway restart resumes rather than starting over. That matters
@@ -1010,6 +1222,30 @@ class AgenticChainWorkflow:
                 or f"quality gates failed for {resolved}"
             )
 
+        # The candidate is qualified. Before the pipeline opens the production
+        # promotion itself, it asks whether anyone is offering canary analysis
+        # for this service. This is a lookup, not a setting: Release Safety owns
+        # that capability, advertises it while their platform is running, and the
+        # pipeline routes through it when it is there. When it is not, the next
+        # line of this function is the production promotion, which is what the
+        # pipeline did for its whole life before canary existed.
+        handoff = None
+        if allow_canary:
+            handoff = await self._canary_capability(
+                parent, service, resolved, target, idempotency_key, pass_label
+            )
+        result["canary_handoff"] = handoff
+
+        if handoff:
+            result["message"] = (
+                f"Tool1 read {current} from production, computed {resolved} for "
+                f"a {kind} bump, cut it, promoted it to "
+                f"{PIPELINE_STAGING_ENVIRONMENT}, passed quality gates, and "
+                f"handed off to {handoff['provider']} for canary analysis "
+                f"before the protected {target} promotion"
+            )
+            return result, resolved
+
         result["message"] = (
             f"Tool1 read {current} from production, computed {resolved} for a "
             f"{kind} bump, cut it, promoted it to "
@@ -1017,6 +1253,146 @@ class AgenticChainWorkflow:
             f"at the protected {target} promotion"
         )
         return result, resolved
+
+    async def _canary_capability(
+        self,
+        parent: Operation,
+        service: str,
+        version: str,
+        target: str,
+        idempotency_key: str,
+        pass_label: str,
+    ) -> dict | None:
+        """Ask the shared platform whether canary analysis is on offer.
+
+        Keyed per pass, like the gate run and the production read, because it is
+        a read of something that moves: Release Safety can ship canary, or take
+        their platform down for a deploy, between one pipeline run and the next.
+
+        A failure to reach the registry is not a reason to stop the release. It
+        means the pipeline could not learn that canary exists, so it behaves the
+        way it behaves when canary does not exist, and the production promotion
+        still goes in front of a human either way. Nothing is skipped by
+        failing this lookup; a checkpoint is skipped, and the one that actually
+        protects production is still there.
+        """
+        try:
+            status = await self._execute_tool_activity(
+                tool_name=CANARY_CAPABILITY_TOOL,
+                arguments={
+                    "service": service,
+                    "version": version,
+                    "environment": target,
+                },
+                idempotency_key=f"{idempotency_key}:{pass_label}:canary-status",
+            )
+        except ActivityError as err:
+            self._log(
+                "canary_capability_unavailable",
+                parent,
+                {"error": str(err)},
+            )
+            return None
+        if not status.get("available"):
+            return None
+        handoff = {
+            "provider": str(status.get("provider", "release-safety")),
+            "namespace": str(status.get("namespace", "release-safety")),
+            "task_queue": str(status.get("task_queue", "release-safety-tq")),
+            "scripted_outcome": str(status.get("scripted_outcome", "pass")),
+            "tick_seconds": int(status.get("tick_seconds", 5)),
+            "window_ticks": int(status.get("window_ticks", 4)),
+        }
+        self._log(
+            "canary_capability_discovered",
+            parent,
+            {"version": version, **handoff},
+        )
+        return handoff
+
+    async def _hand_off_to_canary(
+        self,
+        parent: Operation,
+        req: NestedToolCallRequest,
+        handoff: dict,
+        version: str,
+    ) -> ToolCallResponse:
+        """Pass a qualified release to Release Safety, and park the pipeline.
+
+        This is where CASE-2b stops being the same shape as CASE-2a. Up to here
+        every step was Waypoint's own work, correctly modeled as ordinary
+        Activities inside this workflow, because one team genuinely owns cutting
+        and staging and gating a release. Canary analysis is not that. It is
+        another team's system, in another namespace, on another worker, and what
+        happens next is a real handoff to it rather than another Activity.
+
+        The pipeline operation is parked, not finished. It is waiting on a
+        verdict from a system it does not control, and the thing that eventually
+        completes it is a call arriving back from that system. Nothing else in
+        this workflow is blocked meanwhile: the chain keeps taking tool calls and
+        approvals for anything else the operator is doing.
+
+        A canary that cannot be started stops the release. The alternative is
+        promoting to production having skipped a checkpoint the pipeline just
+        confirmed was in force, which is exactly the thing the gate machinery
+        exists to refuse.
+        """
+        try:
+            started = await workflow.execute_activity(
+                start_canary_analysis,
+                StartCanaryAnalysisInput(
+                    gateway_workflow_id=self._state.workflow_id,
+                    gateway_namespace=workflow.info().namespace,
+                    origin_operation_id=parent.operation_id,
+                    service=str(parent.arguments.get("service", "")),
+                    version=version,
+                    environment=str(parent.arguments.get("environment", "")),
+                    idempotency_key=f"{req.idempotency_key}:canary",
+                    requester=parent.requester or "",
+                    scripted_outcome=handoff.get("scripted_outcome", "pass"),
+                    tick_seconds=handoff.get("tick_seconds", 5),
+                    window_ticks=handoff.get("window_ticks", 4),
+                ),
+                start_to_close_timeout=RELEASE_SAFETY_TIMEOUT,
+                retry_policy=RetryPolicy(maximum_attempts=3),
+            )
+        except ActivityError as err:
+            parent.status = OperationStatus.FAILED
+            parent.error = (
+                f"Could not open a canary window with "
+                f"{handoff['provider']}: {err}. The release stops here rather "
+                "than promoting to production without one."
+            )
+            parent.decided_iso = workflow.now().isoformat()
+            self._log("canary_handoff_failed", parent, {"error": str(err)})
+            return self._response_for(parent)
+
+        parent.status = OperationStatus.WAITING_FOR_DEPENDENCY
+        parent.checkpoint = {
+            **parent.checkpoint,
+            "stage": "awaiting_canary",
+            "canary_provider": handoff["provider"],
+            "canary_namespace": started.namespace,
+            "canary_task_queue": started.task_queue,
+            "canary_workflow_id": started.canary_workflow_id,
+        }
+        self._log(
+            "canary_handoff",
+            parent,
+            {
+                "version": version,
+                "provider": handoff["provider"],
+                "namespace": started.namespace,
+                "canary_workflow_id": started.canary_workflow_id,
+            },
+        )
+        response = self._response_for(parent)
+        response.message = (
+            f"Quality gates passed. {handoff['provider']} is running canary "
+            f"analysis for {version}; the production promotion will be "
+            "requested for approval once the canary window closes."
+        )
+        return response
 
     @staticmethod
     def _promotion_sentence(arguments: dict) -> str:
@@ -1184,6 +1560,10 @@ class AgenticChainWorkflow:
             workflow_id_source=req.correlation.workflow_id_source,
             controlled_tool=req.controlled_tool1,
             replay_safe=req.replay_safe,
+            # Carried on the parent only. The parent is what completes once the
+            # whole nested unit is done, so it is the right thing to key the
+            # waiting pipeline operation off.
+            origin_operation_id=req.origin_operation_id,
         )
 
     def _new_nested_child(
@@ -1236,6 +1616,10 @@ class AgenticChainWorkflow:
             workflow_id_source=req.correlation.workflow_id_source,
             controlled_tool=req.controlled_tool1,
             replay_safe=req.replay_safe,
+            # The child is the operation the external Tool1 was told to wait on,
+            # so its terminal status is what gets delivered back.
+            callback_workflow_id=req.callback_workflow_id,
+            callback_namespace=req.callback_namespace,
         )
 
     def _response_for(self, op: Operation) -> ToolCallResponse:
