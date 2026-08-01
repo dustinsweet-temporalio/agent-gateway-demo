@@ -80,9 +80,9 @@ target namespace and task queue; callers address it by name and learn neither.
   durable result. Uncontrolled Tool1 calls fail closed. An approved Tool2 is not
   executed until the caller explicitly retries, and replay is refused unless
   Tool1 advertised replay safety.
-- Porticour is the company; **Waypoint is one engineering team inside it**, the
+- QuickMeals is the company; **Waypoint is one engineering team inside it**, the
   one that owns the delivery-matching service and the release tooling in this
-  repo. The Security team is a peer. Every persona is `@porticour.io`, and which
+  repo. The Security team is a peer. Every persona is `@quickmeals.com`, and which
   team a persona belongs to is what decides who may approve what.
 - `cut_release` and `promote_release` are **Child Workflows**, in the same
   namespace and on the same task queue as the chain that starts them, and this is
@@ -107,7 +107,7 @@ target namespace and task queue; callers address it by name and learn neither.
   evidence on the dashboard before deciding. CASE-2a's pipeline does wait, on the
   specific `(service, version)`-keyed gate workflow its own staging promotion
   started, so a different candidate's verdict can never be read as its own.
-- **Some operations may only be approved by one Porticour team.** The operation
+- **Some operations may only be approved by one QuickMeals team.** The operation
   carries `required_approver_team`, set at creation, and the gateway refuses a
   decision from anyone else with a 403 before the Signal is ever sent — the
   workflow enforces the same rule again on the durable side, so a Signal sent
@@ -867,13 +867,13 @@ Set via environment in `docker-compose.yml`.
 - `GATEWAY_MCP_ALLOWED_ORIGINS` comma-separated browser origins accepted by MCP
   DNS-rebinding protection. Defaults include local browser origins.
 - `GATEWAY_PRINCIPALS` JSON map of bearer token to requester identity, for
-  example `{"tok_dustin":"Dustin Sweet <dustin.sweet@porticour.io>"}`. When unset,
+  example `{"tok_dustin":"Dustin Sweet <dustin.sweet@quickmeals.com>"}`. When unset,
   the requester is reported as `claude-code (unverified)`.
 - `GATEWAY_APPROVERS` comma-separated principal identities authorized to review
   and decide operations. The compose demo authorizes `tok_approver`
   (`approver@demo`), `tok_dustin`, and `tok_abe`.
-- `GATEWAY_PRINCIPAL_TEAMS` JSON map of principal to Porticour engineering team,
-  for example `{"abe.roover@porticour.io":"security"}`. Keys may be the full
+- `GATEWAY_PRINCIPAL_TEAMS` JSON map of principal to QuickMeals engineering team,
+  for example `{"abe.roover@quickmeals.com":"security"}`. Keys may be the full
   principal string or just the address inside it. Consulted only for an operation
   that carries a required approver team — an operation a Security scan asked for,
   or any production promotion while the security mandate is on; everything else is

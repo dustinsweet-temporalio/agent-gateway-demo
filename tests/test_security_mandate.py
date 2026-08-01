@@ -68,8 +68,8 @@ from workflows.release_children import (
 TASK_QUEUE = "test-security-mandate"
 SERVICE = "delivery-matching-service"
 PRINCIPAL = "requester@example.com"
-WAYPOINT_APPROVER = "Dustin Sweet <dustin.sweet@porticour.io>"
-SECURITY_APPROVER = "Abe Roover <abe.roover@porticour.io>"
+WAYPOINT_APPROVER = "Dustin Sweet <dustin.sweet@quickmeals.com>"
+SECURITY_APPROVER = "Abe Roover <abe.roover@quickmeals.com>"
 
 _PRISTINE_DEPLOYED = copy.deepcopy(backend._deployed)
 _PRISTINE_RELEASES = copy.deepcopy(backend._releases)

@@ -7,7 +7,7 @@ worker, or a new task queue.
 
 That is the whole point of the distinction they draw against
 SecurityScanWorkflow. That one is a peer in another namespace because a
-different Porticour engineering team genuinely owns it, and the boundary between
+different QuickMeals engineering team genuinely owns it, and the boundary between
 them is a Nexus Endpoint. These three are the Waypoint team's own tooling,
 invoked by the Waypoint team's own gateway workflow, and a Child Workflow is the
 right primitive for exactly the reasons the SA best-practices guide lists as

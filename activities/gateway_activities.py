@@ -174,7 +174,7 @@ def archive_artifacts(input: ArchiveArtifactsInput) -> dict[str, Any]:
     """
     time.sleep(2.0)
     artifact_ref = (
-        f"s3://porticour-artifacts/{input.service}/{input.version}/"
+        f"s3://quickmeals-artifacts/{input.service}/{input.version}/"
         f"{input.service}-{input.version}.tar.zst"
     )
     # Derived from the digest rather than random, so it does not change between

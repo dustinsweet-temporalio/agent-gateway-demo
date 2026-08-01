@@ -522,7 +522,7 @@ async def _resumes_on_a_fresh_worker(
             AgenticChainWorkflow.approve_operation,
             ApprovalDecision(
                 operation_id=promotion.operation_id,
-                approver="Abe Roover <abe.roover@porticour.io>",
+                approver="Abe Roover <abe.roover@quickmeals.com>",
                 approver_team="security",
             ),
         )
@@ -583,7 +583,7 @@ def test_rejecting_the_promotion_wakes_the_scan_with_the_bad_news() -> None:
                     AgenticChainWorkflow.reject_operation,
                     ApprovalDecision(
                         operation_id=promotion.operation_id,
-                        approver="Abe Roover <abe.roover@porticour.io>",
+                        approver="Abe Roover <abe.roover@quickmeals.com>",
                         approver_team="security",
                         reason="holiday change freeze",
                     ),

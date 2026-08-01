@@ -143,7 +143,7 @@ _DEFAULT_CHAIN = "wf-" + uuid.uuid4().hex[:6]
 def _load_principals() -> dict[str, str]:
     """Static bearer token to identity map from GATEWAY_PRINCIPALS (JSON).
 
-    Example: {"tok_dustin": "Dustin Sweet <dustin.sweet@porticour.io>"}
+    Example: {"tok_dustin": "Dustin Sweet <dustin.sweet@quickmeals.com>"}
     """
     raw = os.getenv("GATEWAY_PRINCIPALS", "").strip()
     if not raw:
@@ -167,11 +167,11 @@ _APPROVERS = _load_approvers()
 
 
 def _load_principal_teams() -> dict[str, str]:
-    """Principal to Porticour engineering team map from GATEWAY_PRINCIPAL_TEAMS.
+    """Principal to QuickMeals engineering team map from GATEWAY_PRINCIPAL_TEAMS.
 
     Example:
-      {"dustin.sweet@porticour.io": "waypoint",
-       "abe.roover@porticour.io": "security"}
+      {"dustin.sweet@quickmeals.com": "waypoint",
+       "abe.roover@quickmeals.com": "security"}
 
     Explicit rather than inferred. An Operation gated by the Security team's
     pre-prod scan may only be approved by a member of the Security team (see
@@ -229,7 +229,7 @@ def _team_for_principal(principal: str) -> Optional[str]:
     """The team this principal belongs to, or None if it has no mapping.
 
     Keys may be written either as the full principal string the token resolves
-    to ("Abe Roover <abe.roover@porticour.io>") or as just the address inside
+    to ("Abe Roover <abe.roover@quickmeals.com>") or as just the address inside
     it. Pulling the address out of the angle brackets is a lookup normalization
     against the explicit map, not an inference: the domain is never consulted,
     and an address that is not in the map has no team.
@@ -1195,7 +1195,7 @@ async def whoami(request: Request) -> JSONResponse:
             "resolved_from_this_request": _principal_for_token(token),
             "resolved_from_middleware_contextvar": _current_principal.get(),
             "is_approver": _is_approver(_resolve_principal()),
-            # Which Porticour team this token approves as. Only matters for an
+            # Which QuickMeals team this token approves as. Only matters for an
             # operation that carries a team restriction; null everywhere else.
             "team": _team_for_principal(_principal_for_token(token)),
         }
@@ -1548,7 +1548,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .reject { background: #ef4444; }
 .toggle { background: transparent; border: 1px solid var(--border); color: var(--fg); }
 .countdown.urgent { color: #ef4444; font-weight: 600; }
-/* Only one Porticour team may decide this entry. Reads as a constraint on the
+/* Only one QuickMeals team may decide this entry. Reads as a constraint on the
    row rather than a status of the operation, so it sits under the requested
    action instead of in the outcome column. */
 .team-req { display: inline-block; margin-top: 0.3rem; padding: 0.12rem 0.45rem;
@@ -1740,7 +1740,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
    gate card uses. It sits between the gate and production, because that is
    where it sits in the pipeline: the last checkpoint before the protected
    promotion. Marked with its owner, because unlike every other card in this row
-   it is not the Waypoint team's -- it belongs to another Porticour engineering
+   it is not the Waypoint team's -- it belongs to another QuickMeals engineering
    team, running in another Temporal namespace, and the demo's whole CASE-2b
    beat is that distinction. */
 .gate.scan { flex: 0 0 12rem; }
@@ -2457,16 +2457,16 @@ def _render_dashboard(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Porticour Release Control</title>
+  <title>QuickMeals Release Control</title>
   <script>{_THEME_BOOT_JS}</script>
   <style>{_CSS}</style>
 </head>
 <body>
   <header>
     <div>
-      <h1>Porticour Release Control</h1>
+      <h1>QuickMeals Release Control</h1>
       <p class="muted brandline">Release management for the Waypoint engineering
-      team &middot; delivery matching. Approvers from other Porticour teams sign
+      team &middot; delivery matching. Approvers from other QuickMeals teams sign
       in here too.</p>
     </div>
     <div>
@@ -2543,7 +2543,7 @@ def _render_forbidden(message: str) -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Not authorized &middot; Porticour Release Control</title>
+  <title>Not authorized &middot; QuickMeals Release Control</title>
   <script>{_THEME_BOOT_JS}</script>
   <style>{_CSS}</style>
 </head>
@@ -2551,7 +2551,7 @@ def _render_forbidden(message: str) -> str:
   <main class="forbidden">
     <h1>Not authorized to decide this operation</h1>
     <p>{html.escape(message)}</p>
-    <p class="muted">This operation is restricted to one Porticour team's
+    <p class="muted">This operation is restricted to one QuickMeals team's
     approvers, either because that team's own pre-prod check produced it or
     because the company-wide security mandate is in effect. A member of that
     team has to be the one who approves or rejects it. Sign in with their
@@ -2570,16 +2570,16 @@ def _render_login(error: str = "") -> str:
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Porticour Release Control</title>
+  <title>QuickMeals Release Control</title>
   <script>{_THEME_BOOT_JS}</script>
   <style>{_CSS}</style>
 </head>
 <body>
   <main class="login">
     <h1>Approver sign in</h1>
-    <p class="muted">Porticour Release Control. Use a gateway-issued approver
+    <p class="muted">QuickMeals Release Control. Use a gateway-issued approver
     token. Decisions are recorded under the identity mapped to the token, not a
-    form-supplied name, and the token is what determines which Porticour team
+    form-supplied name, and the token is what determines which QuickMeals team
     you approve as.</p>
     {message}
     <form method="post" action="/login">

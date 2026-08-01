@@ -67,7 +67,7 @@ curl -s \
 The resolved identity should be:
 
 ```text
-Dustin Sweet <dustin.sweet@porticour.io>
+Dustin Sweet <dustin.sweet@quickmeals.com>
 ```
 
 ## 3. Sign in as the approver
@@ -340,7 +340,7 @@ click **Approve** on that row.
 ```text
 Not authorized to decide this operation
 operation op-... requires approval from the security team;
-'Dustin Sweet <dustin.sweet@porticour.io>' is not authorized to decide it
+'Dustin Sweet <dustin.sweet@quickmeals.com>' is not authorized to decide it
 ```
 
 Even now, mandate or not, Waypoint cannot clear this. It has to be Security.

@@ -297,7 +297,7 @@ class ScanVerdict:
 # stalls: which step, not which tool call.
 #
 # These are the OPPOSITE case from SecurityScanWorkflow. That one is a peer in
-# another namespace because another Porticour team owns it. These are the
+# another namespace because another QuickMeals team owns it. These are the
 # Waypoint team's own tooling, invoked by the Waypoint team's own gateway
 # workflow, in the same namespace on the same task queue. Same team, same
 # infrastructure, more depth.
@@ -559,7 +559,7 @@ class Operation:
     callback_workflow_id: str = ""
     callback_notified: bool = False
     origin_operation_id: str = ""
-    # The Porticour engineering team a human must belong to in order to approve
+    # The QuickMeals engineering team a human must belong to in order to approve
     # this operation, or None for no team restriction. Set at creation time from
     # which check gated the promotion: an Operation the Security team's scan
     # asked for may only be approved by the Security team. Everything else --

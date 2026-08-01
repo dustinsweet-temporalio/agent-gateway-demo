@@ -152,16 +152,16 @@ services:
       # Static bearer-token to identity map. The gateway sets the approval
       # requester from a matching token, never from anything the agent says.
       # Connect Claude Code with: --header "Authorization: Bearer tok_dustin"
-      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@porticour.io>","tok_abe":"Abe Roover <abe.roover@porticour.io>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo"}'
-      GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@porticour.io>,Abe Roover <abe.roover@porticour.io>"
-      # Which Porticour engineering team each principal belongs to. Explicit and
+      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@quickmeals.com>","tok_abe":"Abe Roover <abe.roover@quickmeals.com>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo"}'
+      GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@quickmeals.com>,Abe Roover <abe.roover@quickmeals.com>"
+      # Which QuickMeals engineering team each principal belongs to. Explicit and
       # auditable on purpose: an Operation gated by the Security team's scan may
       # only be approved by a Security-team member, and inferring that from an
       # email domain or a token-name pattern would break silently the first time
       # a persona's address changed. Keys may be the full principal string or
       # just the address inside it; anything absent has no team and therefore
       # cannot approve a team-restricted Operation.
-      GATEWAY_PRINCIPAL_TEAMS: '{"dustin.sweet@porticour.io":"waypoint","abe.roover@porticour.io":"security"}'
+      GATEWAY_PRINCIPAL_TEAMS: '{"dustin.sweet@quickmeals.com":"waypoint","abe.roover@quickmeals.com":"security"}'
       GATEWAY_DEBUG: "1"
     ports:
       - "8080:8080"

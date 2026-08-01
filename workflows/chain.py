@@ -117,7 +117,7 @@ PIPELINE_PRODUCTION_ENVIRONMENT = "prod"
 # pipeline opens the production promotion itself, exactly as it always did.
 SCAN_CAPABILITY_TOOL = "get_security_scan_status"
 
-# Which Porticour engineering team must approve a promotion, keyed by the
+# Which QuickMeals engineering team must approve a promotion, keyed by the
 # service that asked for it. A promotion the Security team's scan requested is
 # the Security team's call to stand behind, so a member of that team has to be
 # the one who approves it -- that authorization requirement is what makes the
@@ -148,7 +148,7 @@ def _required_approver_team_for(
     environment: str,
     security_mandate: bool,
 ) -> str | None:
-    """Which Porticour team, if any, must be the one to approve this operation.
+    """Which QuickMeals team, if any, must be the one to approve this operation.
 
     Two independent reasons an operation can be team-restricted, checked in the
     order they were introduced:

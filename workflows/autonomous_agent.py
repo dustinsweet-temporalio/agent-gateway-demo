@@ -305,7 +305,7 @@ class AutonomousAgentWorkflow:
 
         Declared so the gateway can ask any workflow behind an approval queue
         entry the same question without first working out which type it is. A
-        CASE-3 run promotes directly and is never gated by another Porticour
+        CASE-3 run promotes directly and is never gated by another QuickMeals
         team's check, so there is no team whose approval it specifically needs;
         the ordinary GATEWAY_APPROVERS membership check is the whole rule here.
 
