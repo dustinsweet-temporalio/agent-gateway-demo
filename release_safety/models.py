@@ -12,6 +12,7 @@ tests/test_release_safety_contract.py rather than by the type system.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -31,6 +32,21 @@ CANARY_THRESHOLD = 0.02
 # deliberate decision about the demo, not a knob to reach for.
 CANARY_TICK_SECONDS = 5
 CANARY_WINDOW_TICKS = 4
+
+
+def canary_fail_versions() -> set[str]:
+    """Versions whose window fails, so the fail-closed path can be demoed.
+
+    Read at call time rather than at import, and read on this side of the
+    boundary rather than relayed in by the caller. Which releases canary rejects
+    is the canary team's business; a pipeline that could tell canary what verdict
+    to reach would not be much of a checkpoint.
+    """
+    return {
+        item.strip()
+        for item in os.getenv("CANARY_FAIL_VERSIONS", "").split(",")
+        if item.strip()
+    }
 
 
 @dataclass
@@ -57,9 +73,8 @@ class CanaryAnalysisInput:
     origin_operation_id: str = ""
     # Who asked for the release. Canary acts on their behalf when it calls the
     # gateway back, so the gateway can check the request against the chain's
-    # owner. See canary_activities.call_agent_gateway_promote.
+    # owner.
     requester: str = ""
-    gateway_namespace: str = "default"
 
 
 @dataclass
@@ -88,6 +103,13 @@ class CanaryState:
     window_ticks: int = CANARY_WINDOW_TICKS
     tick_results: list[dict[str, Any]] = field(default_factory=list)
     verdict: Optional[str] = None
+    # The Nexus operation this workflow is suspended on. Held from the moment
+    # the request is made, and this team's own handle on the pending call.
+    gateway_operation_token: Optional[str] = None
+    # Agent Gateway's internal id for the operation, which arrives only with the
+    # outcome. Canary does not have it while it waits and does not need it: it is
+    # waiting on an operation it owns a token for, not polling someone else's
+    # record by id.
     gateway_operation_id: Optional[str] = None
     gateway_workflow_id: Optional[str] = None
     promotion_result: Optional[Any] = None
@@ -108,6 +130,7 @@ class CanaryStatusView:
     tick_results: list[dict[str, Any]] = field(default_factory=list)
     verdict: Optional[str] = None
     gateway_workflow_id: Optional[str] = None
+    gateway_operation_token: Optional[str] = None
     gateway_operation_id: Optional[str] = None
     promotion_result: Optional[Any] = None
     error: Optional[str] = None
@@ -121,35 +144,6 @@ class CanaryResult:
     gateway_operation_id: Optional[str] = None
     promotion_result: Optional[Any] = None
     error: Optional[str] = None
-
-
-@dataclass
-class AgentGatewayPromoteInput:
-    """The nested tool call canary makes once its window closes green."""
-
-    gateway_workflow_id: str
-    gateway_namespace: str
-    canary_workflow_id: str
-    origin_operation_id: str
-    service: str
-    version: str
-    environment: str
-    idempotency_key: str
-    requester: str
-    justification: str
-
-
-@dataclass
-class ReportCanaryVerdictInput:
-    """Tell Agent Gateway the window closed red, so it can stop waiting."""
-
-    gateway_workflow_id: str
-    gateway_namespace: str
-    canary_workflow_id: str
-    origin_operation_id: str
-    verdict: str
-    reason: Optional[str] = None
-    detail: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -176,18 +170,8 @@ class PublishCanaryStateInput:
     error: Optional[str] = None
 
 
-# ---------------------------------------------------------------- wire contract
-
-
-@dataclass
-class GatewayOperationResolution:
-    """Agent Gateway's terminal answer, delivered as a Signal.
-
-    This team's copy of common.models.GatewayOperationResolution. Same field
-    names, deliberately not the same class.
-    """
-
-    operation_id: str
-    status: str
-    result: Optional[Any] = None
-    reason: Optional[str] = None
+# The wire contract with Agent Gateway used to live here: a hand-copied version
+# of their internal request struct, plus a Signal payload, plus a test that
+# grepped their source to check the copies had not drifted. All of it is gone.
+# What replaced it is release_safety/nexus_contracts.py, which states an
+# interface rather than mirroring an implementation.

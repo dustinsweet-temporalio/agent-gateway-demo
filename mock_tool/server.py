@@ -76,14 +76,6 @@ _canary: dict | None = None
 # their container rather than by editing a config flag.
 _canary_provider: dict | None = None
 
-# Demo knob, mirroring QUALITY_GATE_FAIL_VERSIONS: canary fails for these
-# versions, so the fail-closed path can be shown on demand. Empty by default.
-CANARY_FAIL_VERSIONS = {
-    item.strip()
-    for item in os.getenv("CANARY_FAIL_VERSIONS", "").split(",")
-    if item.strip()
-}
-
 # How long a gate run takes. Long enough to watch the card work and to trip the
 # gateway's sync budget honestly, short enough to stay well inside the invoke
 # Activity's request timeout.
@@ -278,11 +270,7 @@ def _handle(tool_name: str, arguments: dict) -> dict:
             "provider": str(arguments.get("provider", "release-safety")),
             "namespace": str(arguments.get("namespace", "release-safety")),
             "task_queue": str(arguments.get("task_queue", "release-safety-tq")),
-            "workflow_type": str(
-                arguments.get("workflow_type", "CanaryAnalysisWorkflow")
-            ),
-            "tick_seconds": int(arguments.get("tick_seconds", 5)),
-            "window_ticks": int(arguments.get("window_ticks", 4)),
+            "endpoint": str(arguments.get("endpoint", "release-safety")),
             "ttl_seconds": float(arguments.get("ttl_seconds", 20.0)),
             "last_seen": time.time(),
         }
@@ -295,12 +283,17 @@ def _handle(tool_name: str, arguments: dict) -> dict:
         }
 
     if tool_name == "get_release_safety_status":
-        # The release pipeline's capability lookup. Available means somebody is
-        # currently running a canary platform, not that somebody once did: a
-        # registration that has not been refreshed inside its TTL is treated as
-        # gone, so stopping the Release Safety worker takes the capability with
-        # it and the pipeline goes back to opening the promotion itself.
-        version = str(arguments.get("version", ""))
+        # The release pipeline's capability lookup: is anyone offering canary
+        # analysis right now? Available means somebody is currently running a
+        # canary platform, not that somebody once did -- a registration that has
+        # not been refreshed inside its TTL is treated as gone, so stopping the
+        # Release Safety worker takes the capability with it and the pipeline
+        # goes back to opening the promotion itself.
+        #
+        # The answer is who, and nothing about how. How long a window runs, what
+        # threshold it applies, and which versions it rejects are all decided
+        # behind the canary team's Nexus endpoint, where the caller cannot reach
+        # them and has no business trying.
         record = _canary_provider
         fresh = bool(
             record
@@ -314,17 +307,8 @@ def _handle(tool_name: str, arguments: dict) -> dict:
         return {
             "available": True,
             "provider": record["provider"],
-            "namespace": record["namespace"],
-            "task_queue": record["task_queue"],
-            "workflow_type": record["workflow_type"],
-            "tick_seconds": record["tick_seconds"],
-            "window_ticks": record["window_ticks"],
-            "scripted_outcome": (
-                "fail" if version in CANARY_FAIL_VERSIONS else "pass"
-            ),
-            "message": (
-                f"{record['provider']} is offering canary analysis for {version}"
-            ),
+            "endpoint": record["endpoint"],
+            "message": f"{record['provider']} is offering canary analysis",
         }
 
     if tool_name == "record_canary_state":

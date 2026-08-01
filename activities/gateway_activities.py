@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
 import os
-import uuid
 from typing import Any
 
 import requests
@@ -10,22 +10,23 @@ from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 
 from common.models import (
-    CanaryAnalysisStarted,
+    CorrelationContext,
     EvaluatePolicyInput,
+    GatewayOperationResolution,
     InvokeToolInput,
+    NestedToolCallRequest,
     PolicyDecision,
-    SignalReleaseSafetyInput,
-    StartCanaryAnalysisInput,
+    SignalOperationCallbackInput,
+    SubmitNestedToolCallInput,
+    ToolCallResponse,
 )
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
-# Release Safety's namespace. The gateway team does not deploy anything into it
-# and cannot see inside their code; it knows a namespace, a task queue, a
-# workflow type name, and a signal name, all of which Release Safety publishes.
-RELEASE_SAFETY_NAMESPACE = os.getenv("RELEASE_SAFETY_NAMESPACE", "release-safety")
-RELEASE_SAFETY_TASK_QUEUE = os.getenv("RELEASE_SAFETY_TASK_QUEUE", "release-safety-tq")
-RELEASE_SAFETY_WORKFLOW_TYPE = "CanaryAnalysisWorkflow"
-RELEASE_SAFETY_RESOLUTION_SIGNAL = "gateway_operation_resolved"
+# This worker's own namespace. Both Activities at the bottom of this file
+# connect here and nowhere else: there is no longer any code in the gateway that
+# reaches into another team's cluster, because the Nexus Endpoint does that.
+TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", "default")
+OPERATION_RESOLVED_SIGNAL = "operation_resolved"
 
 
 def _protected_environments() -> set[str]:
@@ -85,91 +86,103 @@ def invoke_tool(input: InvokeToolInput) -> dict[str, Any]:
     return resp.json()
 
 
-# ---------------------------------------------------------- Release Safety edge
+
+
+# ------------------------------------------------- serving an external caller
 #
-# Two Activities that reach into another team's Temporal namespace. Both create
-# their own Client, scoped to that namespace, inside the Activity. Workflow code
-# never holds a client: it has to replay deterministically, and a network call
-# cannot.
+# Both Activities below connect to this worker's OWN namespace. Nothing in the
+# gateway reaches into another team's cluster any more: the cross-team hop is a
+# Nexus Endpoint, and by the time either of these runs, the call has already
+# crossed it. Workflow code still never holds a client, because it has to replay
+# deterministically and a network call cannot.
 
 
 @activity.defn
-async def start_canary_analysis(
-    input: StartCanaryAnalysisInput,
-) -> CanaryAnalysisStarted:
-    """Hand a qualified release to Release Safety's canary platform.
+async def submit_nested_tool_call(
+    input: SubmitNestedToolCallInput,
+) -> dict[str, Any]:
+    """Lodge an external tool's protected-action request with the chain.
 
-    Started by id and workflow type name, not by importing their workflow class,
-    because their code is not on this worker's path and should not be. This is
-    also deliberately NOT a child workflow: a child shares its parent's namespace
-    and is torn down with it, which would make canary look separated without
-    being separated. The two workflows are peers, in different namespaces,
-    correlated by the chain workflow_id carried in the input.
+    An Update, which workflow code cannot issue directly, so
+    ProtectedActionWorkflow goes through here. The chain is addressed by the
+    workflow_id the caller carried as correlation context, so the request lands
+    on the operator's existing session rather than opening a second one.
 
-    The workflow id is shaped to be unmistakable in the Temporal UI's workflow
-    list, so that switching namespaces during the demo visibly lands you in
-    another team's system rather than in more of the same.
+    caller_principal is the chain's owner, threaded through from whoever asked
+    for the release. The external tool is acting on their behalf, and the chain
+    checks a nested call against its owner, so a tool that invented its own
+    principal here would simply be refused. Its own identity travels alongside
+    in caller_service and in the call path, so the ledger records both who
+    authorized the release and which system actually asked.
     """
-    client = await Client.connect(TEMPORAL_ADDRESS, namespace=RELEASE_SAFETY_NAMESPACE)
-    canary_workflow_id = (
-        f"release-safety::canary::{input.service}::{input.version}::"
-        f"{uuid.uuid4().hex[:8]}"
-    )
-    handle = await client.start_workflow(
-        RELEASE_SAFETY_WORKFLOW_TYPE,
-        {
-            "workflow_id": input.gateway_workflow_id,
-            "service": input.service,
-            "version": input.version,
-            "environment": input.environment,
-            "scripted_outcome": input.scripted_outcome,
-            "tick_seconds": input.tick_seconds,
-            "window_ticks": input.window_ticks,
-            "idempotency_key": input.idempotency_key,
-            "origin_operation_id": input.origin_operation_id,
-            "requester": input.requester,
-            "gateway_namespace": input.gateway_namespace,
+    client = await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
+    handle = client.get_workflow_handle(input.gateway_workflow_id)
+    request = NestedToolCallRequest(
+        tool1_name=f"{input.caller_service.replace('-', '_')}_canary",
+        tool1_arguments={
+            **input.arguments,
+            "caller_workflow_id": input.caller_workflow_id,
         },
-        id=canary_workflow_id,
-        task_queue=RELEASE_SAFETY_TASK_QUEUE,
+        tool2_name=input.tool_name,
+        tool2_arguments=dict(input.arguments),
+        idempotency_key=input.idempotency_key,
+        correlation=CorrelationContext(
+            workflow_id=input.gateway_workflow_id,
+            workflow_id_source="explicit_authorized",
+            idempotency_key=input.idempotency_key,
+            caller_principal=input.caller_principal,
+            caller_service=input.caller_service,
+            runtime="nexus",
+            call_path=[
+                input.caller_service,
+                f"{input.caller_service.replace('-', '_')}_canary",
+            ],
+        ),
+        requested_action=(
+            f"Promote {input.arguments.get('service', '?')} "
+            f"{input.arguments.get('version', '?')} to "
+            f"{input.arguments.get('environment', '?')}"
+        ),
+        justification=input.justification or None,
+        controlled_tool1=True,
+        replay_safe=True,
+        callback_workflow_id=input.callback_workflow_id,
+        origin_operation_id=input.origin_operation_id,
+    )
+    response: ToolCallResponse = await handle.execute_update(
+        "request_nested_tool_call", request, result_type=ToolCallResponse
     )
     activity.logger.info(
-        "opened canary window %s in namespace %s",
-        canary_workflow_id,
-        RELEASE_SAFETY_NAMESPACE,
+        "chain %s answered %s for %s",
+        input.gateway_workflow_id,
+        response.status,
+        input.caller_service,
     )
-    return CanaryAnalysisStarted(
-        canary_workflow_id=canary_workflow_id,
-        canary_run_id=handle.result_run_id or "",
-        namespace=RELEASE_SAFETY_NAMESPACE,
-        task_queue=RELEASE_SAFETY_TASK_QUEUE,
-    )
+    return dataclasses.asdict(response)
 
 
 @activity.defn
-async def signal_release_safety_workflow(input: SignalReleaseSafetyInput) -> None:
-    """Deliver a terminal operation result back to the durable Tool1 that asked.
+async def signal_operation_callback(input: SignalOperationCallbackInput) -> None:
+    """Tell the workflow holding a request open that its operation resolved.
 
-    The counterpart of the pause. Canary stopped its own execution waiting for
-    this, and this is what wakes it, whether the answer is approved, rejected, or
-    timed out. It runs on the gateway's own worker, in the gateway's namespace,
-    and reaches out to Release Safety's -- the gateway is the one that knows the
-    decision, so the gateway is the one that delivers it.
+    The other half of the pause. Something is suspended waiting for this --
+    in CASE-2b a ProtectedActionWorkflow, which is in turn the handler for a
+    Nexus operation another team's canary is suspended on. Delivering it here
+    completes that chain of waits without anyone polling.
     """
-    namespace = input.callback_namespace or RELEASE_SAFETY_NAMESPACE
-    client = await Client.connect(TEMPORAL_ADDRESS, namespace=namespace)
+    client = await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
     handle = client.get_workflow_handle(input.callback_workflow_id)
     await handle.signal(
-        RELEASE_SAFETY_RESOLUTION_SIGNAL,
-        {
-            "operation_id": input.operation_id,
-            "status": input.status,
-            "result": input.result,
-            "reason": input.reason,
-        },
+        OPERATION_RESOLVED_SIGNAL,
+        GatewayOperationResolution(
+            operation_id=input.operation_id,
+            status=input.status,
+            result=input.result,
+            reason=input.reason,
+        ),
     )
     activity.logger.info(
-        "notified %s that %s is %s",
+        "told %s that %s is %s",
         input.callback_workflow_id,
         input.operation_id,
         input.status,

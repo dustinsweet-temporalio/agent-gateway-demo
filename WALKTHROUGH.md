@@ -17,6 +17,10 @@ Wait until the logs include:
 worker started, polling task queue 'agentic-gateway'
 ```
 
+The `nexus-endpoints` service runs once and exits, having registered the two
+Nexus Endpoints the two teams call each other on. Its log ends with a listing of
+both; if it is missing, step 7 will fail with an operation timeout.
+
 Keep this terminal open. The useful endpoints are:
 
 - Approval dashboard: http://localhost:8080
@@ -28,6 +32,13 @@ One service deliberately does **not** start: `release-safety-worker`, the Releas
 Safety team's canary platform. It belongs to step 7, and starting it early gives
 away the CASE-2b reveal. If you have run this walkthrough before, check with
 `docker compose ps` and stop it before you begin.
+
+If you have changed any code since you last ran this, build with the profile or
+the canary worker keeps a stale image:
+
+```bash
+docker compose --profile '*' build
+```
 
 ## 2. Connect Claude Code
 
@@ -360,8 +371,8 @@ message: Quality gates passed. release-safety is running canary analysis for
 
 Not `waiting_for_approval`. Nothing is on the approval queue yet, because the
 promotion has not been *requested* yet. The pipeline asked the shared platform
-whether anyone was offering canary analysis, found that somebody now is, handed
-the release over, and parked itself. The ledger shows
+whether anyone was offering canary analysis, found that somebody now is, called
+their **Nexus Endpoint**, and parked itself. The ledger shows
 `canary_capability_discovered` then `canary_handoff`.
 
 The pipeline is not configured for canary. It looks to see whether canary is
@@ -385,13 +396,26 @@ release-safety::canary::delivery-matching-service::<computed version>::a1b2c3d4
 
 Different namespace, different task queue, different worker identity, different
 workflow id scheme. It is a *peer* of the chain workflow, not a child of it: no
-parent link, its own retention, its own failure domain. This is the point where
-"another team's tool" stops being a label on a code comment.
+parent link, its own retention, its own failure domain.
 
-### C. The nested call
+Now say the part that matters. Grep the gateway's code for any of that and you
+will not find it:
 
-When the window closes green, canary calls Agent Gateway. Only then does the
-production promotion appear on the approval queue, and its call path reads:
+```bash
+grep -rn "release-safety-tq\|CanaryAnalysisWorkflow" workflows/ activities/ common/
+```
+
+Nothing. The pipeline called an endpoint named `release-safety` and learned none
+of it. Release Safety can rename that workflow, move task queues, or change
+namespace tomorrow and no gateway code changes. This is the point where "another
+team's tool" stops being a label on a code comment.
+
+### C. The nested call, in the other direction
+
+When the window closes green, canary calls Agent Gateway's `agent-gateway`
+endpoint -- straight from workflow code, no client, no credentials for the
+gateway's namespace. Only then does the production promotion appear on the
+approval queue, and its call path reads:
 
 ```text
 release-safety -> release_safety_canary -> promote_release
@@ -401,6 +425,13 @@ One `workflow_id`, two namespaces, three operations. Canary did not promote
 anything itself, and it has no more right to than anyone else does: it made a
 governed request, carrying the original chain's `workflow_id`, and the gateway
 gated it exactly as it gates everything else.
+
+Switch the namespace selector back to `default` and there is now a second
+workflow alongside the chain: `protected-action::release-safety::promote_release::...`.
+That is the gateway's Nexus handler holding canary's request open. It exists because a Nexus operation
+backed by a workflow starts a *new* workflow, while the request has to reach the
+chain that is already running; it is short-lived, gateway-owned, and everything
+it does to the chain is a same-namespace call.
 
 ### D. The checkpoint that survives its own worker
 
@@ -412,10 +443,9 @@ docker compose stop release-safety-worker
 ```
 
 Now approve the promotion in the dashboard anyway. It works: production rolls
-over to the canaried version, and the chain's ledger records
-`controlled_caller_notified`. Agent Gateway delivered the decision across the
-namespace boundary to a workflow whose worker is not running, because a Signal
-does not need one.
+over to the canaried version, and in the `default` namespace the
+`protected-action::...` workflow completes. Completing it completes the Nexus
+operation belonging to a workflow whose worker is not running.
 
 Bring Release Safety back:
 
@@ -423,53 +453,59 @@ Bring Release Safety back:
 docker compose start release-safety-worker
 ```
 
-Canary wakes on the Signal that was waiting for it, records the promotion it
-never performed and never watched happen, and completes. Open its Event History:
+Canary resumes on the operation that completed while it was gone, records the
+promotion it never performed and never watched happen, and finishes. Open its
+Event History:
 
 ```text
 run_canary_tick  x4
-call_agent_gateway_promote
-gateway_operation_resolved   <- the Signal
+NexusOperationScheduled     request_protected_action
+NexusOperationStarted
+    ... the entire approval happens in this gap, including the worker
+        being killed and replaced ...
+NexusOperationCompleted
 WorkflowExecutionCompleted
 ```
 
 (`publish_canary_state` calls are interleaved throughout; they are what feed the
 dashboard card and have no bearing on the verdict.)
 
-Four ticks, not eight. Nothing re-ran. Say the sentence out loud: *that history
-belongs to Release Safety, not to Agent Gateway.* In step 6 the gateway was
-pausing in the middle of doing its own work and then continuing it. Here a
-genuinely separate system checkpointed its own work, stopped, and was resumed.
-That is the distinction the requirements document is drawing, and it is the first
-time in this walkthrough it has actually been true.
+Four ticks, not eight. Nothing re-ran. And notice what is *not* in that history:
+no Signal handler, no callback, no polling loop. The workflow suspended on an
+outbound operation and the operation finished.
+
+Say the sentence out loud: *that history belongs to Release Safety, not to Agent
+Gateway.* In step 6 the gateway was pausing in the middle of doing its own work
+and then continuing it. Here a genuinely separate system checkpointed its own
+work, stopped, and was resumed. That is the distinction the requirements document
+is drawing, and it is the first time in this walkthrough it has actually been
+true.
 
 ### E. A red window never reaches the approver
 
-Point the backend at a version whose canary fails, exactly as you did for the
-gates in step 6C:
+Tell the canary team's worker which version to fail:
 
 ```bash
-docker compose stop mock-tool
-CANARY_FAIL_VERSIONS=<next version> docker compose up -d mock-tool
+CANARY_FAIL_VERSIONS=<next version> \
+  docker compose up -d --force-recreate release-safety-worker
 ```
 
-Recreating `mock-tool` resets its in-memory world: the fleet goes back to its
-seeded versions and both the gate card and the canary card disappear until
-something runs them again. That is the same reset step 6C does, and it is
-harmless here -- work out the next version from what production shows *after* the
-restart. The capability registration is wiped too, and Release Safety's worker
-re-advertises within about five seconds, so canary is available again by the time
-you have typed the prompt.
+Note where that knob is. Not on `mock-tool`, not on the pipeline: on the canary
+team's own worker, because which release fails canary is their decision. Under
+the earlier design the caller relayed it in, which meant the pipeline was telling
+the checkpoint what verdict to reach. It also means this recreate does **not**
+reset the fleet the way step 6C's `mock-tool` restart does, so the version you
+compute stays the version you get.
 
-Run the pipeline again. The gate card appears and goes green, canary opens its
-window, and the first tick comes in over threshold. The window dies there: one
-bad reading fails it, it is not averaged out or retried past. Canary signals its
-verdict back, the pipeline operation fails, and **nothing reaches the approval
-queue**. Production is untouched.
+Run the pipeline again. The gate card goes green, canary opens its window, and
+the first tick comes in over threshold. The window dies there: one bad reading
+fails it, it is not averaged out or retried past. Canary reports the outcome back
+through the same endpoint, the pipeline operation fails, and **nothing reaches
+the approval queue**. Production is untouched.
 
 Same shape as the failing gate in step 6C, one checkpoint later, and now enforced
-by a system Waypoint does not own. Restore the normal backend with
-`docker compose up -d --force-recreate mock-tool`.
+by a system Waypoint does not own. Restore with
+`docker compose up -d --force-recreate release-safety-worker`.
 
 ## 8. CASE-2b safety boundary: a Tool1 that cannot suspend
 
@@ -727,18 +763,22 @@ Look for events such as:
 
 For a CASE-2b run, the handoff and its resolution are in the same ledger:
 
-- `canary_capability_discovered`, then `canary_handoff` with the canary
-  workflow id and the namespace it was started in
-- `controlled_caller_notified` when the decision was delivered back across the
-  namespace boundary, or `controlled_caller_unreachable` if it could not be
+- `canary_capability_discovered`, then `canary_handoff` with the canary workflow
+  id and the **endpoint** it was reached on. No namespace is recorded, because
+  the pipeline was never told one
+- `controlled_caller_notified` when the decision was handed to the workflow
+  holding the request open, or `controlled_caller_unreachable` if it could not
+  be. Both are same-namespace: the boundary is crossed by the Nexus operation
+  completing, not by this
 - `canary_pipeline_settled` when the parked pipeline operation was closed out
 - `canary_failed` when Release Safety reported a red window instead
 
 The same execution history is visible in the Temporal UI at
-http://localhost:8233. For CASE-2b there are two of them, one per namespace:
-the chain's, and canary's own under `release-safety`. Neither is a subset of the
-other, which is the point -- each team's system keeps its own record of what it
-did.
+http://localhost:8233. For CASE-2b there are three executions across two
+namespaces: the chain and its `protected-action::...` adapter under `default`,
+and canary's own under `release-safety`. None is a subset of the others, which is
+the point -- each team's system keeps its own record of what it did, under its
+own retention policy.
 
 ## 11. Troubleshooting
 
@@ -772,11 +812,42 @@ provider and handed off. That is step 7 arriving a step early. Check with
 `docker compose ps`, and see "Start over" below for why plain
 `docker compose down` leaves it up.
 
+### Step 7 fails with "Could not open a canary window"
+
+The Nexus operation timed out, which means nothing was polling
+`release-safety-tq` in the `release-safety` namespace for Nexus tasks. Two
+causes, in order of likelihood:
+
+**A stale image.** `docker compose build` skips services behind a profile, so
+`release-safety-worker` can be running last week's code. Check that the Nexus
+handler is even in the image:
+
+```bash
+docker compose exec release-safety-worker ls /app/release_safety/
+```
+
+If `nexus_handlers.py` is missing, rebuild properly:
+
+```bash
+docker compose --profile '*' build release-safety-worker
+docker compose up -d --force-recreate release-safety-worker
+```
+
+**Missing endpoints.** Confirm both are registered:
+
+```bash
+docker compose exec temporal temporal operator nexus endpoint list --address temporal:7233
+```
+
+You want `agent-gateway` → `default`/`agentic-gateway` and `release-safety` →
+`release-safety`/`release-safety-tq`. If they are absent, rerun the registration
+with `docker compose up nexus-endpoints`.
+
 ### Step 7 returns `waiting_for_approval` instead of `processing`
 
-The opposite: no canary provider was found, so the pipeline opened the
-production promotion itself. Either the worker is not running, or it has not
-advertised itself yet. Confirm it started:
+No canary provider was found, so the pipeline opened the production promotion
+itself. Either the worker is not running, or it has not advertised itself yet.
+Confirm it started:
 
 ```bash
 docker compose logs release-safety-worker
@@ -790,12 +861,14 @@ Then ask the registry directly:
 
 ```bash
 curl -s -X POST localhost:9000/invoke -H 'content-type: application/json' \
-  -d '{"tool_name":"get_release_safety_status","arguments":{"version":"0.0.0"}}'
+  -d '{"tool_name":"get_release_safety_status","arguments":{}}'
 ```
 
 `available: true` means the pipeline will route through canary on its next run.
-Registration is a heartbeat with a TTL, so give it about five seconds after the
-worker starts, and expect the same delay after any `mock-tool` recreate.
+Note how little the answer contains -- a provider and an endpoint, no namespace
+and no task queue -- which is the same restraint the code shows. Registration is
+a heartbeat with a TTL, so give it about five seconds after the worker starts,
+and expect the same delay after any `mock-tool` recreate.
 
 ### The canary card is stuck partway through its window
 
@@ -811,12 +884,23 @@ docker compose start release-safety-worker
 
 ### A pipeline operation is stuck in `waiting_for_dependency`
 
-It handed off to canary and is waiting on a verdict. If canary's workflow has
-completed or failed and the pipeline operation has not moved, look for
-`controlled_caller_unreachable` in the chain ledger and check both workers are
-up. A canary workflow that was never scheduled at all -- no worker ever polled
-`release-safety-tq` -- leaves the operation waiting indefinitely, because the
-handoff has no timeout of its own. Starting the worker resolves it.
+It handed off to canary and is waiting on a verdict. Note that a canary worker
+which was never running at all does **not** produce this: the handoff operation
+has a thirty second schedule-to-close timeout, so that case fails fast with
+"Could not open a canary window" instead (see above).
+
+This state means the window was opened and then stopped progressing -- the
+canary worker died after the handler ran. The window itself has no deadline, so
+the operation waits indefinitely. Bring the worker back and canary resumes where
+it left off:
+
+```bash
+docker compose logs release-safety-worker
+docker compose start release-safety-worker
+```
+
+If canary's workflow has completed or failed and the pipeline operation still
+has not moved, look for `controlled_caller_unreachable` in the chain ledger.
 
 ### Start over
 
@@ -841,3 +925,6 @@ from inactive profiles running. If it is still up when you start step 6, the
 pipeline finds a canary provider and hands off, and the CASE-2b reveal in step 7
 happens a step early. Check with `docker compose ps` if step 6 returns
 `processing` instead of `waiting_for_approval`.
+
+The same flag applies to `docker compose build`, which otherwise leaves that
+worker on a stale image. Both omissions fail quietly, in opposite directions.

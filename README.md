@@ -18,38 +18,42 @@ gateway pauses it and a human approves or rejects before it proceeds.
 ## Architecture
 
 ```
-namespace: default                                   namespace: release-safety
-================================================     ==========================
+namespace: default                              namespace: release-safety
+=============================================   =========================
 
-Claude Code ----------------MCP/HTTP--------> Agent Gateway
-                                                       |
+Claude Code -------------MCP/HTTP-----> Agent Gateway
+                                              |
 Google ADK Web -> TemporalAdkSessionWorkflow -> MCP Activity
-                         |                             |
-                         +-- model Activity            |
-                                                       |
-                    +----------------------------------+--------+
-                    |                                           |
-          Chain entity workflow                   Autonomous-agent workflow
-       (CASE-1, CASE-2a, CASE-2b)                  (CASE-3 checkpoint)
-                    |          ^                            |
-                    |          |                            |
-     start_canary_analysis     | request_nested_tool_call    |
-                    |          | (Tool1 -> Tool2)            |
-                    v          |                            |
-              +---------------------------+                 |
-              |  CanaryAnalysisWorkflow    | <-- Release Safety's worker,
-              |  task queue:               |     their namespace, their
-              |  release-safety-tq         |     deploy cadence
-              +---------------------------+                 |
-                    ^          |                            |
-   gateway_operation_resolved  | canary_verdict_reported     |
-        (wakes the pause)      v                            |
-                    +----------+---------------------------+
-                    |
-                    +---------- Activities -> Mock Deploy Backend
-                                                       ^
-                                         approve/reject/cancel Signals
+                        |                     |
+                        +-- model Activity    |
+                                              |
+                   +--------------------------+------+
+                   |                                 |
+         Chain entity workflow            Autonomous-agent workflow
+      (CASE-1, CASE-2a, CASE-2b)             (CASE-3 checkpoint)
+                   |                                 |
+                   |  Nexus: open_canary_window      |
+                   |  (endpoint "release-safety")    |
+                   +-------------------------------> CanaryAnalysisWorkflow
+                                                     task queue:
+                                                     release-safety-tq
+                                                          |
+        ProtectedActionWorkflow <-------------------------+
+        (Nexus handler, endpoint     Nexus: request_protected_action
+         "agent-gateway")            (endpoint "agent-gateway")
+                   |                     ...suspends until a human decides,
+                   | Update              then the operation COMPLETES and
+                   v                     canary resumes. No callback Signal.
+         Chain entity workflow
+                   |
+                   +------- Activities -> Mock Deploy Backend
+                                              ^
+                                approve/reject/cancel Signals
 ```
+
+Neither team's code contains the other's namespace, task queue, or workflow type.
+Both directions cross on a Nexus Endpoint, which is a cluster object naming a
+target namespace and task queue; callers address it by name and learn neither.
 
 - One long-lived workflow per agentic chain, keyed by `workflow_id`. Operations
   live in a map inside workflow state.
@@ -75,25 +79,43 @@ Google ADK Web -> TemporalAdkSessionWorkflow -> MCP Activity
   module. `CanaryAnalysisWorkflow` runs in the `release-safety` namespace, on the
   `release-safety-tq` task queue, in a worker the gateway team does not deploy,
   from a Python package that imports nothing from `gateway/`, `workflows/`,
-  `activities/`, or `common/`. It is deliberately **not** a child workflow: the
-  two are peers correlated by a shared `workflow_id` value, because a child would
-  share the parent's namespace and lifecycle and so would look separated without
-  being separated.
+  `activities/`, or `common/`. It is **not** a child workflow: a child shares its
+  parent's namespace and lifecycle, and would look separated without being
+  separated.
+- **Both directions cross on a Nexus Endpoint.** The pipeline calls
+  `release-safety`; canary calls `agent-gateway`. Neither side's code names the
+  other's namespace, task queue, or workflow type, so either team can restructure
+  behind their endpoint without the other deploying. That property is asserted in
+  `tests/test_release_safety_contract.py`, not just claimed.
 - Canary is the first Tool1 in this demo that genuinely calls Tool2 *through* the
-  gateway. Once its window closes green it invokes `request_nested_tool_call` on
-  the chain workflow, carrying the original `workflow_id`, so one user-visible
-  task spans two namespaces. It then suspends its own execution on a
-  `wait_condition` and is woken by a `gateway_operation_resolved` Signal after a
-  human decides. Kill Release Safety's worker mid-pause and its ticks, verdict,
-  and operation id all come back from its own Event History.
-- Every cross-namespace call goes through an Activity that creates its own
-  namespace-scoped `Client`. Workflow code never holds a client.
+  gateway. Once its window closes green it starts a Nexus operation carrying the
+  original `workflow_id`, so one user-visible task spans two namespaces, and then
+  **suspends on that operation** for as long as the approval takes. There is no
+  callback Signal and nothing to poll: the operation completing is the answer.
+  Kill Release Safety's worker mid-pause and its ticks, verdict, and pending
+  operation all come back from its own Event History.
+- `ProtectedActionWorkflow` is the gateway's Nexus handler for that request. It
+  exists because a workflow-backed Nexus operation starts a *new* workflow, while
+  the thing that must service the request is the already-running chain. It is
+  short-lived, entirely gateway-owned, and everything it does to the chain is a
+  same-namespace call.
+- **The handoff is a *synchronous* Nexus operation on purpose.** An async one
+  awaited for the whole window would put a Nexus operation handle inside
+  `AgenticChainWorkflow`, which continues-as-new on Temporal's suggestion and
+  will certainly do so across an open-ended approval. Handles do not survive
+  Continue-As-New — a pending operation is orphaned and its result dropped. A
+  workflow id does survive, because it is data. Same reasoning as storing
+  approval deadlines as absolute timestamps rather than Timers.
+- Workflow code makes the Nexus calls directly; no client, no Activity. The two
+  Activities that remain (`submit_nested_tool_call`, `signal_operation_callback`)
+  connect only to their own namespace.
 - The pipeline discovers canary rather than being configured for it. After the
   quality gates pass it asks the shared platform whether anyone is offering
   canary analysis; Release Safety's worker heartbeats that registration while it
-  runs, and the entry expires on its own when it stops. With no provider, the
-  pipeline opens the production promotion itself, exactly as it did before canary
-  existed.
+  runs, and the entry expires on its own when it stops. The answer is *who*, and
+  nothing about how: window length, threshold, and which versions fail all live
+  behind the endpoint. With no provider, the pipeline opens the production
+  promotion itself, exactly as it did before canary existed.
 - Each ADK Web session maps to one running `TemporalAdkSessionWorkflow`. ADK Web
   submits later user turns as Updates to that same workflow, which owns one ADK
   runner and its conversation state. A new workflow ID is created only when no
@@ -119,25 +141,27 @@ Google ADK Web -> TemporalAdkSessionWorkflow -> MCP Activity
 | --- | --- | --- |
 | CASE-1: simple tool | `promote_release` | Policy gate, wait payload, approve/reject/expire/cancel, invoke, poll result |
 | CASE-2a: pipeline and gates | `run_release_orchestration` (the pipeline) or `run_nested_release` (explicit version) | Fixed release pipeline, quality gates, full call path, child operation, controlled checkpoint/resume, uncontrolled fail-closed/retry |
-| CASE-2b: canary as a separate Tool1 | same pipeline, with Release Safety's worker running | Cross-namespace handoff, a real nested Tool1 -> Tool2 call back into the same `workflow_id`, Tool1 suspending its own execution, Signal-driven wake, fail-closed on a red window |
+| CASE-2b: canary as a separate Tool1 | same pipeline, with Release Safety's worker running | Nexus handoff to another team's endpoint, a real nested Tool1 -> Tool2 call back into the same `workflow_id`, Tool1 suspending on a pending Nexus operation across the approval, fail-closed on a red window |
 | CASE-2b: uncontrolled Tool1 | `release_safety/legacy_canary_script.py` | A stateless process that cannot hold the pause: prints the operation id, exits non-zero, and requires a human `resume_nested_release` |
 | CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run correlation, plan checkpoint, gateway-owned decision, protected action then dependent action |
 
 Services in `docker-compose.yml`: `temporal` (dev server plus Web UI, with both
-the `default` and `release-safety` namespaces), `worker`, `gateway`, `mock-tool`
-(the pretend deployment backend), `adk-agent` (Google ADK Web for CASE-3), and
+the `default` and `release-safety` namespaces), `nexus-endpoints` (registers the
+two Nexus Endpoints, then exits), `worker`, `gateway`, `mock-tool` (the pretend
+deployment backend), `adk-agent` (Google ADK Web for CASE-3), and
 `release-safety-worker` (Release Safety's canary platform).
 
-Tear the whole thing down with:
+`release-safety-worker` sits behind a Compose profile, so **two commands need
+`--profile '*'`** or they silently skip it:
 
 ```
-docker compose --profile '*' down -v
+docker compose --profile '*' build      # or its image stays stale
+docker compose --profile '*' down -v    # or it keeps running after teardown
 ```
 
-The `--profile '*'` matters. `release-safety-worker` sits behind a Compose
-profile, and plain `docker compose down` leaves services from inactive profiles
-running, which would carry the canary capability into your next run-through and
-give away the CASE-2b reveal before you get to it.
+Both failure modes are quiet. A stale image runs last week's code against this
+week's endpoints; a surviving container carries the canary capability into your
+next run-through and gives away the CASE-2b reveal before you get to it.
 
 `release-safety-worker` sits behind a Compose profile and does **not** start with
 `docker compose up`. That is the CASE-2b beat: for CASE-1 and CASE-2a the
@@ -522,38 +546,45 @@ docker compose up -d release-safety-worker
 1. Say `Deploy the next minor version.` again. Same tool, same prompt, no flags.
    The pipeline does exactly what it did in CASE-2a up to the gates.
 2. After the gates pass, the pipeline asks the shared platform whether anyone is
-   offering canary analysis. This run, somebody is. The ledger shows
-   `canary_capability_discovered` and then `canary_handoff`, and the response is
-   `processing` rather than `waiting_for_approval` -- nothing has been asked of an
-   approver, because the promotion has not been requested yet.
+   offering canary analysis. This run, somebody is, so it calls the
+   `release-safety` **Nexus Endpoint** straight from workflow code. The ledger
+   shows `canary_capability_discovered` and then `canary_handoff`, and the
+   response is `processing` rather than `waiting_for_approval` -- nothing has been
+   asked of an approver, because the promotion has not been requested yet.
 3. The pipeline operation parks in `waiting_for_dependency` and a workflow appears
    **in the other namespace**, named
    `release-safety::canary::delivery-matching-service::2.4.0::a1b2c3d4`. Switch
-   the Temporal UI's namespace selector to `release-safety` to watch it. It is a
-   peer of the chain workflow, not a child of it.
+   the Temporal UI's namespace selector to `release-safety` to watch it. The
+   pipeline did not choose that namespace, that task queue, or that workflow
+   type, and cannot see any of them. It called an endpoint.
 4. The canary card animates into the dashboard between the gate and production,
    labelled with its owner, and ticks four times over fifteen seconds.
-5. Only when the window closes green does canary call back into Agent Gateway,
-   with the *original* `workflow_id`, and only then does the production promotion
-   reach the approval queue. Its call path reads
+5. Only when the window closes green does canary call Agent Gateway's
+   `agent-gateway` endpoint, carrying the *original* `workflow_id`, and only then
+   does the production promotion reach the approval queue. Its call path reads
    `release-safety -> release_safety_canary -> promote_release`: one chain, two
-   systems.
+   systems. Canary is now suspended on a pending Nexus operation.
 6. **Kill Release Safety's worker while canary is suspended.**
    `docker compose stop release-safety-worker`. Approve the promotion anyway. The
-   promotion runs, the fleet panel rolls production over, and the ledger records
-   `controlled_caller_notified` -- the gateway delivered the decision across the
-   namespace boundary to a workflow whose worker is not even running.
-7. `docker compose start release-safety-worker`. Canary wakes on the Signal that
-   was waiting for it, records the promotion it never performed and never saw
-   happen, and completes. Its Event History shows four ticks, one nested gateway
-   call, one Signal, and no tick re-runs. That history is the checkpoint the
-   requirements document is asking for, and it belongs to Release Safety, not to
-   Agent Gateway.
-8. To show the fail-closed path, set `CANARY_FAIL_VERSIONS` on `mock-tool` and run
-   the pipeline again. The window dies on its first bad reading, canary signals
-   `canary_verdict_reported`, the pipeline operation fails, and production is
-   never touched. Nobody is asked to approve anything: the same shape as a failed
-   quality gate, one checkpoint later.
+   promotion runs, the fleet panel rolls production over, and
+   `ProtectedActionWorkflow` completes in the gateway's namespace -- which
+   completes the Nexus operation belonging to a workflow whose worker is not
+   even running.
+7. `docker compose start release-safety-worker`. Canary resumes on the completed
+   operation, records the promotion it never performed and never saw happen, and
+   finishes. Its Event History reads: four ticks,
+   `NexusOperationScheduled`/`Started`, a long gap spanning the entire approval,
+   `NexusOperationCompleted`, done. No re-run ticks, no Signal handler, no
+   client. That history is the checkpoint the requirements document is asking
+   for, and it belongs to Release Safety, not to Agent Gateway.
+8. To show the fail-closed path, set `CANARY_FAIL_VERSIONS` on
+   `release-safety-worker` and run the pipeline again. The window dies on its
+   first bad reading, canary reports the outcome through the same endpoint, the
+   pipeline operation fails, and production is never touched. Nobody is asked to
+   approve anything: the same shape as a failed quality gate, one checkpoint
+   later. Note where that knob lives -- on the canary team's worker, not on the
+   shared backend. Which release fails canary is their decision, not their
+   caller's, and recreating their worker no longer resets the fleet.
 
 ### CASE-2b: a Tool1 that genuinely cannot suspend
 
@@ -694,24 +725,34 @@ last known fleet on screen and marks itself stale rather than blanking.
 - Nested fail-closed boundary. CASE-2 never treats an uncontrolled Tool1 stack as
   resumable. Approval and execution are separate states, and explicit replay is
   permitted only with an advertised replay-safe contract.
-- Cross-namespace calls from Activities, never from workflow code. Both
-  directions of the CASE-2b boundary (`start_canary_analysis`,
-  `signal_release_safety_workflow` on one side, `call_agent_gateway_promote` and
-  `report_canary_verdict` on the other) create their own namespace-scoped
-  `Client` inside an Activity, so workflow code stays deterministic.
-- Peers, not parent and child. `CanaryAnalysisWorkflow` is started with
-  `start_workflow`, by type name, in another namespace, with no parent/child link
-  to the chain. A child workflow would have been easier and would have quietly
+- Nexus for cross-team calls, in both directions. Calls go from workflow code to
+  an Endpoint; no client is created, no namespace is named, and no Activity is
+  needed to keep workflow code deterministic. The two Activities that remain on
+  this path talk only to their own namespace.
+- Long-running work as an asynchronous Nexus operation. The caller receives an
+  operation handle and suspends on it; the handler workflow's return value is
+  delivered by Temporal's completion callback. Neither side polls, and neither
+  side has to know the other's workflow id to wake it.
+- Short-lived adapter workflows where a Nexus operation must be serviced by an
+  existing long-lived execution. `ProtectedActionWorkflow` is that adapter, and
+  it keeps the entity workflow out of the Nexus caller role entirely.
+- Nexus operation handles are run-scoped, so a workflow that continues-as-new
+  must not hold one across the boundary. The chain takes a workflow id back from
+  a synchronous operation instead, for the same reason its approval deadlines are
+  absolute timestamps rather than Timers.
+- Peers, not parent and child. `CanaryAnalysisWorkflow` is started by the canary
+  team's own Nexus handler, in their namespace, with no parent/child link to the
+  chain. A child workflow would have been easier and would have quietly
   reintroduced shared ownership and a shared lifecycle.
-- Signal handlers still only mutate state, on both sides. The chain's
-  `canary_verdict_reported` handler and canary's `gateway_operation_resolved`
-  handler each record and return; the Activities that follow are driven from the
-  main loop, off durable operation state rather than an in-memory queue, so a
-  Worker restart mid-notification picks the work back up.
-- Contracts across a team boundary are duplicated on purpose. Each side declares
-  its own copy of the payloads they exchange rather than sharing an internal
-  package, and `tests/test_release_safety_contract.py` is what stops them
-  drifting.
+- Signal handlers still only mutate state. The chain's `canary_verdict_reported`
+  handler and the adapter's `operation_resolved` handler each record and return;
+  the Activities that follow are driven from the main loop, off durable operation
+  state rather than an in-memory queue, so a Worker restart mid-notification
+  picks the work back up.
+- Published interfaces, not mirrored internals. Each side declares the same Nexus
+  service contract -- endpoint names, operation names, payload field names -- and
+  `tests/test_release_safety_contract.py` checks they agree and that neither side
+  has reacquired knowledge of the other's topology.
 
 ## Honest caveats
 
@@ -745,21 +786,28 @@ last known fleet on screen and marks itself stale rather than blanking.
   error-rate sequence so a demo run is repeatable. In a real Release Safety
   platform that Activity queries a metrics store; nothing else about the workflow
   changes.
-- Canary acts on the requester's behalf. The nested `promote_release` call
-  carries the chain owner as `caller_principal`, because the gateway checks a
-  nested call against the chain's owner, with canary's own identity alongside it
-  in `caller_service` and the call path. A production system would model this as
+- Canary acts on the requester's behalf. The protected-action request carries the
+  chain owner as `caller_principal`, because the gateway checks a nested call
+  against the chain's owner, with canary's own identity alongside it in
+  `caller_service` and the call path. A production system would model this as
   explicit delegation -- canary holding its own principal and the gateway
   authorizing it to act for the requester -- rather than relaying the identity.
-- A parked pipeline operation has no deadline of its own. It waits on canary's
-  verdict, and canary's approval request carries the normal approval window, but
-  a canary workflow that is never scheduled (no worker ever starts on
-  `release-safety-tq`) leaves the pipeline operation waiting. Production should
-  give the handoff its own timeout.
+  Nexus makes this cleaner than it was but does not solve it: an endpoint
+  authorizes a caller to reach a service, not to act as a particular person.
+- A parked pipeline operation has no deadline of its own. A canary workflow that
+  is never scheduled (no worker ever starts on `release-safety-tq`) leaves the
+  pipeline operation waiting. The handoff operation has a schedule-to-close
+  timeout, but that only covers opening the window, not the window itself.
+  Production should give the parked operation its own deadline.
 - Two namespaces on one dev server is the right shape but not the full claim.
   Real independent ownership also means separate deployments, separate retention
-  policy, and separate operators; this demo gets the boundary and the failure
-  domain right and shares a cluster.
+  policy, separate operators, and endpoint-level authorization; this demo gets
+  the boundary and the failure domain right and shares a cluster.
+- `ProtectedActionWorkflow` is an adapter, and adapters are a cost. It exists
+  only because a workflow-backed Nexus operation starts a new workflow while the
+  request has to reach an existing entity workflow. If the gateway's chain were
+  per-release rather than per-session, the Nexus operation could target it
+  directly and this workflow would not exist.
 - The Temporal Google ADK integration is currently experimental. This demo uses
   a fixed signal and authenticated callback metadata; production should also
   issue a signed, single-use callback registration token and authorize the target
@@ -795,13 +843,11 @@ Set via environment in `docker-compose.yml`.
 - `ADK_MODEL` model used by the ADK agent. Default `gemini-3.6-flash`.
 - `GOOGLE_API_KEY` Gemini API credential injected into the worker at runtime. It
   is deliberately absent from the Docker image and ADK Web container.
-- `RELEASE_SAFETY_NAMESPACE` / `RELEASE_SAFETY_TASK_QUEUE` where the gateway
-  worker reaches Release Safety's canary platform. Defaults `release-safety` and
-  `release-safety-tq`.
-- `TEMPORAL_NAMESPACE` namespace the Release Safety worker serves. Default
-  `release-safety`.
-- `AGENT_GATEWAY_NAMESPACE` namespace the canary Activities call back into.
-  Default `default`.
+- `TEMPORAL_NAMESPACE` the namespace a worker serves, and the only one it
+  connects to. `default` for the gateway worker, `release-safety` for the canary
+  worker. There is no configuration for reaching the *other* team, because
+  reaching them is a Nexus Endpoint, and endpoint names are part of the contract
+  in `common/nexus_contracts.py` and `release_safety/nexus_contracts.py`.
 - `RELEASE_SAFETY_METRICS_URL` shared observability backend the canary reports
   window progress and its capability heartbeat to. Default
   `http://mock-tool:9000/invoke`.
@@ -809,7 +855,9 @@ Set via environment in `docker-compose.yml`.
   re-advertises canary analysis. Default `5`; the registration's TTL is four
   times this, so stopping the worker withdraws the capability within ~20s.
 - `CANARY_FAIL_VERSIONS` comma separated versions whose canary window fails, so
-  the fail-closed path can be shown on demand. Empty by default.
+  the fail-closed path can be shown on demand. Empty by default. Set on
+  `release-safety-worker`, not on `mock-tool`: it is the canary team's verdict
+  rule, and putting it anywhere else would let the caller decide its own result.
 
 The idle timeout is not an environment variable. It is the `IDLE_TIMEOUT_SECONDS`
 constant in `workflows/chain.py`, set to 24 hours, kept in code so every Worker
@@ -817,10 +865,10 @@ agrees on it. Lower it and rebuild the worker to demo the idle close.
 
 The canary window is not an environment variable either. It is
 `CANARY_TICK_SECONDS` and `CANARY_WINDOW_TICKS` in `release_safety/models.py`,
-four ticks five seconds apart, because how long a canary window runs is the
-Release Safety team's decision and not a caller's. Their worker publishes the
-shape it is using in its capability registration and the pipeline relays it back
-when it starts a window, so the two can never disagree.
+four ticks five seconds apart, read by their Nexus handler when it opens a
+window. How long a canary window runs is the Release Safety team's decision, so
+it is not on the wire at all: `OpenCanaryWindowInput` has no field for it, and
+the pipeline could not set it if it wanted to.
 
 ## Production notes
 
@@ -835,11 +883,16 @@ when it starts a window, so the two can never disagree.
 
 ```
 common/models.py            shared dataclasses and enums
+common/nexus_contracts.py   the gateway's half of the Nexus boundary: endpoint
+                            names, service definitions, payload types
 common/semver.py            version bump arithmetic for the release pipeline
 gateway_call.py             call one gateway tool directly, for operator actions
 workflows/chain.py          AgenticChainWorkflow (entity workflow, CAN, idle close)
 workflows/autonomous_agent.py  CASE-3 durable autonomous-agent checkpoint
 workflows/adk_session.py     long-lived ADK session, turn Updates, callback receiver
+workflows/nexus_handlers.py  the gateway's Nexus front door for other teams
+workflows/protected_action.py  short-lived adapter: holds one external tool's
+                            request open until a human decides
 adk_agents/release_approval_agent/  Dashy agent, Temporal integration, Web proxy
 adk_agents/run_temporal_session.py  CLI client for the same ADK session workflow
 activities/gateway_activities.py  evaluate_policy, invoke_tool, and the two
@@ -852,10 +905,13 @@ tests/                      Temporal scenarios, gateway contract, and ADK agent 
 release_safety/             the Release Safety team's canary platform. A separate
                             package, a separate namespace, a separate worker, and
                             no imports from anything above this line.
-  models.py                 their dataclasses, and their copy of the wire contract
+  models.py                 their dataclasses, and their window's shape
+  nexus_contracts.py        their half of the Nexus boundary, declared
+                            independently of the gateway's
+  nexus_handlers.py         their Nexus front door: open_canary_window
   canary_workflow.py        CanaryAnalysisWorkflow: the window, the nested call,
                             and the suspension that outlives their worker
-  canary_activities.py      the tick, the call into Agent Gateway, the verdict
+  canary_activities.py      the tick, and reporting progress for the dashboard
   worker.py                 release-safety-tq worker and its capability heartbeat
   legacy_canary_script.py   the uncontrolled Tool1: a plain process, no temporalio
 ```

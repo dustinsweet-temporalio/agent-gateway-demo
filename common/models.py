@@ -164,13 +164,12 @@ class NestedToolCallRequest:
     replay_safe: bool = False
     safe_tool1_arguments: dict[str, Any] = field(default_factory=dict)
     safe_tool2_arguments: dict[str, Any] = field(default_factory=dict)
-    # Set when Tool1 is a durable system running somewhere else and wants the
-    # terminal result delivered back to it. The gateway stores it on the nested
-    # operation and signals that workflow once the operation resolves, instead of
-    # the caller having to hold an open request or poll. Empty for every caller
-    # that is not independently durable, which is every CASE-2a caller.
+    # Set when something is holding this request open and needs the terminal
+    # result delivered rather than polled for. In CASE-2b that is
+    # ProtectedActionWorkflow, which is servicing a Nexus operation another team
+    # is suspended on. Empty for every caller that waits inline, which is every
+    # CASE-2a caller.
     callback_workflow_id: str = ""
-    callback_namespace: str = ""
     # An operation elsewhere in this chain that is waiting on this nested call to
     # resolve. CASE-2b sets it to the release pipeline's own operation, which
     # handed off to canary analysis and is parked until the promotion lands.
@@ -186,60 +185,47 @@ class ResumeNestedRequest:
 
 
 # --------------------------------------------------------------------------
-# Release Safety boundary (CASE-2b).
+# Serving other teams' tools (CASE-2b).
 #
-# Canary analysis is a different team's system, in a different Temporal
-# namespace, deployed on its own cadence. These three dataclasses are the wire
-# contract between the two, and release_safety/models.py deliberately declares
-# its own identical copies rather than importing these. Two independently owned
-# services do not share an internal Python package: they agree on a payload
-# shape and each keeps its own definition of it. The duplication is the point,
-# and it is exactly what makes the boundary real rather than decorative.
+# Everything below is internal to the gateway. The cross-team boundary is a
+# Nexus Endpoint and lives in common/nexus_contracts.py; by the time any of
+# these types are in play, the call has already crossed it and is being handled
+# by the gateway's own workflows in the gateway's own namespace.
+#
+# That split is the whole design. There used to be a set of types here that were
+# hand-mirrored in release_safety/models.py, because both sides had to agree on
+# an internal request struct. They do not any more.
 # --------------------------------------------------------------------------
 
 
 @dataclass
-class StartCanaryAnalysisInput:
-    """Ask the Release Safety team's platform to open a canary window.
+class SubmitNestedToolCallInput:
+    """Input for the Activity that lodges an external tool's request.
 
-    Sent from the chain workflow's namespace into release-safety's. Carries the
-    chain workflow_id so that when canary calls back, the nested tool call lands
-    on the same user-visible task, per the requirements document's correlation
-    model (explicit propagation).
+    ProtectedActionWorkflow cannot issue an Update from workflow code, so it goes
+    through this. Same namespace, same worker, same team: this is the gateway
+    calling its own chain workflow, not a cross-cluster reach.
     """
 
     gateway_workflow_id: str
-    gateway_namespace: str
-    origin_operation_id: str
-    service: str
-    version: str
-    environment: str
+    tool_name: str
+    arguments: dict[str, Any]
     idempotency_key: str
-    requester: str
-    scripted_outcome: str = "pass"
-    # The window shape Release Safety advertises for itself. The gateway relays
-    # it back rather than choosing it: how long a canary window runs is the
-    # canary team's call, and the pipeline only repeats what they published.
-    tick_seconds: int = 5
-    window_ticks: int = 4
-
-
-@dataclass
-class CanaryAnalysisStarted:
-    """What the Release Safety platform hands back when a window opens."""
-
-    canary_workflow_id: str
-    canary_run_id: str
-    namespace: str
-    task_queue: str
+    caller_service: str
+    caller_principal: str
+    caller_workflow_id: str
+    callback_workflow_id: str
+    origin_operation_id: str = ""
+    justification: str = ""
 
 
 @dataclass
 class GatewayOperationResolution:
-    """Terminal operation result delivered back to a durable external Tool1.
+    """A terminal operation, reported to whatever is holding the request open.
 
-    Mirrored by release_safety.models.GatewayOperationResolution. Field names are
-    the contract; the JSON payload converter matches on them.
+    Delivered as a Signal to ProtectedActionWorkflow, in this namespace. It is
+    not a cross-team payload: the external caller never sees this, it sees the
+    Nexus operation complete.
     """
 
     operation_id: str
@@ -249,11 +235,10 @@ class GatewayOperationResolution:
 
 
 @dataclass
-class SignalReleaseSafetyInput:
-    """Input for the gateway-side Activity that delivers the resolution Signal."""
+class SignalOperationCallbackInput:
+    """Input for the Activity that delivers a resolution to a waiting workflow."""
 
     callback_workflow_id: str
-    callback_namespace: str
     operation_id: str
     status: str
     result: Optional[Any] = None
@@ -262,12 +247,14 @@ class SignalReleaseSafetyInput:
 
 @dataclass
 class CanaryVerdict:
-    """Canary's own verdict, signaled to the chain workflow.
+    """A checkpoint's verdict, signaled to the chain workflow.
 
-    Only the failing verdict needs this: a passing canary reports itself by
-    making the nested promote_release call. A failing one never calls, so
-    without this the release pipeline operation that handed off to canary would
-    wait forever for a promotion that is never going to be requested.
+    Only a failing verdict needs this: a passing canary reports itself by
+    requesting the promotion. A failing one never asks for anything, so without
+    it the pipeline operation parked on the handoff would wait forever for a
+    request that is not coming.
+
+    Raised into the chain by the gateway's own Nexus handler, not by the caller.
     """
 
     origin_operation_id: str
@@ -335,10 +322,10 @@ class Operation:
     controlled_tool: bool = True
     replay_safe: bool = False
     checkpoint: dict[str, Any] = field(default_factory=dict)
-    # Durable Tool1 running in another system, to be signaled when this operation
-    # reaches a terminal state. See NestedToolCallRequest.callback_workflow_id.
+    # A workflow in this namespace holding a request open on someone's behalf,
+    # to be signaled when this operation reaches a terminal state. See
+    # NestedToolCallRequest.callback_workflow_id.
     callback_workflow_id: str = ""
-    callback_namespace: str = ""
     callback_notified: bool = False
     origin_operation_id: str = ""
 

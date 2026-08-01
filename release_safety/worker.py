@@ -18,19 +18,11 @@ import requests
 from temporalio.client import Client
 from temporalio.worker import Worker
 
-from release_safety.canary_activities import (
-    call_agent_gateway_promote,
-    publish_canary_state,
-    report_canary_verdict,
-    run_canary_tick,
-)
+from release_safety.canary_activities import publish_canary_state, run_canary_tick
 from release_safety.canary_workflow import CanaryAnalysisWorkflow
-from release_safety.models import (
-    CANARY_NAMESPACE,
-    CANARY_TASK_QUEUE,
-    CANARY_TICK_SECONDS,
-    CANARY_WINDOW_TICKS,
-)
+from release_safety.nexus_handlers import ReleaseSafetyServiceHandler
+from release_safety.models import CANARY_NAMESPACE, CANARY_TASK_QUEUE
+from release_safety.nexus_contracts import RELEASE_SAFETY_ENDPOINT
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
 NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", CANARY_NAMESPACE)
@@ -61,14 +53,11 @@ async def _announce_forever() -> None:
                         "tool_name": "register_canary_capability",
                         "arguments": {
                             "provider": "release-safety",
-                            "namespace": NAMESPACE,
-                            "task_queue": TASK_QUEUE,
-                            "workflow_type": "CanaryAnalysisWorkflow",
-                            # This team's window shape, published so callers
-                            # know what they are waiting for rather than
-                            # deciding it for us.
-                            "tick_seconds": CANARY_TICK_SECONDS,
-                            "window_ticks": CANARY_WINDOW_TICKS,
+                            # The endpoint, not the namespace or task queue
+                            # behind it. Advertising those would hand callers
+                            # exactly the coupling the endpoint exists to
+                            # prevent.
+                            "endpoint": RELEASE_SAFETY_ENDPOINT,
                             "ttl_seconds": HEARTBEAT_SECONDS * 4,
                         },
                     },
@@ -90,12 +79,10 @@ async def main() -> None:
             client,
             task_queue=TASK_QUEUE,
             workflows=[CanaryAnalysisWorkflow],
-            activities=[
-                run_canary_tick,
-                call_agent_gateway_promote,
-                report_canary_verdict,
-                publish_canary_state,
-            ],
+            activities=[run_canary_tick, publish_canary_state],
+            # This team's Nexus front door. Agent Gateway reaches it through the
+            # `release-safety` Endpoint and never learns what is behind it.
+            nexus_service_handlers=[ReleaseSafetyServiceHandler()],
             activity_executor=executor,
             identity=f"release-safety-worker@{os.getenv('HOSTNAME', 'local')}",
         )

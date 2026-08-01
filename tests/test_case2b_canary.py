@@ -28,20 +28,22 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import os
 import shutil
 import time
 import uuid
 
 from temporalio import activity
+from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
+from temporalio.api.operatorservice.v1 import CreateNexusEndpointRequest
 from temporalio.client import Client, WorkflowHandle
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
 import activities.gateway_activities as gateway_activities
-import release_safety.canary_activities as canary_activities
 from activities.gateway_activities import (
-    signal_release_safety_workflow,
-    start_canary_analysis,
+    signal_operation_callback,
+    submit_nested_tool_call,
 )
 from common.models import (
     ApprovalDecision,
@@ -53,13 +55,17 @@ from common.models import (
     PolicyDecision,
 )
 from mock_tool import server as backend
-from release_safety.canary_activities import (
-    call_agent_gateway_promote,
-    report_canary_verdict,
-    run_canary_tick,
-)
+import release_safety.models as safety_models
+from release_safety.canary_activities import run_canary_tick
 from release_safety.canary_workflow import CanaryAnalysisWorkflow
 from release_safety.models import CanaryResult, PublishCanaryStateInput
+from release_safety.nexus_contracts import (
+    AGENT_GATEWAY_ENDPOINT,
+    RELEASE_SAFETY_ENDPOINT,
+)
+from release_safety.nexus_handlers import ReleaseSafetyServiceHandler
+from workflows.nexus_handlers import AgentGatewayServiceHandler
+from workflows.protected_action import ProtectedActionWorkflow
 from workflows.chain import AgenticChainWorkflow
 
 GATEWAY_TASK_QUEUE = "test-agent-gateway-2b"
@@ -69,9 +75,10 @@ SERVICE = "delivery-matching-service"
 PRINCIPAL = "requester@example.com"
 
 # A one-second, two-tick window. The real one is four ticks five seconds apart,
-# which is right for a live demo and wrong for a test suite. The shape is
-# advertised by the provider registration, so shortening it here goes through the
-# same path the real worker uses rather than through a test-only branch.
+# which is right for a live demo and wrong for a test suite. Patched onto the
+# canary team's own module, because that is where the window's shape lives now:
+# the caller cannot set it, so a test cannot either without standing where the
+# canary team stands.
 TEST_TICK_SECONDS = 1
 TEST_WINDOW_TICKS = 2
 
@@ -92,19 +99,23 @@ def _reset_backend(*, canary_available: bool, fail_versions: set[str] | None = N
     backend._seen.clear()
     backend._quality_gates = None
     backend._canary = None
-    backend.CANARY_FAIL_VERSIONS = set(fail_versions or set())
+    # The window's shape and its verdict rule both belong to the canary team, so
+    # both are set on their module rather than passed in by anyone.
+    safety_models.CANARY_TICK_SECONDS = TEST_TICK_SECONDS
+    safety_models.CANARY_WINDOW_TICKS = TEST_WINDOW_TICKS
+    safety_models.CANARY_TASK_QUEUE = CANARY_TASK_QUEUE
+    os.environ["CANARY_FAIL_VERSIONS"] = ",".join(sorted(fail_versions or set()))
     # Registering a provider is what "the Release Safety team has shipped canary"
     # means. Not registering one is CASE-2a, and the pipeline cannot tell the
     # difference between a team that has not built it yet and a team whose worker
     # is currently down, which is correct: in both cases nobody is offering it.
+    #
+    # Note what the registration no longer carries: no namespace, no task queue,
+    # no workflow type. Just who, and the endpoint to reach them on.
     backend._canary_provider = (
         {
             "provider": "release-safety",
-            "namespace": CANARY_NAMESPACE,
-            "task_queue": CANARY_TASK_QUEUE,
-            "workflow_type": "CanaryAnalysisWorkflow",
-            "tick_seconds": TEST_TICK_SECONDS,
-            "window_ticks": TEST_WINDOW_TICKS,
+            "endpoint": RELEASE_SAFETY_ENDPOINT,
             "ttl_seconds": 300.0,
             "last_seen": time.time(),
         }
@@ -175,11 +186,12 @@ async def fake_publish_canary_state(input: PublishCanaryStateInput) -> dict:
 
 
 async def _environment() -> WorkflowEnvironment:
-    """A dev server with both namespaces, and the module constants pointed at it.
+    """A dev server with both namespaces and both Nexus Endpoints registered.
 
-    The two cross-namespace Activities resolve their addresses from module-level
-    constants read at import time, which is right for a container and wrong for a
-    test against an ephemeral server, so they are repointed here.
+    The endpoints are the whole topology now. Each names a target namespace and
+    task queue, and neither team's code contains either: that indirection is
+    what the design buys, so the test has to set it up the same way production
+    does rather than by patching constants into the callers.
     """
     temporal = shutil.which("temporal")
     assert temporal, "Temporal CLI is required for workflow tests"
@@ -188,26 +200,49 @@ async def _environment() -> WorkflowEnvironment:
         dev_server_log_level="error",
         dev_server_extra_args=["--namespace", CANARY_NAMESPACE],
     )
-    address = env.client.service_client.config.target_host
-    gateway_activities.TEMPORAL_ADDRESS = address
-    gateway_activities.RELEASE_SAFETY_NAMESPACE = CANARY_NAMESPACE
-    gateway_activities.RELEASE_SAFETY_TASK_QUEUE = CANARY_TASK_QUEUE
-    canary_activities.TEMPORAL_ADDRESS = address
-    canary_activities.GATEWAY_NAMESPACE = env.client.namespace
+    # The gateway's own Activities connect to their own namespace by address,
+    # which is a container default and wrong for an ephemeral test server.
+    gateway_activities.TEMPORAL_ADDRESS = env.client.service_client.config.target_host
+    gateway_activities.TEMPORAL_NAMESPACE = env.client.namespace
+
+    await _create_endpoint(
+        env, AGENT_GATEWAY_ENDPOINT, env.client.namespace, GATEWAY_TASK_QUEUE
+    )
+    await _create_endpoint(
+        env, RELEASE_SAFETY_ENDPOINT, CANARY_NAMESPACE, CANARY_TASK_QUEUE
+    )
     return env
+
+
+async def _create_endpoint(
+    env: WorkflowEnvironment, name: str, namespace: str, task_queue: str
+) -> None:
+    await env.client.operator_service.create_nexus_endpoint(
+        CreateNexusEndpointRequest(
+            spec=EndpointSpec(
+                name=name,
+                target=EndpointTarget(
+                    worker=EndpointTarget.Worker(
+                        namespace=namespace, task_queue=task_queue
+                    )
+                ),
+            )
+        )
+    )
 
 
 def _gateway_worker(env: WorkflowEnvironment) -> Worker:
     return Worker(
         env.client,
         task_queue=GATEWAY_TASK_QUEUE,
-        workflows=[AgenticChainWorkflow],
+        workflows=[AgenticChainWorkflow, ProtectedActionWorkflow],
         activities=[
             fake_evaluate_policy,
             backend_invoke_tool,
-            start_canary_analysis,
-            signal_release_safety_workflow,
+            submit_nested_tool_call,
+            signal_operation_callback,
         ],
+        nexus_service_handlers=[AgentGatewayServiceHandler()],
     )
 
 
@@ -217,12 +252,8 @@ def _canary_worker(client: Client) -> Worker:
         client,
         task_queue=CANARY_TASK_QUEUE,
         workflows=[CanaryAnalysisWorkflow],
-        activities=[
-            run_canary_tick,
-            call_agent_gateway_promote,
-            report_canary_verdict,
-            fake_publish_canary_state,
-        ],
+        activities=[run_canary_tick, fake_publish_canary_state],
+        nexus_service_handlers=[ReleaseSafetyServiceHandler()],
         # run_canary_tick is synchronous, exactly as it is in the real worker.
         activity_executor=concurrent.futures.ThreadPoolExecutor(max_workers=8),
     )
@@ -358,11 +389,16 @@ async def _window_runs_and_suspends(
     assert parent.status == "waiting_for_dependency"
     assert parent.checkpoint["stage"] == "awaiting_canary"
     assert parent.checkpoint["canary_provider"] == "release-safety"
-    assert parent.checkpoint["canary_namespace"] == CANARY_NAMESPACE
+    # An endpoint, not a namespace. The pipeline recorded who it handed to and
+    # how to reach them, and that is the entire extent of what it knows.
+    assert parent.checkpoint["canary_endpoint"] == RELEASE_SAFETY_ENDPOINT
+    assert "canary_namespace" not in parent.checkpoint
+    assert "canary_task_queue" not in parent.checkpoint
     canary_workflow_id = parent.checkpoint["canary_workflow_id"]
 
-    # The workflow it started is in the OTHER namespace, under a workflow id that
-    # does not look like anything Agent Gateway owns.
+    # A workflow really did start in the OTHER namespace, on the other team's
+    # task queue, under an id that looks nothing like anything Agent Gateway
+    # owns -- none of which the gateway chose or could see.
     assert canary_workflow_id.startswith("release-safety::canary::")
     canary = canary_client.get_workflow_handle(canary_workflow_id)
     describe = await canary.describe()
@@ -394,7 +430,13 @@ async def _window_runs_and_suspends(
     assert status.verdict == "pass"
     assert status.ticks_completed == TEST_WINDOW_TICKS
     assert status.gateway_workflow_id == handle.id
-    assert status.gateway_operation_id == promotion.operation_id
+    # What canary holds while it waits is a Nexus operation token, not Agent
+    # Gateway's internal operation id. It is suspended on an operation it owns a
+    # handle to, rather than polling somebody else's record by id, and the
+    # gateway's id only reaches it with the outcome. That is the boundary doing
+    # its job: canary correlates on the thing that is actually its own.
+    assert status.gateway_operation_token
+    assert status.gateway_operation_id is None
     assert backend._deployed["prod"]["version"] == "2.2.0"
     return handle, promotion, status
 

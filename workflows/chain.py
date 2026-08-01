@@ -23,26 +23,33 @@ with workflow.unsafe.imports_passed_through():
         OperationView,
         NestedToolCallRequest,
         ResumeNestedRequest,
-        SignalReleaseSafetyInput,
-        StartCanaryAnalysisInput,
+        SignalOperationCallbackInput,
         ToolCallRequest,
         ToolCallResponse,
+    )
+    from common.nexus_contracts import (
+        OpenCanaryWindowInput,
+        RELEASE_SAFETY_ENDPOINT,
+        ReleaseSafetyService,
     )
     from common.semver import InvalidVersionError, next_version, normalize_bump
     from activities.gateway_activities import (
         evaluate_policy,
         invoke_tool,
-        signal_release_safety_workflow,
-        start_canary_analysis,
+        signal_operation_callback,
     )
 
 
 POLICY_TIMEOUT = timedelta(seconds=10)
 INVOKE_TIMEOUT = timedelta(seconds=60)
-# Reaching another team's namespace: starting their workflow, and delivering a
-# decision back to it. Both are short calls, and both are worth retrying hard,
-# because the second one is what wakes a system that is deliberately asleep.
-RELEASE_SAFETY_TIMEOUT = timedelta(seconds=30)
+# Opening a canary window with Release Safety. A Nexus call to another team's
+# endpoint, and a short one: their handler starts a workflow and hands back its
+# id rather than waiting for the window to close. See _hand_off_to_canary for
+# why it must not be the other way round.
+CANARY_HANDOFF_TIMEOUT = timedelta(seconds=30)
+# Delivering a decision to whatever is holding a request open. Same namespace,
+# but worth retrying hard: it is what wakes a system that is deliberately asleep.
+CALLBACK_TIMEOUT = timedelta(seconds=30)
 
 # Idle timeout for an agentic chain. A chain that has no pending work and receives
 # no new tool call or decision for this long completes on its own. This is a fixed
@@ -908,16 +915,15 @@ class AgenticChainWorkflow:
                 op.callback_notified = True
                 try:
                     await workflow.execute_activity(
-                        signal_release_safety_workflow,
-                        SignalReleaseSafetyInput(
+                        signal_operation_callback,
+                        SignalOperationCallbackInput(
                             callback_workflow_id=op.callback_workflow_id,
-                            callback_namespace=op.callback_namespace,
                             operation_id=op.operation_id,
                             status=op.status.value,
                             result=op.result,
                             reason=op.error,
                         ),
-                        start_to_close_timeout=RELEASE_SAFETY_TIMEOUT,
+                        start_to_close_timeout=CALLBACK_TIMEOUT,
                         retry_policy=RetryPolicy(maximum_attempts=5),
                     )
                     self._log(
@@ -1295,14 +1301,11 @@ class AgenticChainWorkflow:
             return None
         if not status.get("available"):
             return None
-        handoff = {
-            "provider": str(status.get("provider", "release-safety")),
-            "namespace": str(status.get("namespace", "release-safety")),
-            "task_queue": str(status.get("task_queue", "release-safety-tq")),
-            "scripted_outcome": str(status.get("scripted_outcome", "pass")),
-            "tick_seconds": int(status.get("tick_seconds", 5)),
-            "window_ticks": int(status.get("window_ticks", 4)),
-        }
+        # Just who is offering, and nothing about how they do it. The window's
+        # length, its threshold, and which versions it rejects all used to be
+        # relayed through here, which meant the caller was telling the canary
+        # what verdict to reach. They live behind the endpoint now.
+        handoff = {"provider": str(status.get("provider", "release-safety"))}
         self._log(
             "canary_capability_discovered",
             parent,
@@ -1323,13 +1326,26 @@ class AgenticChainWorkflow:
         every step was Waypoint's own work, correctly modeled as ordinary
         Activities inside this workflow, because one team genuinely owns cutting
         and staging and gating a release. Canary analysis is not that. It is
-        another team's system, in another namespace, on another worker, and what
-        happens next is a real handoff to it rather than another Activity.
+        another team's system, and what happens next is a real handoff to it.
 
-        The pipeline operation is parked, not finished. It is waiting on a
-        verdict from a system it does not control, and the thing that eventually
-        completes it is a call arriving back from that system. Nothing else in
-        this workflow is blocked meanwhile: the chain keeps taking tool calls and
+        The handoff is a Nexus call, straight from workflow code, to an endpoint
+        Release Safety owns. Notice everything this workflow does not know: not
+        their namespace, not their task queue, not their workflow type, not how
+        long a canary window runs, and not what would make one fail. It knows an
+        endpoint name and an operation contract, and they can change everything
+        behind it without this file being edited.
+
+        The operation is deliberately synchronous, returning as soon as the
+        window is open. An asynchronous operation awaited for the whole window
+        would read better right up until this workflow continued-as-new, which it
+        does on Temporal's suggestion and will certainly do across an open-ended
+        human approval. Nexus operation handles do not survive Continue-As-New;
+        a workflow id does, because it is data. So the pipeline takes the id and
+        parks on its own state, which is the same reason approval deadlines here
+        are absolute timestamps rather than Timers.
+
+        The pipeline operation is parked, not finished. Nothing else in this
+        workflow is blocked meanwhile: the chain keeps taking tool calls and
         approvals for anything else the operator is doing.
 
         A canary that cannot be started stops the release. The alternative is
@@ -1337,26 +1353,24 @@ class AgenticChainWorkflow:
         confirmed was in force, which is exactly the thing the gate machinery
         exists to refuse.
         """
+        canary = workflow.create_nexus_client(
+            service=ReleaseSafetyService, endpoint=RELEASE_SAFETY_ENDPOINT
+        )
         try:
-            started = await workflow.execute_activity(
-                start_canary_analysis,
-                StartCanaryAnalysisInput(
+            opened = await canary.execute_operation(
+                ReleaseSafetyService.open_canary_window,
+                OpenCanaryWindowInput(
                     gateway_workflow_id=self._state.workflow_id,
-                    gateway_namespace=workflow.info().namespace,
                     origin_operation_id=parent.operation_id,
                     service=str(parent.arguments.get("service", "")),
                     version=version,
                     environment=str(parent.arguments.get("environment", "")),
                     idempotency_key=f"{req.idempotency_key}:canary",
                     requester=parent.requester or "",
-                    scripted_outcome=handoff.get("scripted_outcome", "pass"),
-                    tick_seconds=handoff.get("tick_seconds", 5),
-                    window_ticks=handoff.get("window_ticks", 4),
                 ),
-                start_to_close_timeout=RELEASE_SAFETY_TIMEOUT,
-                retry_policy=RetryPolicy(maximum_attempts=3),
+                schedule_to_close_timeout=CANARY_HANDOFF_TIMEOUT,
             )
-        except ActivityError as err:
+        except Exception as err:
             parent.status = OperationStatus.FAILED
             parent.error = (
                 f"Could not open a canary window with "
@@ -1372,9 +1386,8 @@ class AgenticChainWorkflow:
             **parent.checkpoint,
             "stage": "awaiting_canary",
             "canary_provider": handoff["provider"],
-            "canary_namespace": started.namespace,
-            "canary_task_queue": started.task_queue,
-            "canary_workflow_id": started.canary_workflow_id,
+            "canary_endpoint": RELEASE_SAFETY_ENDPOINT,
+            "canary_workflow_id": opened.canary_workflow_id,
         }
         self._log(
             "canary_handoff",
@@ -1382,8 +1395,8 @@ class AgenticChainWorkflow:
             {
                 "version": version,
                 "provider": handoff["provider"],
-                "namespace": started.namespace,
-                "canary_workflow_id": started.canary_workflow_id,
+                "endpoint": RELEASE_SAFETY_ENDPOINT,
+                "canary_workflow_id": opened.canary_workflow_id,
             },
         )
         response = self._response_for(parent)
@@ -1619,7 +1632,6 @@ class AgenticChainWorkflow:
             # The child is the operation the external Tool1 was told to wait on,
             # so its terminal status is what gets delivered back.
             callback_workflow_id=req.callback_workflow_id,
-            callback_namespace=req.callback_namespace,
         )
 
     def _response_for(self, op: Operation) -> ToolCallResponse:

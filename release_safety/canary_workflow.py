@@ -8,27 +8,31 @@ from temporalio.exceptions import ActivityError
 
 with workflow.unsafe.imports_passed_through():
     from release_safety.models import (
-        AgentGatewayPromoteInput,
         CanaryAnalysisInput,
         CanaryResult,
         CanaryState,
         CanaryStatusView,
         CanaryTickInput,
         CANARY_THRESHOLD,
-        GatewayOperationResolution,
         PublishCanaryStateInput,
-        ReportCanaryVerdictInput,
+    )
+    from release_safety.nexus_contracts import (
+        AGENT_GATEWAY_ENDPOINT,
+        AgentGatewayService,
+        ProtectedActionRequest,
+        ToolOutcomeReport,
     )
     from release_safety.canary_activities import (
-        call_agent_gateway_promote,
         publish_canary_state,
-        report_canary_verdict,
         run_canary_tick,
     )
 
 TICK_TIMEOUT = timedelta(seconds=15)
-GATEWAY_CALL_TIMEOUT = timedelta(seconds=30)
 PUBLISH_TIMEOUT = timedelta(seconds=10)
+# The gateway holds this open across a human decision, so there is no useful
+# upper bound short of the approval window itself plus slack.
+PROTECTED_ACTION_TIMEOUT = timedelta(minutes=30)
+REPORT_TIMEOUT = timedelta(seconds=30)
 
 
 @workflow.defn
@@ -46,15 +50,21 @@ class CanaryAnalysisWorkflow:
     The shape of the run is:
 
         watch the canary window, tick by tick, entirely on its own
-        if any tick is over threshold, stop; the gateway is never called
-        otherwise, call Agent Gateway to request the prod promotion
-        the gateway says waiting_for_approval, so record that and STOP HERE
-        wake on the Signal the gateway sends once a human decides
+        if any tick is over threshold, stop; the gateway is never asked
+        otherwise, call Agent Gateway's Nexus endpoint to request the promotion
+        SUSPEND on that operation until a human somewhere decides
 
-    The stop is the whole point. It is a real suspension of this workflow's own
-    execution, not of Agent Gateway's: kill this worker while the wait is open
-    and the window's results, the verdict, and the operation id all come back on
-    replay, with the wait resuming exactly where it was.
+    The stop is the whole point, and it is a real suspension of this workflow's
+    own execution rather than of Agent Gateway's. Kill this worker while the
+    operation is pending and the window's results, the verdict, and the pending
+    operation all come back on replay, with the wait resuming exactly where it
+    was.
+
+    Note how little this workflow knows about the other side. It calls an
+    endpoint by name. It does not know Agent Gateway's namespace, holds no
+    credentials for it, names none of its workflows, and does not construct any
+    of its internal types. There is no callback Signal to receive, because the
+    Nexus operation's own completion is the answer.
     """
 
     @workflow.init
@@ -65,10 +75,6 @@ class CanaryAnalysisWorkflow:
             window_ticks=input.window_ticks,
             gateway_workflow_id=input.workflow_id,
         )
-        # Set before any handler can run, because the gateway's resolution Signal
-        # can in principle arrive before the Update that requested it has been
-        # observed as returning here.
-        self._pending_resolution: GatewayOperationResolution | None = None
 
     @workflow.run
     async def run(self, input: CanaryAnalysisInput) -> CanaryResult:
@@ -108,119 +114,77 @@ class CanaryAnalysisWorkflow:
         # Phase 2: the nested call. Canary is now itself a tool caller, and it
         # goes through Agent Gateway rather than promoting anything directly,
         # because promoting to production is a protected action and canary has no
-        # more right to do it unsupervised than anyone else does. The call is made
-        # from an Activity, never from workflow code, because it needs a Temporal
-        # client pointed at the other namespace and workflow code must stay
-        # deterministic.
-        gateway = await workflow.execute_activity(
-            call_agent_gateway_promote,
-            AgentGatewayPromoteInput(
+        # more right to do it unsupervised than anyone else does.
+        #
+        # Straight from workflow code. No Activity, no client, no credentials for
+        # anyone else's namespace: a Nexus call to a published endpoint.
+        gateway = workflow.create_nexus_client(
+            service=AgentGatewayService, endpoint=AGENT_GATEWAY_ENDPOINT
+        )
+        handle = await gateway.start_operation(
+            AgentGatewayService.request_protected_action,
+            ProtectedActionRequest(
                 gateway_workflow_id=input.workflow_id,
-                gateway_namespace=input.gateway_namespace,
-                canary_workflow_id=workflow.info().workflow_id,
-                origin_operation_id=input.origin_operation_id,
-                service=input.service,
-                version=input.version,
-                environment=input.environment,
+                tool_name="promote_release",
+                arguments={
+                    "service": input.service,
+                    "version": input.version,
+                    "environment": input.environment,
+                },
                 idempotency_key=(
                     input.idempotency_key or workflow.info().workflow_id
                 ),
-                requester=input.requester,
+                caller_service="release-safety",
+                caller_principal=input.requester,
+                caller_workflow_id=workflow.info().workflow_id,
+                origin_operation_id=input.origin_operation_id,
                 justification=(
                     f"Canary passed {input.window_ticks} consecutive ticks for "
                     f"{input.service} {input.version}, all under the "
                     f"{CANARY_THRESHOLD:.0%} error-rate threshold"
                 ),
             ),
-            start_to_close_timeout=GATEWAY_CALL_TIMEOUT,
-            retry_policy=RetryPolicy(maximum_attempts=5),
+            schedule_to_close_timeout=PROTECTED_ACTION_TIMEOUT,
         )
-        self._state.gateway_workflow_id = (
-            gateway.get("workflow_id") or input.workflow_id
-        )
-        self._state.gateway_operation_id = gateway.get("operation_id")
-
-        status = gateway.get("status")
-        if status == "completed":
-            # Policy did not protect this promotion. Not what the demo's policy
-            # does for prod, but the workflow should be correct under a policy
-            # configuration it does not control.
-            self._state.phase = "completed"
-            self._state.promotion_result = gateway.get("result")
-            await self._publish()
-            return self._result()
-
-        if status != "waiting_for_approval":
-            # The gateway declined before any human saw it: a rejected update, a
-            # failed policy evaluation, a chain that is not accepting work.
-            # Canary has no promotion to wait for, so it stops.
-            self._state.phase = "rejected" if status == "rejected" else "failed"
-            self._state.error = (
-                gateway.get("message")
-                or gateway.get("reason")
-                or f"Agent Gateway returned {status!r}"
-            )
-            await self._publish()
-            await self._report_verdict(
-                "gateway_declined", self._state.error
-            )
-            return self._result()
-
+        self._state.gateway_workflow_id = input.workflow_id
+        self._state.gateway_operation_token = handle.operation_token
         self._state.phase = "awaiting_prod_approval"
         await self._publish()
 
-        # Phase 3: the checkpoint. Execution genuinely stops here. Everything
-        # above this line -- every tick, the verdict, the operation id -- is
-        # already in this workflow's own Event History, in this namespace, under
-        # this team's retention policy. Kill the release-safety worker now and
-        # replay rebuilds all of it without re-running a single tick, and this
-        # wait picks up exactly where it left off.
-        await workflow.wait_condition(lambda: self._pending_resolution is not None)
-        resolution = self._pending_resolution
-        assert resolution is not None
+        # Phase 3: the checkpoint. Execution genuinely stops here, on a pending
+        # Nexus operation, for as long as it takes a person to decide.
+        #
+        # Everything above this line -- every tick, the verdict, the outbound
+        # operation -- is already in this workflow's own Event History, in this
+        # namespace, under this team's retention policy. Kill the release-safety
+        # worker now and replay rebuilds all of it without re-running a single
+        # tick, and this await picks up exactly where it left off.
+        outcome = await handle
+        self._state.gateway_operation_id = outcome.operation_id
 
-        if resolution.status == "completed":
+        if outcome.status == "completed":
             self._state.phase = "completed"
-            self._state.promotion_result = resolution.result
-        elif resolution.status == "rejected":
+            self._state.promotion_result = outcome.result
+        elif outcome.status in ("rejected", "canceled"):
             self._state.phase = "rejected"
-            self._state.error = resolution.reason or "the approver rejected it"
-        elif resolution.status == "canceled":
-            self._state.phase = "rejected"
-            self._state.error = resolution.reason or "the operation was canceled"
-        else:
+            self._state.error = outcome.reason or f"the promotion was {outcome.status}"
+        elif outcome.status == "expired":
             self._state.phase = "expired"
-            self._state.error = resolution.reason or "approval window expired"
+            self._state.error = outcome.reason or "approval window expired"
+        else:
+            self._state.phase = "failed"
+            self._state.error = (
+                outcome.reason or f"Agent Gateway returned {outcome.status!r}"
+            )
         await self._publish()
         return self._result()
 
     # ------------------------------------------------------------- handlers
-
-    @workflow.signal
-    def gateway_operation_resolved(
-        self, resolution: GatewayOperationResolution
-    ) -> None:
-        """Agent Gateway's callback once a human decided.
-
-        Mutates state only. The run method's wait_condition observes it, which is
-        the same discipline the chain workflow follows on its side: handlers do
-        not drive Activities.
-        """
-        if self._pending_resolution is not None:
-            # Already resolved. A duplicate delivery is not an error; Signals are
-            # at-least-once and the gateway retries this Activity.
-            return
-        expected = self._state.gateway_operation_id
-        if expected is not None and resolution.operation_id != expected:
-            workflow.logger.warning(
-                "ignoring resolution for an unrelated operation",
-                extra={
-                    "received": resolution.operation_id,
-                    "expected": expected,
-                },
-            )
-            return
-        self._pending_resolution = resolution
+    #
+    # There is no resolution Signal handler here any more, and its absence is
+    # the clearest single measure of what Nexus bought. Agent Gateway used to
+    # need this workflow's id and a signal name to wake it; now the operation
+    # this workflow is suspended on simply completes.
 
     @workflow.query
     def get_status(self) -> CanaryStatusView:
@@ -235,6 +199,7 @@ class CanaryAnalysisWorkflow:
             tick_results=list(self._state.tick_results),
             verdict=self._state.verdict,
             gateway_workflow_id=self._state.gateway_workflow_id,
+            gateway_operation_token=self._state.gateway_operation_token,
             gateway_operation_id=self._state.gateway_operation_id,
             promotion_result=self._state.promotion_result,
             error=self._state.error,
@@ -265,31 +230,34 @@ class CanaryAnalysisWorkflow:
         """Tell Agent Gateway the promotion is not coming.
 
         Only needed when the window closes red. A green window reports itself by
-        calling promote_release; a red one never calls, and without this the
-        release pipeline operation that handed off would sit waiting on a request
-        that is never going to arrive.
+        requesting the promotion; a red one never asks for anything, and without
+        this the release pipeline operation that handed off would sit waiting on
+        a request that is never going to arrive.
+
+        Synchronous, because there is nothing to wait for.
         """
         if not self._input.origin_operation_id:
             return
+        gateway = workflow.create_nexus_client(
+            service=AgentGatewayService, endpoint=AGENT_GATEWAY_ENDPOINT
+        )
         try:
-            await workflow.execute_activity(
-                report_canary_verdict,
-                ReportCanaryVerdictInput(
+            await gateway.execute_operation(
+                AgentGatewayService.report_tool_outcome,
+                ToolOutcomeReport(
                     gateway_workflow_id=self._input.workflow_id,
-                    gateway_namespace=self._input.gateway_namespace,
-                    canary_workflow_id=workflow.info().workflow_id,
                     origin_operation_id=self._input.origin_operation_id,
-                    verdict=verdict,
+                    caller_workflow_id=workflow.info().workflow_id,
+                    outcome=verdict,
                     reason=reason,
                     detail={
                         "tick_results": list(self._state.tick_results),
                         "threshold": CANARY_THRESHOLD,
                     },
                 ),
-                start_to_close_timeout=GATEWAY_CALL_TIMEOUT,
-                retry_policy=RetryPolicy(maximum_attempts=5),
+                schedule_to_close_timeout=REPORT_TIMEOUT,
             )
-        except ActivityError as err:
+        except Exception as err:
             # The window's own verdict is already durable here. Failing to
             # deliver it does not change what canary observed, so it is recorded
             # and the workflow still completes with the right answer.

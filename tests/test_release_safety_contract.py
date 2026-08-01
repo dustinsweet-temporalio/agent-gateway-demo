@@ -1,173 +1,134 @@
-"""The wire contract between Agent Gateway and Release Safety.
+"""The Nexus boundary between Agent Gateway and Release Safety.
 
-The two teams deliberately do not share an internal Python package. Each keeps
-its own copy of the payloads they exchange, which is what two independently
-owned services actually do, and which is what makes the boundary in CASE-2b real
-rather than decorative. The cost of that choice is that nothing stops the copies
-drifting apart, so this suite is the thing that does.
+The previous version of this file greped the other team's source code to check
+that two hand-copied dataclasses had not drifted apart. That test was a
+compensating control for a boundary that was not real: two genuinely separate
+teams do not have each other's repositories, so neither of them could have
+written it.
 
-It also pins the four strings that make up the rest of the integration surface:
-two message names and two topology values. Renaming a Signal handler on one side
-without the other is exactly the kind of change that looks harmless in review and
-silently strands a suspended workflow in production.
+What replaced it is a published interface. Each side declares the same service
+contract -- endpoint names, operation names, payload field names -- and the
+checks below are the ones a real integration test can make: that the two
+declarations agree, and that neither side has quietly reacquired knowledge of
+the other's internals.
 """
 
 from __future__ import annotations
 
+import ast
 import dataclasses
-import inspect
 from pathlib import Path
 
-import activities.gateway_activities as gateway_activities
-import common.models as gateway_models
-import release_safety.canary_activities as canary_activities
-import release_safety.models as safety_models
-from release_safety.canary_workflow import CanaryAnalysisWorkflow
-from workflows.chain import AgenticChainWorkflow
+import nexusrpc
+
+import common.nexus_contracts as gateway_contracts
+import release_safety.nexus_contracts as safety_contracts
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _fields(cls) -> dict[str, str]:
-    return {f.name: str(f.type) for f in dataclasses.fields(cls)}
+def _fields(cls) -> set[str]:
+    return {f.name for f in dataclasses.fields(cls)}
 
 
-def test_operation_resolution_payload_matches_on_both_sides() -> None:
-    """The Signal that wakes a suspended canary.
+def _operations(service) -> dict[str, tuple[str, str]]:
+    definition = nexusrpc.get_service_definition(service)
+    return {
+        name: (op.input_type.__name__, op.output_type.__name__)
+        for name, op in definition.operation_definitions.items()
+    }
 
-    Agent Gateway builds it, Release Safety receives it, and neither imports the
-    other's definition. Field names are the contract, because that is what the
-    JSON payload converter matches on.
+
+def _code_only(path: Path) -> str:
+    """Source with docstrings and comments stripped.
+
+    The checks below are about what the code depends on, not about what the
+    prose is allowed to explain. A comment in release_safety/ describing why the
+    canary window is opened synchronously has to be able to name
+    AgenticChainWorkflow and Continue-As-New, because that is the reason, and a
+    reader who cannot be told the reason is worse off than one who can.
     """
-    assert set(_fields(gateway_models.GatewayOperationResolution)) == set(
-        _fields(safety_models.GatewayOperationResolution)
+    tree = ast.parse(path.read_text())
+    for node in ast.walk(tree):
+        if isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                node.body = body[1:] or [ast.Pass()]
+    return ast.unparse(ast.fix_missing_locations(tree))
+
+
+def test_both_sides_declare_the_same_endpoints() -> None:
+    assert (
+        gateway_contracts.AGENT_GATEWAY_ENDPOINT
+        == safety_contracts.AGENT_GATEWAY_ENDPOINT
+    )
+    assert (
+        gateway_contracts.RELEASE_SAFETY_ENDPOINT
+        == safety_contracts.RELEASE_SAFETY_ENDPOINT
     )
 
 
-def test_start_canary_payload_covers_what_the_canary_workflow_needs() -> None:
-    """Everything canary is started with has somewhere to land.
+def test_both_sides_declare_the_same_operations() -> None:
+    """Operation names and payload types, on the service each side handles.
 
-    The gateway starts the workflow by type name with a plain dict, so a field it
-    invents that CanaryAnalysisInput does not declare would be silently dropped
-    and the window would run with a default nobody chose.
+    A rename on one side without the other is the failure this catches, and it
+    is the one that would strand a suspended workflow rather than erroring
+    loudly at deploy time.
     """
-    accepted = set(_fields(safety_models.CanaryAnalysisInput))
-    source = inspect.getsource(gateway_activities.start_canary_analysis)
-    sent = {
-        "workflow_id",
-        "service",
-        "version",
-        "environment",
-        "scripted_outcome",
-        "tick_seconds",
-        "window_ticks",
-        "idempotency_key",
-        "origin_operation_id",
-        "requester",
-        "gateway_namespace",
-    }
-    for name in sent:
-        assert f'"{name}"' in source, f"the gateway no longer sends {name}"
-        assert name in accepted, f"canary cannot accept {name}"
-    # The correlation context is the field the whole nested-call story rests on:
-    # it is the chain's workflow_id, not canary's own, and losing it would split
-    # one user-visible task into two unrelated ones.
-    assert "workflow_id" in accepted
-
-
-def test_nested_call_fields_canary_sends_exist_on_the_gateway_request() -> None:
-    """Canary builds request_nested_tool_call as a dict, by hand.
-
-    It has to: NestedToolCallRequest lives in the gateway's package, which is not
-    on Release Safety's path. So the field names it types out are checked here
-    against the real dataclass instead of by an import.
-    """
-    accepted = set(_fields(gateway_models.NestedToolCallRequest))
-    sent = {
-        "tool1_name",
-        "tool1_arguments",
-        "tool2_name",
-        "tool2_arguments",
-        "idempotency_key",
-        "correlation",
-        "requested_action",
-        "justification",
-        "controlled_tool1",
-        "replay_safe",
-        "callback_workflow_id",
-        "callback_namespace",
-        "origin_operation_id",
-    }
-    source = inspect.getsource(canary_activities.call_agent_gateway_promote)
-    for name in sent:
-        assert f'"{name}"' in source, f"canary no longer sends {name}"
-        assert name in accepted, f"the gateway no longer accepts {name}"
-
-    correlation = set(_fields(gateway_models.CorrelationContext))
-    for name in (
-        "workflow_id",
-        "workflow_id_source",
-        "idempotency_key",
-        "caller_principal",
-        "caller_service",
-        "runtime",
-        "call_path",
+    for gateway_service, safety_service in (
+        (gateway_contracts.AgentGatewayService, safety_contracts.AgentGatewayService),
+        (
+            gateway_contracts.ReleaseSafetyService,
+            safety_contracts.ReleaseSafetyService,
+        ),
     ):
-        assert name in correlation, f"CorrelationContext no longer has {name}"
+        assert _operations(gateway_service) == _operations(safety_service)
 
 
-def test_canary_verdict_payload_matches_the_signal_the_chain_declares() -> None:
-    sent = {
-        "origin_operation_id",
-        "canary_workflow_id",
-        "verdict",
-        "reason",
-        "detail",
-    }
-    assert sent == set(_fields(gateway_models.CanaryVerdict))
-    source = inspect.getsource(canary_activities.report_canary_verdict)
-    for name in sent:
-        assert f'"{name}"' in source, f"canary no longer sends {name}"
+def test_payload_field_names_match_on_both_sides() -> None:
+    """Field names are the contract; the payload converter matches on them."""
+    pairs = [
+        (gateway_contracts.ProtectedActionRequest, safety_contracts.ProtectedActionRequest),
+        (gateway_contracts.ProtectedActionOutcome, safety_contracts.ProtectedActionOutcome),
+        (gateway_contracts.ToolOutcomeReport, safety_contracts.ToolOutcomeReport),
+        (gateway_contracts.ToolOutcomeAck, safety_contracts.ToolOutcomeAck),
+        (gateway_contracts.OpenCanaryWindowInput, safety_contracts.OpenCanaryWindowInput),
+        (gateway_contracts.CanaryWindowOpened, safety_contracts.CanaryWindowOpened),
+    ]
+    for ours, theirs in pairs:
+        assert _fields(ours) == _fields(theirs), ours.__name__
 
 
-def test_message_names_agree_on_both_sides() -> None:
-    """Two Updates and two Signals, referred to by string across the boundary."""
-    assert (
-        canary_activities.GATEWAY_NESTED_CALL_UPDATE
-        == AgenticChainWorkflow.request_nested_tool_call.__name__
-    )
-    assert (
-        canary_activities.GATEWAY_CANARY_VERDICT_SIGNAL
-        == AgenticChainWorkflow.canary_verdict_reported.__name__
-    )
-    assert (
-        gateway_activities.RELEASE_SAFETY_RESOLUTION_SIGNAL
-        == CanaryAnalysisWorkflow.gateway_operation_resolved.__name__
-    )
-    assert (
-        gateway_activities.RELEASE_SAFETY_WORKFLOW_TYPE
-        == CanaryAnalysisWorkflow.__name__
-    )
+def test_the_correlation_token_survives_the_boundary() -> None:
+    """One user-visible task across two systems rests on this one field.
+
+    Everything else could be renamed and the demo would still make its point.
+    Lose the chain workflow_id on the way through and the nested call opens a
+    second chain, which is precisely the failure the requirements document's
+    correlation section exists to prevent.
+    """
+    assert "gateway_workflow_id" in _fields(gateway_contracts.OpenCanaryWindowInput)
+    assert "gateway_workflow_id" in _fields(gateway_contracts.ProtectedActionRequest)
+    assert "gateway_workflow_id" in _fields(gateway_contracts.ToolOutcomeReport)
 
 
 def _imported_packages(path: Path) -> set[str]:
-    """Top-level packages a module imports, from its import statements only."""
     packages: set[str] = set()
     for raw in path.read_text().splitlines():
         line = raw.strip()
-        if line.startswith("from "):
-            packages.add(line.split()[1].split(".")[0])
-        elif line.startswith("import "):
+        if line.startswith(("from ", "import ")):
             packages.add(line.split()[1].split(".")[0])
     return packages
 
 
 def test_release_safety_does_not_import_the_gateway() -> None:
-    """The boundary, enforced rather than described.
-
-    If this fails, the two teams have quietly become one codebase again and
-    CASE-2b is back to being an internal function call wearing a costume.
-    """
     forbidden = {"common", "workflows", "activities", "gateway", "mock_tool"}
     for path in sorted((REPO_ROOT / "release_safety").glob("*.py")):
         leaked = _imported_packages(path) & forbidden
@@ -175,16 +136,35 @@ def test_release_safety_does_not_import_the_gateway() -> None:
 
 
 def test_the_gateway_does_not_import_release_safety() -> None:
-    """And the same in the other direction.
-
-    The gateway starts canary by workflow type name and signals it by signal
-    name, on purpose. Importing their workflow class would put their code on this
-    worker's image and make their deploys the gateway team's problem. Names like
-    signal_release_safety_workflow are fine -- an Activity that talks to another
-    team is not the same thing as a dependency on their code.
-    """
     for module in ("workflows", "activities", "gateway", "common"):
         for path in sorted((REPO_ROOT / module).glob("*.py")):
             assert "release_safety" not in _imported_packages(path), (
                 f"{module}/{path.name} imports the release_safety package"
             )
+
+
+def test_neither_side_names_the_other_topology() -> None:
+    """The isolation win, asserted rather than described.
+
+    Under the previous design each side hardcoded the other's namespace, task
+    queue, and either a workflow type or an update and signal name. A Nexus
+    Endpoint replaces all of it, which means either team can rename their
+    workflows, move task queues, or change namespace without the other team
+    deploying. If one of these strings comes back, that property is gone.
+    """
+    for module in ("workflows", "activities", "common"):
+        for path in (REPO_ROOT / module).glob("*.py"):
+            code = _code_only(path)
+            assert "release-safety-tq" not in code, path.name
+            assert "CanaryAnalysisWorkflow" not in code, path.name
+
+    for path in (REPO_ROOT / "release_safety").glob("*.py"):
+        # The legacy script is the uncontrolled caller and deliberately talks to
+        # the gateway's public MCP endpoint. Everything else must not know the
+        # gateway exists beyond its Nexus endpoint name.
+        if path.name == "legacy_canary_script.py":
+            continue
+        code = _code_only(path)
+        assert "agentic-gateway" not in code, path.name
+        assert "AgenticChainWorkflow" not in code, path.name
+        assert "request_nested_tool_call" not in code, path.name

@@ -10,9 +10,11 @@ from temporalio.worker import Worker
 from activities.gateway_activities import (
     evaluate_policy,
     invoke_tool,
-    signal_release_safety_workflow,
-    start_canary_analysis,
+    signal_operation_callback,
+    submit_nested_tool_call,
 )
+from workflows.nexus_handlers import AgentGatewayServiceHandler
+from workflows.protected_action import ProtectedActionWorkflow
 from adk_agents.release_approval_agent.temporal_integration import (
     build_google_adk_plugin,
 )
@@ -39,16 +41,22 @@ async def main() -> None:
                 AgenticChainWorkflow,
                 AutonomousAgentWorkflow,
                 TemporalAdkSessionWorkflow,
+                # Services one external tool request each, for as long as the
+                # approval takes.
+                ProtectedActionWorkflow,
             ],
             activities=[
                 evaluate_policy,
                 invoke_tool,
-                # Both reach into the Release Safety namespace. They run here, on
-                # the gateway's own worker, because the gateway is the side that
-                # knows when to open a canary window and what a human decided.
-                start_canary_analysis,
-                signal_release_safety_workflow,
+                # Both stay inside this namespace. Nothing on this worker holds
+                # a client for anyone else's cluster.
+                submit_nested_tool_call,
+                signal_operation_callback,
             ],
+            # The gateway's Nexus front door, behind the `agent-gateway`
+            # Endpoint. This is how another team's tool asks for a protected
+            # action without any access to this namespace.
+            nexus_service_handlers=[AgentGatewayServiceHandler()],
             activity_executor=executor,
         )
         print(f"worker started, polling task queue '{TASK_QUEUE}'", flush=True)
