@@ -6,15 +6,18 @@ import html
 import json
 import os
 import uuid
+from http.cookies import SimpleCookie
 from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import requests
 import uvicorn
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from temporalio.client import (
     Client,
     WithStartWorkflowOperation,
@@ -23,11 +26,25 @@ from temporalio.client import (
 from temporalio.common import WorkflowIDConflictPolicy
 
 from common.models import (
+    ADK_SESSION_ID_HEADER,
+    CALLBACK_RUN_ID_HEADER,
+    CALLBACK_WORKFLOW_ID_HEADER,
+    AdkTemporalSessionCallback,
     ApprovalDecision,
+    AutonomousAgentInput,
+    CancelOperation,
     ChainInput,
     CorrelationContext,
+    LedgerEntry,
+    NestedToolCallRequest,
+    OperationView,
+    ResumeNestedRequest,
     ToolCallRequest,
+    ToolCallResponse,
+    WorkflowLedgerResponse,
+    WorkflowStatusResponse,
 )
+from workflows.autonomous_agent import AutonomousAgentWorkflow
 from workflows.chain import AgenticChainWorkflow
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
@@ -35,18 +52,49 @@ TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "300"))
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8080"))
+MOCK_TOOL_STATE_URL = os.getenv(
+    "MOCK_TOOL_STATE_URL", "http://mock-tool:9000/state"
+)
+PROTECTED_ENVIRONMENTS = {
+    item.strip().lower()
+    for item in os.getenv("PROTECTED_ENVIRONMENTS", "prod,production").split(",")
+    if item.strip()
+}
+GATEWAY_MCP_ALLOWED_HOSTS = [
+    item.strip()
+    for item in os.getenv(
+        "GATEWAY_MCP_ALLOWED_HOSTS",
+        "127.0.0.1:*,localhost:*,[::1]:*,gateway:*",
+    ).split(",")
+    if item.strip()
+]
+GATEWAY_MCP_ALLOWED_ORIGINS = [
+    item.strip()
+    for item in os.getenv(
+        "GATEWAY_MCP_ALLOWED_ORIGINS",
+        "http://127.0.0.1:*,http://localhost:*,http://[::1]:*",
+    ).split(",")
+    if item.strip()
+]
 
-TERMINAL_STATUSES = {"completed", "rejected", "expired", "failed"}
+TERMINAL_STATUSES = {
+    "completed",
+    "rejected",
+    "expired",
+    "canceled",
+    "blocked",
+    "approved_awaiting_retry",
+    "failed",
+}
 UNVERIFIED_PRINCIPAL = "claude-code (unverified)"
 GATEWAY_DEBUG = bool(os.getenv("GATEWAY_DEBUG"))
 POLL_AFTER_SECONDS = int(os.getenv("POLL_AFTER_SECONDS", "5"))
 
-# Per-tool sync/async handling, annotated in code (design scenarios #1, #2, #3).
-#   "sync"        block to completion, never convert (scenario #1)
-#   "async"       return a poll handle immediately (scenario #2)
+# Per-tool sync/async handling.
+#   "sync"        block to completion, never convert
+#   "async"       return a poll handle immediately
 #   <int> ms      monitor and convert: block up to this budget, then convert to
 #                 async and return a poll handle while the workflow keeps running
-#                 (scenario #3)
 # A tool absent from this map uses _DEFAULT_STRATEGY.
 _TOOL_STRATEGY: dict[str, object] = {
     "get_deployed_version": "sync",
@@ -55,9 +103,16 @@ _TOOL_STRATEGY: dict[str, object] = {
 }
 _DEFAULT_STRATEGY: object = 5000
 
-mcp = FastMCP("agent-gateway")
-mcp.settings.host = GATEWAY_HOST
-mcp.settings.port = GATEWAY_PORT
+mcp = FastMCP(
+    "agent-gateway",
+    host=GATEWAY_HOST,
+    port=GATEWAY_PORT,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=GATEWAY_MCP_ALLOWED_HOSTS,
+        allowed_origins=GATEWAY_MCP_ALLOWED_ORIGINS,
+    ),
+)
 
 _client: Optional[Client] = None
 _client_lock = asyncio.Lock()
@@ -84,15 +139,25 @@ def _load_principals() -> dict[str, str]:
 
 _PRINCIPALS = _load_principals()
 
+
+def _load_approvers() -> set[str]:
+    raw = os.getenv("GATEWAY_APPROVERS", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+_APPROVERS = _load_approvers()
+
 # The requester is resolved at the ASGI layer (see PrincipalMiddleware) where the
 # raw HTTP headers are reliably available. The bundled mcp SDK does not reliably
 # expose request headers inside a tool, so we do not read them there. The
-# ContextVar carries the per-request principal; the module fallback covers the
-# single-session demo case if the ContextVar does not propagate into the tool task.
+# ContextVar carries the per-request principal. If task context does not propagate,
+# the safe fallback is unverified; never reuse another request's identity.
 _current_principal: ContextVar[Optional[str]] = ContextVar(
     "current_principal", default=None
 )
-_last_principal = UNVERIFIED_PRINCIPAL
+_current_adk_callback: ContextVar[
+    Optional[AdkTemporalSessionCallback]
+] = ContextVar("current_adk_callback", default=None)
 
 # Result-wait tasks that outlived the gateway's sync budget. Kept referenced so the
 # event loop does not garbage collect them mid-flight; discarded on completion.
@@ -112,6 +177,39 @@ def _principal_for_token(token: Optional[str]) -> str:
     return UNVERIFIED_PRINCIPAL
 
 
+def _adk_callback_from_headers(
+    headers: list[tuple[bytes, bytes]],
+    principal: str,
+) -> AdkTemporalSessionCallback | None:
+    """Resolve a fixed Temporal callback target from authenticated MCP headers."""
+
+    if principal == UNVERIFIED_PRINCIPAL:
+        return None
+    values = {
+        name.decode("latin-1").lower(): value.decode("latin-1").strip()
+        for name, value in headers
+    }
+    workflow_id = values.get(CALLBACK_WORKFLOW_ID_HEADER, "")
+    session_id = values.get(ADK_SESSION_ID_HEADER, "")
+    run_id = values.get(CALLBACK_RUN_ID_HEADER) or None
+    if not workflow_id or not session_id:
+        return None
+    identifiers = [workflow_id, session_id]
+    if run_id:
+        identifiers.append(run_id)
+    if any(
+        len(value) > 255
+        or not all(ch.isalnum() or ch in "-_.:" for ch in value)
+        for value in identifiers
+    ):
+        return None
+    return AdkTemporalSessionCallback(
+        workflow_id=workflow_id,
+        run_id=run_id,
+        session_id=session_id,
+    )
+
+
 class PrincipalMiddleware:
     """Reads the bearer token off each HTTP request and resolves the requester.
 
@@ -123,31 +221,68 @@ class PrincipalMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        context_token = None
+        callback_token = None
         if scope.get("type") == "http":
+            headers = scope.get("headers", [])
             token: Optional[str] = None
-            for name, value in scope.get("headers", []):
+            for name, value in headers:
                 if name == b"authorization":
                     raw = value.decode("latin-1")
                     if raw.lower().startswith("bearer "):
                         token = raw[7:].strip()
                     break
+            if token is None:
+                for name, value in headers:
+                    if name == b"cookie":
+                        cookie = SimpleCookie()
+                        cookie.load(value.decode("latin-1"))
+                        morsel = cookie.get("gateway_token")
+                        if morsel is not None:
+                            token = morsel.value
+                        break
             principal = _principal_for_token(token)
-            _current_principal.set(principal)
-            global _last_principal
-            _last_principal = principal
+            context_token = _current_principal.set(principal)
+            callback = _adk_callback_from_headers(headers, principal)
+            callback_token = _current_adk_callback.set(callback)
             if GATEWAY_DEBUG:
                 path = scope.get("path", "")
                 print(
                     f"[auth] path={path} header_present={token is not None} "
-                    f"resolved={principal!r}",
+                    f"resolved={principal!r} "
+                    f"adk_callback={callback is not None}",
                     flush=True,
                 )
-        await self.app(scope, receive, send)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            if callback_token is not None:
+                _current_adk_callback.reset(callback_token)
+            if context_token is not None:
+                _current_principal.reset(context_token)
 
 
-def _resolve_principal() -> str:
+def _resolve_principal(ctx: Optional[Context] = None) -> str:
+    if ctx is not None:
+        try:
+            request = ctx.request_context.request
+            if request is not None:
+                auth = request.headers.get("authorization", "")
+                token = (
+                    auth[7:].strip()
+                    if auth.lower().startswith("bearer ")
+                    else None
+                )
+                if token:
+                    return _principal_for_token(token)
+        except Exception:
+            pass
     principal = _current_principal.get()
-    return principal if principal is not None else _last_principal
+    return principal if principal is not None else UNVERIFIED_PRINCIPAL
+
+
+def _is_approver(principal: str) -> bool:
+    return principal in _APPROVERS
 
 
 async def get_client() -> Client:
@@ -160,7 +295,13 @@ async def get_client() -> Client:
 
 
 def _as_dict(obj: Any) -> Any:
-    return asdict(obj) if is_dataclass(obj) else obj
+    if is_dataclass(obj):
+        return asdict(obj)
+    if isinstance(obj, list):
+        return [_as_dict(item) for item in obj]
+    if isinstance(obj, dict):
+        return {key: _as_dict(value) for key, value in obj.items()}
+    return obj
 
 
 def _session_key(ctx: Optional[Context]) -> Optional[str]:
@@ -184,13 +325,15 @@ def _resolve_workflow_id(
     explicit: Optional[str], ctx: Optional[Context]
 ) -> tuple[str, str]:
     if explicit:
-        # NOTE: the requirements state caller-supplied IDs must be authorized
-        # before use. This demo trusts an explicit workflow_id as-is.
-        return explicit, "explicit"
+        if _resolve_principal(ctx) == UNVERIFIED_PRINCIPAL:
+            raise PermissionError(
+                "explicit workflow_id requires an authenticated principal"
+            )
+        return explicit, "explicit_authorized"
     key = _session_key(ctx)
     if key is not None:
         wf = _session_chains.setdefault(key, "wf-" + uuid.uuid4().hex[:6])
-        return wf, "mcp_session"
+        return wf, "inferred_from_session"
     return _DEFAULT_CHAIN, "gateway_default"
 
 
@@ -204,20 +347,78 @@ def _derive_idempotency_key(workflow_id: str, tool_name: str, arguments: dict) -
 def _derive_operation_id(idempotency_key: str) -> str:
     # Deterministic from the idempotency key so the gateway knows the id up front
     # and it stays stable across retries and across a sync-to-async conversion.
-    return "op-" + hashlib.sha256(idempotency_key.encode()).hexdigest()[:6]
+    return "op-" + hashlib.sha256(idempotency_key.encode()).hexdigest()[:16]
 
 
-def _async_handle(workflow_id: str, operation_id: str) -> dict:
-    return {
-        "status": "processing",
-        "workflow_id": workflow_id,
-        "operation_id": operation_id,
-        "message": (
+def _caller_idempotency_key(
+    workflow_id: str,
+    tool_name: str,
+    arguments: dict,
+    supplied: Optional[str],
+    principal: Optional[str] = None,
+) -> str:
+    if supplied:
+        resolved_principal = principal or _resolve_principal()
+        payload = f"{resolved_principal}:{workflow_id}:{supplied}"
+        return "idem-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+    return _derive_idempotency_key(workflow_id, tool_name, arguments)
+
+
+_SENSITIVE_KEYS = {
+    "authorization",
+    "api_key",
+    "apikey",
+    "password",
+    "secret",
+    "token",
+}
+
+
+def _safe_arguments(arguments: dict) -> dict:
+    """Redact credential-like values before query, ledger, or UI exposure."""
+
+    def redact(value: Any, key: str = "") -> Any:
+        normalized = key.lower().replace("-", "_")
+        if any(part in normalized for part in _SENSITIVE_KEYS):
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {str(k): redact(v, str(k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        return value
+
+    return redact(arguments)
+
+
+async def _authorized_handle(workflow_id: str, ctx: Optional[Context]):
+    client = await get_client()
+    handle = client.get_workflow_handle(workflow_id)
+    owner = await handle.query("get_workflow_owner", result_type=str)
+    principal = _resolve_principal(ctx)
+    if owner != principal:
+        raise PermissionError("workflow_id is owned by a different principal")
+    if principal == UNVERIFIED_PRINCIPAL:
+        session_workflow_id, _ = _resolve_workflow_id(None, ctx)
+        if session_workflow_id != workflow_id:
+            raise PermissionError(
+                "unverified callers may only access their current MCP session"
+            )
+    return handle
+
+
+def _async_handle(
+    workflow_id: str, operation_id: str
+) -> ToolCallResponse:
+    return ToolCallResponse(
+        status="processing",
+        workflow_id=workflow_id,
+        operation_id=operation_id,
+        message=(
             "The tool call is still running and was converted to async. Poll "
             "get_operation_result with this workflow_id and operation_id."
         ),
-        "poll_after_seconds": POLL_AFTER_SECONDS,
-    }
+        poll_after_seconds=POLL_AFTER_SECONDS,
+    )
 
 
 def _requested_action(tool_name: str, arguments: dict) -> str:
@@ -242,17 +443,29 @@ async def _submit_tool_call(
     explicit_workflow_id: Optional[str],
     justification: Optional[str],
     ctx: Optional[Context],
-) -> dict:
+    supplied_idempotency_key: Optional[str] = None,
+    runtime: str = "ClaudeCode",
+) -> ToolCallResponse:
     client = await get_client()
 
     workflow_id, source = _resolve_workflow_id(explicit_workflow_id, ctx)
-    caller_principal = _resolve_principal()
-    idem = _derive_idempotency_key(workflow_id, tool_name, arguments)
+    caller_principal = _resolve_principal(ctx)
+    idem = _caller_idempotency_key(
+        workflow_id,
+        tool_name,
+        arguments,
+        supplied_idempotency_key,
+        caller_principal,
+    )
     operation_id = _derive_operation_id(idem)
     correlation = CorrelationContext(
         workflow_id=workflow_id,
         workflow_id_source=source,
+        idempotency_key=idem,
+        agent_session_id=_session_key(ctx),
         caller_principal=caller_principal,
+        runtime=runtime,
+        call_path=[runtime, tool_name],
     )
     req = ToolCallRequest(
         tool_name=tool_name,
@@ -263,6 +476,7 @@ async def _submit_tool_call(
         requested_action=_requested_action(tool_name, arguments),
         justification=justification,
         operation_id=operation_id,
+        safe_arguments=_safe_arguments(arguments),
     )
 
     # Deliver the tool call as an Update. wait_for_stage=ACCEPTED returns the handle
@@ -270,7 +484,10 @@ async def _submit_tool_call(
     # long it blocks on the result independently.
     start_op = WithStartWorkflowOperation(
         AgenticChainWorkflow.run,
-        ChainInput(workflow_id=workflow_id),
+        ChainInput(
+            workflow_id=workflow_id,
+            owner_principal=caller_principal,
+        ),
         id=workflow_id,
         task_queue=TASK_QUEUE,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
@@ -285,14 +502,14 @@ async def _submit_tool_call(
     strategy = _TOOL_STRATEGY.get(tool_name, _DEFAULT_STRATEGY)
 
     if strategy == "async":
-        # Scenario #2: hand back a poll handle immediately; the workflow runs on.
+        # Async mode: hand back a poll handle immediately; the workflow runs on.
         return _async_handle(workflow_id, operation_id)
 
     if strategy == "sync":
-        # Scenario #1: block to completion.
-        return _as_dict(await handle.result())
+        # Sync mode: block to completion.
+        return await handle.result()
 
-    # Scenario #3: block up to the budget, then convert to async. asyncio.wait
+    # Convert mode: block up to the budget, then convert to async. asyncio.wait
     # stops blocking WITHOUT cancelling the result poll, so the Temporal SDK does
     # not raise a cancellation error and the workflow is unaffected. The result is
     # recovered later by polling get_operation_result.
@@ -300,7 +517,7 @@ async def _submit_tool_call(
     result_task = asyncio.ensure_future(handle.result())
     done, _pending = await asyncio.wait({result_task}, timeout=budget_seconds)
     if result_task in done:
-        return _as_dict(result_task.result())
+        return result_task.result()
     # Budget elapsed. Detach the still-running wait and hand back a poll handle.
     _BACKGROUND_TASKS.add(result_task)
     result_task.add_done_callback(_discard_background_task)
@@ -316,34 +533,51 @@ async def _submit_tool_call(
 # --------------------------------------------------------------------- MCP tools
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 async def get_deployed_version(
-    environment: str, ctx: Context, workflow_id: str = ""
-) -> dict:
+    environment: str,
+    ctx: Context,
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
     """Return the release version currently deployed in an environment.
 
-    environment is one of test, staging, or prod. Read only; never requires approval.
+    environment is one of staging or prod. Read only; never requires approval.
     """
     return await _submit_tool_call(
-        "get_deployed_version", {"environment": environment}, workflow_id or None, None, ctx
+        "get_deployed_version",
+        {"environment": environment},
+        workflow_id or None,
+        None,
+        ctx,
+        idempotency_key or None,
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 async def cut_release(
-    service: str, version: str, ctx: Context, workflow_id: str = ""
-) -> dict:
+    service: str,
+    version: str,
+    ctx: Context,
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
     """Cut a release candidate for a service from an already built artifact.
 
     Registers a promotable release. Changes nothing running, so it never requires
     approval.
     """
     return await _submit_tool_call(
-        "cut_release", {"service": service, "version": version}, workflow_id or None, None, ctx
+        "cut_release",
+        {"service": service, "version": version},
+        workflow_id or None,
+        None,
+        ctx,
+        idempotency_key or None,
     )
 
 
-@mcp.tool()
+@mcp.tool(structured_output=True)
 async def promote_release(
     service: str,
     version: str,
@@ -351,10 +585,11 @@ async def promote_release(
     ctx: Context,
     justification: str = "",
     workflow_id: str = "",
-) -> dict:
+    idempotency_key: str = "",
+) -> ToolCallResponse:
     """Promote a release to an environment.
 
-    Promotion to test or staging runs immediately. Promotion to prod requires human
+    Promotion to staging runs immediately. Promotion to prod requires human
     approval. Use justification for the business reason for the promotion; do not
     put requester identity in it, since the gateway records the authenticated
     requester independently.
@@ -365,34 +600,328 @@ async def promote_release(
         workflow_id or None,
         justification or None,
         ctx,
+        idempotency_key or None,
     )
 
 
-@mcp.tool()
-async def get_operation_status(workflow_id: str, operation_id: str) -> dict:
+@mcp.tool(structured_output=True)
+async def run_nested_release(
+    service: str,
+    version: str,
+    environment: str,
+    ctx: Context,
+    tool1_mode: str = "controlled",
+    replay_safe: bool = False,
+    justification: str = "",
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
+    """Run Tool1 -> Tool2 where Tool2 is a release promotion.
+
+    A controlled Tool1 checkpoints and resumes automatically after approval.
+    An uncontrolled Tool1 fails closed; approval is recorded, but Tool2 executes
+    only after an explicit retry and only when replay_safe is true.
+    """
+    normalized_mode = tool1_mode.strip().lower()
+    if normalized_mode not in {"controlled", "uncontrolled"}:
+        raise ValueError("tool1_mode must be controlled or uncontrolled")
+
+    client = await get_client()
+    resolved_workflow_id, source = _resolve_workflow_id(
+        workflow_id or None, ctx
+    )
+    principal = _resolve_principal(ctx)
+    tool1_name = "release_orchestrator"
+    tool2_name = "promote_release"
+    tool1_arguments = {
+        "service": service,
+        "version": version,
+        "environment": environment,
+    }
+    tool2_arguments = dict(tool1_arguments)
+    idem = _caller_idempotency_key(
+        resolved_workflow_id,
+        f"{tool1_name}->{tool2_name}",
+        tool1_arguments,
+        idempotency_key or None,
+        principal,
+    )
+    parent_operation_id = _derive_operation_id(f"{idem}:tool1")
+    child_operation_id = _derive_operation_id(f"{idem}:tool2")
+    correlation = CorrelationContext(
+        workflow_id=resolved_workflow_id,
+        workflow_id_source=source,
+        operation_id=child_operation_id,
+        parent_operation_id=parent_operation_id,
+        idempotency_key=idem,
+        agent_session_id=_session_key(ctx),
+        caller_principal=principal,
+        runtime="ClaudeCode",
+        call_path=["ClaudeCode", tool1_name],
+    )
+    request = NestedToolCallRequest(
+        tool1_name=tool1_name,
+        tool1_arguments=tool1_arguments,
+        tool2_name=tool2_name,
+        tool2_arguments=tool2_arguments,
+        idempotency_key=idem,
+        correlation=correlation,
+        approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
+        requested_action=_requested_action(tool2_name, tool2_arguments),
+        justification=justification or None,
+        parent_operation_id=parent_operation_id,
+        nested_operation_id=child_operation_id,
+        controlled_tool1=normalized_mode == "controlled",
+        replay_safe=replay_safe,
+        safe_tool1_arguments=_safe_arguments(tool1_arguments),
+        safe_tool2_arguments=_safe_arguments(tool2_arguments),
+    )
+    start_op = WithStartWorkflowOperation(
+        AgenticChainWorkflow.run,
+        ChainInput(
+            workflow_id=resolved_workflow_id,
+            owner_principal=principal,
+        ),
+        id=resolved_workflow_id,
+        task_queue=TASK_QUEUE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )
+    update = await client.start_update_with_start_workflow(
+        AgenticChainWorkflow.request_nested_tool_call,
+        request,
+        wait_for_stage=WorkflowUpdateStage.ACCEPTED,
+        start_workflow_operation=start_op,
+    )
+    return await update.result()
+
+
+@mcp.tool(structured_output=True)
+async def resume_nested_release(
+    workflow_id: str,
+    operation_id: str,
+    ctx: Context,
+) -> ToolCallResponse:
+    """Explicitly retry an approved uncontrolled nested call.
+
+    Agent Gateway still refuses execution unless Tool1 advertised replay safety.
+    """
+    handle = await _authorized_handle(workflow_id, ctx)
+    response = await handle.execute_update(
+        AgenticChainWorkflow.resume_nested_tool_call,
+        ResumeNestedRequest(
+            operation_id=operation_id,
+            caller_principal=_resolve_principal(ctx),
+        ),
+    )
+    return response
+
+
+@mcp.tool(structured_output=True)
+async def start_google_adk_release_run(
+    service: str,
+    version: str,
+    environment: str,
+    agent_run_id: str,
+    ctx: Context,
+    justification: str = "",
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
+    """Start or recover a durable autonomous Google ADK-style agent run.
+
+    The Temporal workflow checkpoints the agent plan while Agent Gateway owns the
+    approval decision. Dependent external work is executed only after the
+    protected promotion completes.
+    """
+    principal = _resolve_principal(ctx)
+    callback = _current_adk_callback.get()
+    if principal == UNVERIFIED_PRINCIPAL:
+        raise PermissionError(
+            "autonomous agents must authenticate to Agent Gateway"
+        )
+    if not agent_run_id:
+        raise ValueError("agent_run_id is required")
+    if workflow_id:
+        resolved_workflow_id, source = _resolve_workflow_id(workflow_id, ctx)
+    else:
+        seed = f"{principal}:{agent_run_id}"
+        resolved_workflow_id = (
+            "wf-adk-" + hashlib.sha256(seed.encode()).hexdigest()[:16]
+        )
+        source = "inferred_from_agent_run"
+    arguments = {
+        "service": service,
+        "version": version,
+        "environment": environment,
+    }
+    idem = _caller_idempotency_key(
+        resolved_workflow_id,
+        "promote_release",
+        {**arguments, "agent_run_id": agent_run_id},
+        idempotency_key or agent_run_id,
+        principal,
+    )
+    operation_id = _derive_operation_id(idem)
+    correlation = CorrelationContext(
+        workflow_id=resolved_workflow_id,
+        workflow_id_source=source,
+        operation_id=operation_id,
+        idempotency_key=idem,
+        agent_session_id=(
+            callback.session_id if callback is not None else _session_key(ctx)
+        ),
+        agent_run_id=agent_run_id,
+        caller_service="google-adk-agent",
+        caller_principal=principal,
+        runtime="GoogleADKAgent",
+        call_path=["GoogleADKAgent", "AgentGateway", "promote_release"],
+    )
+    input = AutonomousAgentInput(
+        workflow_id=resolved_workflow_id,
+        operation_id=operation_id,
+        idempotency_key=idem,
+        owner_principal=principal,
+        agent_run_id=agent_run_id,
+        agent_identity=principal,
+        tool_name="promote_release",
+        arguments=arguments,
+        safe_arguments=_safe_arguments(arguments),
+        requested_action=_requested_action("promote_release", arguments),
+        justification=justification or None,
+        correlation=correlation,
+        approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
+        callback=callback,
+    )
+    client = await get_client()
+    handle = await client.start_workflow(
+        AutonomousAgentWorkflow.run,
+        input,
+        id=resolved_workflow_id,
+        task_queue=TASK_QUEUE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )
+    if callback is not None:
+        await handle.signal(
+            AutonomousAgentWorkflow.register_callback,
+            callback,
+        )
+    owner = await handle.query(
+        AutonomousAgentWorkflow.get_workflow_owner
+    )
+    if owner != principal:
+        raise PermissionError("workflow_id is owned by a different principal")
+
+    # The first Workflow Task performs policy evaluation. Briefly wait for the
+    # externally useful pause/completion state without tying agent liveness to the
+    # caller connection.
+    for _ in range(100):
+        response = await handle.query(
+            AutonomousAgentWorkflow.get_operation_result,
+            operation_id,
+        )
+        if response.status not in {"processing"}:
+            return response
+        await asyncio.sleep(0.05)
+    return response
+
+
+@mcp.tool(structured_output=True)
+async def get_operation_status(
+    workflow_id: str, operation_id: str, ctx: Context
+) -> ToolCallResponse:
     """Return the current status of one approval-gated operation."""
-    client = await get_client()
-    handle = client.get_workflow_handle(workflow_id)
-    resp = await handle.query(AgenticChainWorkflow.get_operation_status, operation_id)
-    return _as_dict(resp)
+    handle = await _authorized_handle(workflow_id, ctx)
+    resp = await handle.query(
+        "get_operation_status",
+        operation_id,
+        result_type=ToolCallResponse,
+    )
+    return resp
 
 
-@mcp.tool()
-async def get_operation_result(workflow_id: str, operation_id: str) -> dict:
+@mcp.tool(structured_output=True)
+async def get_operation_result(
+    workflow_id: str, operation_id: str, ctx: Context
+) -> ToolCallResponse:
     """Return the result of an operation once it has completed."""
-    client = await get_client()
-    handle = client.get_workflow_handle(workflow_id)
-    resp = await handle.query(AgenticChainWorkflow.get_operation_result, operation_id)
-    return _as_dict(resp)
+    handle = await _authorized_handle(workflow_id, ctx)
+    resp = await handle.query(
+        "get_operation_result",
+        operation_id,
+        result_type=ToolCallResponse,
+    )
+    return resp
 
 
-@mcp.tool()
-async def get_workflow_status(workflow_id: str) -> dict:
+@mcp.tool(structured_output=True)
+async def get_workflow_status(
+    workflow_id: str, ctx: Context
+) -> WorkflowStatusResponse:
     """Return a summary of the whole agentic chain."""
-    client = await get_client()
-    handle = client.get_workflow_handle(workflow_id)
-    summary = await handle.query(AgenticChainWorkflow.get_workflow_status)
-    return _as_dict(summary)
+    handle = await _authorized_handle(workflow_id, ctx)
+    summary = await handle.query("get_workflow_status")
+    raw = _as_dict(summary)
+    return WorkflowStatusResponse(
+        workflow_id=raw["workflow_id"],
+        run_id=raw["run_id"],
+        total_operations=raw["total_operations"],
+        status_counts=raw["status_counts"],
+        operations=[
+            op if isinstance(op, OperationView) else OperationView(**op)
+            for op in raw["operations"]
+        ],
+        closing=raw.get("closing", False),
+        agent_run_id=raw.get("agent_run_id"),
+        agent_identity=raw.get("agent_identity"),
+        checkpoint=raw.get("checkpoint", {}),
+        dependent_action_executed=raw.get(
+            "dependent_action_executed", False
+        ),
+    )
+
+
+@mcp.tool(structured_output=True)
+async def get_workflow_ledger(
+    workflow_id: str, ctx: Context
+) -> WorkflowLedgerResponse:
+    """Return the durable approval and resume ledger for later review."""
+    handle = await _authorized_handle(workflow_id, ctx)
+    entries = await handle.query("get_ledger")
+    raw_entries = _as_dict(entries)
+    return WorkflowLedgerResponse(
+        workflow_id=workflow_id,
+        entries=[
+            entry
+            if isinstance(entry, LedgerEntry)
+            else LedgerEntry(**entry)
+            for entry in raw_entries
+        ],
+    )
+
+
+@mcp.tool(structured_output=True)
+async def cancel_operation(
+    workflow_id: str,
+    operation_id: str,
+    ctx: Context,
+    reason: str = "",
+) -> ToolCallResponse:
+    """Cancel a pending operation without invoking its protected action."""
+    handle = await _authorized_handle(workflow_id, ctx)
+    await handle.signal(
+        "cancel_operation",
+        CancelOperation(
+            operation_id=operation_id,
+            canceled_by=_resolve_principal(ctx),
+            reason=reason or "Canceled by caller",
+        ),
+    )
+    response = await handle.query(
+        "get_operation_status",
+        operation_id,
+        result_type=ToolCallResponse,
+    )
+    return response
 
 
 # ------------------------------------------------------- approver UI and actions
@@ -418,46 +947,126 @@ async def whoami(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "authorization_header_present": bool(auth),
-            "token_seen": token,
             "principals_loaded": len(_PRINCIPALS),
+            "approvers_loaded": len(_APPROVERS),
             "resolved_from_this_request": _principal_for_token(token),
             "resolved_from_middleware_contextvar": _current_principal.get(),
-            "resolved_last_principal": _last_principal,
+            "is_approver": _is_approver(_resolve_principal()),
         }
     )
 
 
+@mcp.custom_route("/login", methods=["GET", "POST"])
+async def login(request: Request) -> Response:
+    if request.method == "GET":
+        return HTMLResponse(_render_login())
+    form = await request.form()
+    token = str(form.get("token") or "")
+    principal = _principal_for_token(token)
+    if not token or not _is_approver(principal):
+        return HTMLResponse(
+            _render_login("That token is not authorized for approvals."),
+            status_code=403,
+        )
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(
+        "gateway_token",
+        token,
+        httponly=True,
+        samesite="strict",
+        secure=False,
+        max_age=8 * 60 * 60,
+    )
+    return response
+
+
+@mcp.custom_route("/logout", methods=["POST"])
+async def logout(request: Request) -> RedirectResponse:
+    response = RedirectResponse("/login", status_code=303)
+    response.delete_cookie("gateway_token")
+    return response
+
+
 @mcp.custom_route("/", methods=["GET"])
 async def dashboard(request: Request) -> HTMLResponse:
+    if not _is_approver(_resolve_principal()):
+        return HTMLResponse(_render_login(), status_code=401)
     client = await get_client()
     pending: list[tuple[str, Any]] = []
     history: list[tuple[str, Any]] = []
-    query = 'WorkflowType = "AgenticChainWorkflow" AND ExecutionStatus = "Running"'
-    async for wf in client.list_workflows(query):
-        handle = client.get_workflow_handle(wf.id)
-        try:
-            summary = await handle.query(AgenticChainWorkflow.get_workflow_status)
-        except Exception:
-            continue
-        for op in summary.operations:
-            if op.status == "waiting_for_approval":
-                pending.append((wf.id, op))
-            elif op.status in TERMINAL_STATUSES:
-                history.append((wf.id, op))
+    queries = [
+        (
+            'WorkflowType = "AgenticChainWorkflow"',
+            AgenticChainWorkflow.get_workflow_status,
+        ),
+        (
+            'WorkflowType = "AutonomousAgentWorkflow"',
+            AutonomousAgentWorkflow.get_workflow_status,
+        ),
+    ]
+    for query, status_query in queries:
+        async for wf in client.list_workflows(query):
+            handle = client.get_workflow_handle(wf.id, run_id=wf.run_id)
+            try:
+                summary = await handle.query(status_query)
+            except Exception:
+                continue
+            for op in summary.operations:
+                if op.status == "waiting_for_approval":
+                    pending.append((wf.id, op))
+                elif op.status in TERMINAL_STATUSES:
+                    history.append((wf.id, op))
     history.sort(key=lambda row: (row[1].decided_iso or ""), reverse=True)
     return HTMLResponse(_render_dashboard(pending, history))
 
 
+def _fetch_fleet_state() -> dict:
+    resp = requests.get(MOCK_TOOL_STATE_URL, timeout=3)
+    resp.raise_for_status()
+    return resp.json()
+
+
+@mcp.custom_route("/fleet", methods=["GET"])
+async def fleet(request: Request) -> JSONResponse:
+    """Fleet state for the dashboard panel, polled on its own cadence.
+
+    Separate from the dashboard HTML so a promotion can be animated in place
+    instead of appearing after a full page reload. Read only, and gated on the
+    same approver identity as the dashboard.
+    """
+    if not _is_approver(_resolve_principal()):
+        return JSONResponse({"error": "not authorized"}, status_code=401)
+    try:
+        # requests is synchronous; run it off the event loop so a slow or hung
+        # deployment backend cannot stall the MCP transport on the same port.
+        state = await asyncio.to_thread(_fetch_fleet_state)
+    except Exception as err:
+        return JSONResponse(
+            {
+                "available": False,
+                "error": f"deployment backend unreachable: {err}",
+                "environments": [],
+                "releases": [],
+            }
+        )
+    state["available"] = True
+    state["protected_environments"] = sorted(PROTECTED_ENVIRONMENTS)
+    return JSONResponse(state)
+
+
 @mcp.custom_route("/approve", methods=["POST"])
 async def approve(request: Request) -> RedirectResponse:
+    principal = _resolve_principal()
+    if not _is_approver(principal):
+        return RedirectResponse("/login", status_code=303)
     form = await request.form()
     client = await get_client()
     handle = client.get_workflow_handle(str(form["workflow_id"]))
     await handle.signal(
-        AgenticChainWorkflow.approve_operation,
+        "approve_operation",
         ApprovalDecision(
             operation_id=str(form["operation_id"]),
-            approver=str(form.get("approver") or "approver@demo"),
+            approver=principal,
         ),
     )
     return RedirectResponse("/", status_code=303)
@@ -465,14 +1074,17 @@ async def approve(request: Request) -> RedirectResponse:
 
 @mcp.custom_route("/reject", methods=["POST"])
 async def reject(request: Request) -> RedirectResponse:
+    principal = _resolve_principal()
+    if not _is_approver(principal):
+        return RedirectResponse("/login", status_code=303)
     form = await request.form()
     client = await get_client()
     handle = client.get_workflow_handle(str(form["workflow_id"]))
     await handle.signal(
-        AgenticChainWorkflow.reject_operation,
+        "reject_operation",
         ApprovalDecision(
             operation_id=str(form["operation_id"]),
-            approver=str(form.get("approver") or "approver@demo"),
+            approver=principal,
             reason=str(form.get("reason") or "Rejected by approver"),
         ),
     )
@@ -522,13 +1134,14 @@ def _render_pending_row(workflow_id: str, op: Any) -> str:
       <td>{_fmt(op.requester)}</td>
       <td class="mono">{_args_summary(op.arguments)}</td>
       <td>{_fmt(op.justification)}</td>
+      <td>{_fmt(op.risk_reason)}</td>
+      <td class="mono">{html.escape(" -> ".join(op.call_path))}</td>
       <td class="mono">{html.escape(_short_ts(op.created_iso))}</td>
       <td class="mono"><span class="countdown" data-deadline="{deadline}"></span></td>
       <td>
         <form method="post" action="/approve" class="inline">
           <input type="hidden" name="workflow_id" value="{wf}">
           <input type="hidden" name="operation_id" value="{op_id}">
-          <input type="text" name="approver" value="approver@demo">
           <button class="approve" type="submit">Approve</button>
         </form>
         <form method="post" action="/reject" class="inline">
@@ -556,6 +1169,7 @@ def _render_history_row(workflow_id: str, op: Any) -> str:
       <td>{_fmt(op.requester)}</td>
       <td class="mono">{html.escape(op.operation_id)}</td>
       <td class="mono">{html.escape(op.tool_name)}</td>
+      <td class="mono">{html.escape(" -> ".join(op.call_path))}</td>
       <td class="{prot_class}">{prot}</td>
       <td>{_fmt(op.requested_action)}</td>
       <td>{_result_summary(op.result)}</td>
@@ -570,10 +1184,16 @@ _CSS = """
 :root {
   --bg: #0f1117; --fg: #e6e8eb; --muted: #8b93a1; --border: #232733;
   --accent: #13c4b0; --th: #8b93a1; --field: #161a22;
+  --card: #151924; --card-edge: #1c2130; --protect: #f59e0b;
+  --on-accent: #04211e; --accent-glow: rgba(19,196,176,0.34);
+  --accent-wash: rgba(19,196,176,0.16); --shine: rgba(19,196,176,0.16);
 }
 [data-theme="light"] {
   --bg: #ffffff; --fg: #0f1117; --muted: #6b7280; --border: #e5e7eb;
   --accent: #0f9b8e; --th: #6b7280; --field: #ffffff;
+  --card: #fbfcfd; --card-edge: #eef1f4; --protect: #b45309;
+  --on-accent: #ffffff; --accent-glow: rgba(15,155,142,0.26);
+  --accent-wash: rgba(15,155,142,0.12); --shine: rgba(15,155,142,0.12);
 }
 body { background: var(--bg); color: var(--fg); font-family: Inter, system-ui, sans-serif; margin: 2rem; }
 header { display: flex; align-items: center; justify-content: space-between; }
@@ -601,10 +1221,465 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .badge-expired { background: #f59e0b; }
 .badge-failed { background: #6b7280; }
 .filterbar { display: flex; gap: 0.5rem; align-items: center; margin-top: 1.75rem; }
+.login { max-width: 28rem; margin: 12vh auto; padding: 2rem; border: 1px solid var(--border); border-radius: 8px; }
+.login input { width: 100%; box-sizing: border-box; margin: 0.5rem 0 1rem; }
+
+/* --------------------------------------------------------- release fleet panel
+   Cards, not a table. The approval queue below answers "what needs a decision";
+   this answers "what is running", so it is deliberately a different visual form
+   while sharing the palette, radii, and type scale. */
+/* One row: what is ready, then the environments it can move through. Bounded so
+   the cards stay card-shaped instead of stretching across the whole window. */
+.fleet { margin-top: 1.5rem; --fleet-width: 66rem; }
+.fleet .subtle, .fleet .fleet-flow { max-width: var(--fleet-width); }
+.fleet-flow { display: flex; align-items: stretch; margin-top: 0.85rem; }
+.ready { flex: 0 0 13.5rem; min-width: 0; }
+.ready .rail-head { margin-top: 0; }
+.fleet-service { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 1.05rem;
+       font-weight: 600; letter-spacing: -0.01em; }
+.section-head { display: flex; align-items: center; gap: 0; }
+.section-head .live { margin-left: 0.7rem; }
+.eyebrow { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--th); }
+.subtle { margin: 0.3rem 0 0; font-size: 0.78rem; }
+.divider { border: 0; border-top: 1px solid var(--border); margin: 1.9rem 0 0; }
+.queue-head { margin-top: 1.6rem; }
+.live { display: inline-flex; align-items: center; gap: 0.38rem; font-size: 0.68rem;
+        text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+.live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent); animation: dot-pulse 2.6s ease-out infinite; }
+.live.stale { color: var(--protect); text-transform: none; letter-spacing: 0; }
+.live.stale .live-dot { background: var(--protect); animation: none; }
+@keyframes dot-pulse {
+  0% { box-shadow: 0 0 0 0 var(--accent-glow); }
+  70% { box-shadow: 0 0 0 6px rgba(0,0,0,0); }
+  100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }
+}
+
+/* Ready -> staging -> production, left to right. The first connector carries the
+   divider that separates what is promotable from what is running. */
+.pipeline { display: flex; flex: 1 1 0; min-width: 0; }
+.link { flex: 0 0 2.6rem; position: relative; display: flex; align-items: center; }
+.link:first-child { flex-basis: 3.1rem; margin-right: 0.9rem; }
+.link:first-child .link-line { margin-right: 0.55rem; }
+.link:first-child::after { right: 0.55rem; }
+/* The pipe: promotable on the left, running on the right. Faded at both ends so a
+   full-height rule does not cut the row in half. */
+.link:first-child::before { content: ""; position: absolute; right: 0; top: -0.35rem; bottom: -0.35rem;
+       width: 1px; background: linear-gradient(180deg, transparent, var(--th), transparent); opacity: 0.8; }
+.link-line { position: relative; flex: 1 1 auto; height: 2px; border-radius: 2px;
+             background: var(--border); overflow: hidden; }
+.link-line::after { content: ""; position: absolute; inset: 0; opacity: 0;
+             background: linear-gradient(90deg, transparent, var(--accent), transparent); }
+.link.flowing .link-line::after { animation: flow 0.9s ease-in-out 2; }
+.link::after { content: ""; position: absolute; right: 0; top: 50%; margin-top: -4px;
+             border-top: 4px solid transparent; border-bottom: 4px solid transparent;
+             border-left: 6px solid var(--border); }
+.link.flowing::after { border-left-color: var(--accent); }
+@keyframes flow { from { transform: translateX(-100%); opacity: 1; } to { transform: translateX(100%); opacity: 1; } }
+
+.env { flex: 1 1 0; min-width: 0; position: relative; overflow: hidden; --stripe: var(--accent);
+       padding: 0.85rem 1.1rem 0.95rem; border: 1px solid var(--card-edge); border-radius: 14px;
+       background: var(--card); transition: border-color 0.5s ease, box-shadow 0.5s ease; }
+.env.protected { --stripe: var(--protect); }
+.env::before { content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0;
+       background: radial-gradient(90% 130% at 22% 130%, var(--accent-wash), transparent 65%); }
+.env::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+       opacity: 0.55; background: linear-gradient(90deg, transparent, var(--stripe), transparent); }
+.env-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+.env-body { min-width: 0; }
+.env-side { min-width: 0; }
+.env-name { font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--th); }
+.tag { flex: none; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em;
+       padding: 0.14rem 0.44rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+.tag-protected { color: var(--protect); border-color: var(--protect); }
+/* Clips the version swap so it reads as an odometer roll rather than two numbers
+   drifting over the rest of the card. */
+.version-wrap { position: relative; flex: 1 1 auto; height: 2.15rem; margin: 0.45rem 0 0.05rem; overflow: hidden; }
+.version { position: absolute; left: 0; right: 0; top: 0; display: flex; align-items: center; height: 100%;
+       font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 1.5rem; font-weight: 600;
+       letter-spacing: -0.02em; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.env-service { font-size: 0.74rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.env-meta { display: flex; align-items: center; gap: 0.45rem;
+       margin-top: 0.3rem; font-size: 0.68rem; color: var(--muted); }
+.env-meta .from { font-family: "JetBrains Mono", ui-monospace, monospace; }
+.env-meta .sep { opacity: 0.5; }
+.shine { position: absolute; top: 0; bottom: 0; left: -60%; width: 45%; opacity: 0; pointer-events: none;
+       background: linear-gradient(100deg, transparent, var(--shine), transparent); }
+
+.env.promoting { border-color: var(--accent); box-shadow: 0 14px 38px -18px var(--accent-glow); }
+.env.promoting::before { animation: wash 1.9s ease-out; }
+.version.out { animation: v-out 0.42s cubic-bezier(0.4,0,1,1) forwards; }
+/* Slight delay so the outgoing version clears before the new one arrives rather
+   than the two crossing over each other. */
+.version.in { animation: v-in 0.6s cubic-bezier(0.16,1,0.3,1) 0.14s both; }
+.env.protected.promoting .shine { animation: shine 1.3s cubic-bezier(0.22,1,0.36,1) 0.08s; }
+@keyframes wash { 0% { opacity: 0; } 18% { opacity: 1; } 100% { opacity: 0; } }
+@keyframes v-out { 0% { transform: translateY(0); opacity: 1; filter: blur(0); }
+                  70% { opacity: 0; }
+                  100% { transform: translateY(-105%); opacity: 0; filter: blur(4px); } }
+@keyframes v-in { 0% { transform: translateY(105%); opacity: 0; filter: blur(4px); }
+                  55% { opacity: 1; }
+                  100% { transform: translateY(0); opacity: 1; filter: blur(0); } }
+@keyframes shine { 0% { left: -60%; opacity: 0; } 22% { opacity: 1; } 100% { left: 115%; opacity: 0; } }
+
+.rail-head { margin-top: 1.1rem; }
+/* Stacked in the ready column, so each release is a block that wraps its badges
+   rather than a pill that would overflow a narrow column. */
+.candidates { display: flex; flex-direction: column; align-items: stretch; gap: 0.4rem; margin-top: 0.5rem; }
+.chip { display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+        padding: 0.34rem 0.5rem 0.34rem 0.62rem;
+        border: 1px solid var(--card-edge); border-radius: 10px; background: var(--card); }
+.chip .when { margin-left: auto; }
+.chip .cv { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.76rem; font-weight: 600; }
+.chip .cw { font-size: 0.66rem; color: var(--muted); }
+.where { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em; padding: 0.1rem 0.42rem;
+        border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
+/* Outline for staging, filled for production: the same version can carry both, and
+   the pair should read as a progression. */
+.where-staging { border-color: var(--accent); color: var(--accent); }
+.where-prod { background: var(--accent); border-color: var(--accent); color: var(--on-accent); font-weight: 600; }
+.where-past { border-style: dashed; opacity: 0.75; }
+.chip.fresh { animation: chip-in 0.55s cubic-bezier(0.16,1,0.3,1); border-color: var(--accent); }
+.rail-empty { font-size: 0.78rem; color: var(--muted); }
+@keyframes chip-in { from { transform: scale(0.88) translateY(5px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+.fleet-toast { position: fixed; top: 1.2rem; right: 1.2rem; z-index: 30; display: flex; align-items: center;
+        gap: 0.65rem; max-width: 22rem; padding: 0.7rem 0.95rem; border: 1px solid var(--accent);
+        border-radius: 12px; background: var(--card); box-shadow: 0 18px 44px -16px var(--accent-glow);
+        animation: toast-in 0.45s cubic-bezier(0.16,1,0.3,1); }
+.fleet-toast.leaving { animation: toast-out 0.35s ease forwards; }
+.toast-mark { display: grid; place-items: center; flex: none; width: 1.4rem; height: 1.4rem; border-radius: 50%;
+        background: var(--accent); color: var(--on-accent); font-size: 0.8rem; font-weight: 700; }
+.toast-title { font-size: 0.85rem; font-weight: 600; }
+.toast-sub { font-size: 0.7rem; color: var(--muted); }
+@keyframes toast-in { from { transform: translateY(-10px) scale(0.97); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes toast-out { to { transform: translateY(-8px); opacity: 0; } }
+
+@media (max-width: 900px) {
+  /* Not enough width for three columns: the ready list goes back to a wrapping
+     row above the two environment cards. */
+  .fleet-flow { flex-direction: column; }
+  .ready { flex: 0 0 auto; }
+  .candidates { flex-direction: row; flex-wrap: wrap; }
+  .chip { border-radius: 999px; }
+  .chip .when { margin-left: 0; }
+  .pipeline { flex: 0 0 auto; margin-top: 1rem; }
+  /* The ready list is above the cards now, not to their left, so an inlet arrow
+     from the page edge would point at nothing. */
+  .link:first-child { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-dot, .env.promoting::before, .env.promoting .shine, .link.flowing .link-line::after,
+  .chip.fresh, .fleet-toast { animation: none; }
+  .version.out { display: none; }
+  .version.in { animation: none; }
+}
 """
 
 _THEME_BOOT_JS = """
 try { document.documentElement.setAttribute('data-theme', localStorage.getItem('gw-theme') || 'dark'); } catch (e) {}
+"""
+
+_FLEET_JS = """
+// Release fleet panel. Polls /fleet on its own 2s cadence and updates the cards in
+// place, so a promotion is visible as a transition instead of appearing after the
+// page reload. The panel is the only part of the dashboard that mutates without a
+// reload; the queue and history tables still come from the server render.
+var FLEET = (function () {
+  var LABELS = { staging: 'Staging', prod: 'Production' };
+  var KNOWN_ENVS = { staging: 1, prod: 1 };
+  var ANIM_MS = 2200;
+  var pipeline, rail, statusEl, serviceEl;
+  var protectedEnvs = {};
+  var seen = {};
+  var railSeen = {};
+  var railPainted = false;
+  var holdUntil = 0;
+
+  function label(env) { return LABELS[env] || env; }
+  function readJson(key, fallback) {
+    try { return JSON.parse(sessionStorage.getItem(key)) || fallback; } catch (e) { return fallback; }
+  }
+  function writeJson(key, value) {
+    try { sessionStorage.setItem(key, JSON.stringify(value)); } catch (e) {}
+  }
+
+  // Numeric segment by segment, lexical when a segment is not a plain number, so
+  // 2.10.0 sorts above 2.9.0 and a suffixed build still orders deterministically.
+  function cmpVersion(a, b) {
+    var x = String(a).split('.'), y = String(b).split('.');
+    for (var i = 0; i < Math.max(x.length, y.length); i++) {
+      var p = x[i] === undefined ? '' : x[i], q = y[i] === undefined ? '' : y[i];
+      var np = parseInt(p, 10), nq = parseInt(q, 10);
+      if (String(np) === p && String(nq) === q) {
+        if (np !== nq) return np < nq ? -1 : 1;
+      } else if (p !== q) {
+        return p < q ? -1 : 1;
+      }
+    }
+    return 0;
+  }
+
+  function ago(epoch) {
+    var value = parseFloat(epoch);
+    if (!value) return '';
+    var s = Math.max(0, Math.floor(Date.now() / 1000 - value));
+    if (s < 5) return 'just now';
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+  }
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function cardFor(env) {
+    var cards = pipeline.querySelectorAll('.env');
+    for (var i = 0; i < cards.length; i++) {
+      if (cards[i].getAttribute('data-env') === env) return cards[i];
+    }
+    return null;
+  }
+
+  function linkInto(env) {
+    var links = pipeline.querySelectorAll('.link');
+    for (var i = 0; i < links.length; i++) {
+      if (links[i].getAttribute('data-into') === env) return links[i];
+    }
+    return null;
+  }
+
+  function buildPipeline(records) {
+    pipeline.innerHTML = '';
+    records.forEach(function (rec) {
+      // Every card gets an inbound connector, including the first: releases flow
+      // into staging from the ready list sitting directly above it.
+      var link = el('div', 'link');
+      link.setAttribute('data-into', rec.environment);
+      link.appendChild(el('span', 'link-line'));
+      pipeline.appendChild(link);
+      var card = el('div', 'env' + (protectedEnvs[rec.environment] ? ' protected' : ''));
+      card.setAttribute('data-env', rec.environment);
+      card.appendChild(el('span', 'shine'));
+      var top = el('div', 'env-top');
+      top.appendChild(el('span', 'env-name'));
+      top.appendChild(el('span', 'tag'));
+      card.appendChild(top);
+      var body = el('div', 'env-body');
+      body.appendChild(el('div', 'version-wrap'));
+      var side = el('div', 'env-side');
+      side.appendChild(el('div', 'env-service'));
+      var meta = el('div', 'env-meta');
+      meta.appendChild(el('span', 'from'));
+      meta.appendChild(el('span', 'sep', '\\u00b7'));
+      meta.appendChild(el('span', 'when'));
+      side.appendChild(meta);
+      body.appendChild(side);
+      card.appendChild(body);
+      pipeline.appendChild(card);
+    });
+  }
+
+  // Returns true when the version actually changed and was animated.
+  function setVersion(card, version, animate) {
+    var wrap = card.querySelector('.version-wrap');
+    var current = wrap.querySelector('.version:not(.out)');
+    if (current && current.textContent === version) return false;
+    if (!current || !animate) {
+      wrap.innerHTML = '';
+      wrap.appendChild(el('span', 'version', version));
+      return false;
+    }
+    current.classList.add('out');
+    setTimeout(function () { current.remove(); }, 800);
+    wrap.appendChild(el('span', 'version in', version));
+    return true;
+  }
+
+  function toast(rec) {
+    var node = el('div', 'fleet-toast');
+    node.appendChild(el('span', 'toast-mark', '\\u2713'));
+    var body = el('div');
+    body.appendChild(el('div', 'toast-title', 'Live in ' + label(rec.environment) + ' \\u00b7 ' + rec.version));
+    body.appendChild(el('div', 'toast-sub', (rec.service || '') +
+      (rec.previous_version ? ' \\u00b7 replaced ' + rec.previous_version : '')));
+    node.appendChild(body);
+    document.body.appendChild(node);
+    setTimeout(function () {
+      node.classList.add('leaving');
+      setTimeout(function () { node.remove(); }, 400);
+    }, 4500);
+  }
+
+  function announce(card, rec) {
+    card.classList.remove('promoting');
+    void card.offsetWidth;  // restart the keyframes on a repeat promotion
+    card.classList.add('promoting');
+    var link = linkInto(rec.environment);
+    if (link) { link.classList.remove('flowing'); void link.offsetWidth; link.classList.add('flowing'); }
+    setTimeout(function () {
+      card.classList.remove('promoting');
+      if (link) link.classList.remove('flowing');
+    }, ANIM_MS);
+    // A protected environment is the point of the whole demo, so it gets the
+    // loudest treatment: card shine plus a toast.
+    if (protectedEnvs[rec.environment]) toast(rec);
+    hold();
+  }
+
+  function hold() { holdUntil = Date.now() + ANIM_MS + 600; }
+
+  function paint(state, animate) {
+    var records = state.environments || [];
+    if (!records.length) return;
+    protectedEnvs = {};
+    (state.protected_environments || ['prod']).forEach(function (env) { protectedEnvs[env] = true; });
+
+    if (serviceEl) {
+      var service = records[0].service || '';
+      serviceEl.textContent = service ? ': ' + service : '';
+    }
+
+    var shape = records.map(function (rec) { return rec.environment; }).join('|');
+    if (pipeline.getAttribute('data-shape') !== shape) {
+      buildPipeline(records);
+      pipeline.setAttribute('data-shape', shape);
+    }
+
+    var animated = false;
+    records.forEach(function (rec) {
+      var card = cardFor(rec.environment);
+      if (!card) return;
+      var isProtected = !!protectedEnvs[rec.environment];
+      card.querySelector('.env-name').textContent = label(rec.environment);
+      var tag = card.querySelector('.tag');
+      tag.className = 'tag' + (isProtected ? ' tag-protected' : '');
+      tag.textContent = isProtected ? 'approval required' : 'auto-promote';
+      card.querySelector('.env-service').textContent = rec.service || '';
+      card.querySelector('.from').textContent = rec.previous_version
+        ? 'from ' + rec.previous_version : 'initial state';
+      card.querySelector('.when').setAttribute('data-epoch', rec.updated_at || '');
+      if (setVersion(card, rec.version, animate)) {
+        announce(card, rec);
+        animated = true;
+      }
+      seen[rec.environment] = rec.version;
+    });
+
+    paintRail(state);
+    tickTimes();
+    // Persist only once the transition has played, so a reload landing mid
+    // animation replays it instead of swallowing it.
+    if (animated) setTimeout(function () { writeJson('gw-fleet-seen', seen); }, ANIM_MS);
+    else writeJson('gw-fleet-seen', seen);
+  }
+
+  function paintRail(state) {
+    var records = state.environments || [];
+    // A version can be running in more than one environment, so keep every one of
+    // them. Environments arrive ordered staging -> prod, which is the order the
+    // badges read in.
+    var where = {};
+    records.forEach(function (rec) {
+      var key = rec.service + '@' + rec.version;
+      (where[key] = where[key] || []).push(rec.environment);
+    });
+
+    // Anything older than the oldest version still running somewhere is history,
+    // not something to promote, so it drops off the rail.
+    var floor = null;
+    records.forEach(function (rec) {
+      if (floor === null || cmpVersion(rec.version, floor) < 0) floor = rec.version;
+    });
+    var releases = (state.releases || []).filter(function (rel) {
+      return floor === null || cmpVersion(rel.version, floor) >= 0;
+    });
+
+    rail.innerHTML = '';
+    if (!releases.length) {
+      rail.appendChild(el('span', 'rail-empty', 'No releases are cut and ready to promote.'));
+      return;
+    }
+    var fresh = false;
+    releases.forEach(function (rel) {
+      var key = rel.service + '@' + rel.version;
+      var isNew = railPainted && !railSeen[key];
+      railSeen[key] = true;
+      if (isNew) fresh = true;
+      var chip = el('span', 'chip' + (isNew ? ' fresh' : ''));
+      chip.appendChild(el('span', 'cv', rel.version));
+      var envs = where[key] || [];
+      var history = rel.seen_in || [];
+      if (envs.length) {
+        envs.forEach(function (env) {
+          chip.appendChild(el('span', 'where' + (KNOWN_ENVS[env] ? ' where-' + env : ''), 'in ' + env));
+        });
+      } else if (history.length) {
+        chip.appendChild(el('span', 'where where-past', 'was in ' + history[history.length - 1]));
+      } else {
+        chip.appendChild(el('span', 'cw', 'ready'));
+      }
+      var when = el('span', 'cw when');
+      when.setAttribute('data-epoch', rel.cut_at || '');
+      chip.appendChild(when);
+      rail.appendChild(chip);
+    });
+    railPainted = true;
+    if (fresh) hold();
+  }
+
+  function setStatus(ok, message) {
+    if (!statusEl) return;
+    statusEl.className = ok ? 'live' : 'live stale';
+    var text = statusEl.querySelector('.live-text');
+    if (text) text.textContent = ok ? 'live' : (message || 'unavailable');
+  }
+
+  function tickTimes() {
+    document.querySelectorAll('.when').forEach(function (node) {
+      node.textContent = ago(node.getAttribute('data-epoch'));
+    });
+  }
+
+  function poll() {
+    fetch('/fleet', { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (resp) { return resp.ok ? resp.json() : Promise.reject(resp.status); })
+      .then(function (state) {
+        if (state.available === false) { setStatus(false, 'deployment backend unreachable'); return; }
+        setStatus(true);
+        writeJson('gw-fleet-state', state);
+        paint(state, true);
+      })
+      .catch(function () { setStatus(false, 'fleet state unavailable'); });
+  }
+
+  function init() {
+    pipeline = document.getElementById('fleet-pipeline');
+    rail = document.getElementById('fleet-rail');
+    statusEl = document.getElementById('fleet-status');
+    serviceEl = document.getElementById('fleet-service');
+    if (!pipeline || !rail) return;
+    // Paint from the last known state first so a reload does not flash an empty
+    // panel, then rewind any version whose transition has not been shown yet.
+    var cached = readJson('gw-fleet-state', null);
+    var pending = readJson('gw-fleet-seen', {});
+    if (cached) {
+      paint(cached, false);
+      Object.keys(pending).forEach(function (env) {
+        var card = cardFor(env);
+        if (card) setVersion(card, pending[env], false);
+      });
+    }
+    poll();
+    setInterval(poll, 2000);
+  }
+
+  return { init: init, tickTimes: tickTimes, holdsReload: function () { return Date.now() < holdUntil; } };
+})();
 """
 
 _MAIN_JS = """
@@ -634,7 +1709,9 @@ _MAIN_JS = """
       el.textContent = fmt(ms);
       if (ms <= 60000) { el.classList.add('urgent'); } else { el.classList.remove('urgent'); }
     });
+    FLEET.tickTimes();
   }
+  FLEET.init();
   tick(); setInterval(tick, 1000);
 
   var filter = document.getElementById('wf-filter');
@@ -661,6 +1738,8 @@ _MAIN_JS = """
   setInterval(function () {
     var a = document.activeElement;
     if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA')) return;
+    // Never reload through a fleet transition; the animation is the point.
+    if (FLEET.holdsReload()) return;
     var reasons = document.querySelectorAll('input.reason');
     for (var i = 0; i < reasons.length; i++) { if (reasons[i].value.trim() !== '') return; }
     window.location.reload();
@@ -675,12 +1754,12 @@ def _render_dashboard(
     pending_rows = (
         "".join(_render_pending_row(wf, op) for wf, op in pending)
         if pending
-        else '<tr><td colspan="9" class="empty">No operations are waiting for approval.</td></tr>'
+        else '<tr><td colspan="11" class="empty">No operations are waiting for approval.</td></tr>'
     )
     history_rows = (
         "".join(_render_history_row(wf, op) for wf, op in history)
         if history
-        else '<tr><td colspan="11" class="empty">No tool calls recorded yet.</td></tr>'
+        else '<tr><td colspan="12" class="empty">No tool calls recorded yet.</td></tr>'
     )
     wf_ids = sorted({wf for wf, _ in history})
     options = "".join(f'<option value="{html.escape(w)}">' for w in wf_ids)
@@ -689,23 +1768,46 @@ def _render_dashboard(
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <title>Agent Gateway Approvals</title>
+  <title>Waypoint Deployment Monitor</title>
   <script>{_THEME_BOOT_JS}</script>
   <style>{_CSS}</style>
 </head>
 <body>
   <header>
-    <h1>Agent Gateway Approvals</h1>
-    <button id="theme-btn" class="toggle" type="button">Light mode</button>
+    <h1>Waypoint Deployment Monitor</h1>
+    <div>
+      <span class="muted">{html.escape(_resolve_principal())}</span>
+      <button id="theme-btn" class="toggle" type="button">Light mode</button>
+      <form method="post" action="/logout" class="inline" style="display:inline">
+        <button class="toggle" type="submit">Log out</button>
+      </form>
+    </div>
   </header>
-  <p class="muted">Operations paused pending human approval. Auto-refreshes every 5 seconds while you are not typing.</p>
+  <section class="fleet" id="fleet">
+    <div class="section-head">
+      <h2>Release fleet</h2>
+      <span class="fleet-service" id="fleet-service"></span>
+      <span class="live" id="fleet-status"><span class="live-dot"></span><span class="live-text">live</span></span>
+    </div>
+    <p class="muted subtle">What is cut, what is running where, and every promotion as it lands.</p>
+    <div class="fleet-flow">
+      <div class="ready">
+        <div class="rail-head eyebrow">Ready for release</div>
+        <div class="candidates" id="fleet-rail"></div>
+      </div>
+      <div class="pipeline" id="fleet-pipeline"></div>
+    </div>
+  </section>
 
-  <h2>Waiting for approval</h2>
+  <hr class="divider">
+
+  <h2 class="queue-head">Waiting for approval</h2>
   <table>
     <thead>
       <tr>
         <th>Workflow</th><th>Operation</th><th>Requested action</th><th>Requester</th>
-        <th>Arguments</th><th>Justification</th><th>Submitted</th><th>Deadline</th><th>Decision</th>
+        <th>Arguments</th><th>Justification</th><th>Risk reason</th><th>Call path</th>
+        <th>Submitted</th><th>Deadline</th><th>Decision</th>
       </tr>
     </thead>
     <tbody>{pending_rows}</tbody>
@@ -720,7 +1822,7 @@ def _render_dashboard(
   <table>
     <thead>
       <tr>
-        <th>Timestamp</th><th>Workflow</th><th>Requester</th><th>Operation</th><th>Tool</th>
+        <th>Timestamp</th><th>Workflow</th><th>Requester</th><th>Operation</th><th>Tool</th><th>Call path</th>
         <th>Protected</th><th>Requested action</th><th>Result</th><th>Outcome</th>
         <th>Approver</th><th>Reason</th>
       </tr>
@@ -728,7 +1830,36 @@ def _render_dashboard(
     <tbody>{history_rows}</tbody>
   </table>
 
+  <script>{_FLEET_JS}</script>
   <script>{_MAIN_JS}</script>
+</body>
+</html>"""
+
+
+def _render_login(error: str = "") -> str:
+    message = (
+        f'<p style="color:#ef4444">{html.escape(error)}</p>' if error else ""
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Waypoint Deployment Monitor</title>
+  <script>{_THEME_BOOT_JS}</script>
+  <style>{_CSS}</style>
+</head>
+<body>
+  <main class="login">
+    <h1>Approver sign in</h1>
+    <p class="muted">Use a gateway-issued approver token. Decisions are recorded
+    under the identity mapped to the token, not a form-supplied name.</p>
+    {message}
+    <form method="post" action="/login">
+      <label for="token">Approver token</label>
+      <input id="token" name="token" type="password" autocomplete="current-password" required>
+      <button class="approve" type="submit">Sign in</button>
+    </form>
+  </main>
 </body>
 </html>"""
 

@@ -5,16 +5,26 @@ from enum import Enum
 from typing import Any, Optional
 
 
+AGENT_GATEWAY_APPROVAL_SIGNAL = "agent_gateway_approval_resolved"
+CALLBACK_WORKFLOW_ID_HEADER = "x-agent-gateway-callback-workflow-id"
+CALLBACK_RUN_ID_HEADER = "x-agent-gateway-callback-run-id"
+ADK_SESSION_ID_HEADER = "x-agent-gateway-adk-session-id"
+
+
 class OperationStatus(str, Enum):
     """Lifecycle states for a single approval-gated operation."""
 
     EVALUATING = "evaluating"
     WAITING_FOR_APPROVAL = "waiting_for_approval"
     APPROVED = "approved"
+    APPROVED_AWAITING_RETRY = "approved_awaiting_retry"
+    WAITING_FOR_DEPENDENCY = "waiting_for_dependency"
     INVOKING = "invoking"
     COMPLETED = "completed"
     REJECTED = "rejected"
     EXPIRED = "expired"
+    CANCELED = "canceled"
+    BLOCKED = "blocked"
     FAILED = "failed"
 
 
@@ -29,9 +39,46 @@ class CorrelationContext:
 
     workflow_id: str
     workflow_id_source: str = "explicit"
+    operation_id: Optional[str] = None
+    parent_operation_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
     agent_session_id: Optional[str] = None
+    agent_run_id: Optional[str] = None
+    tool_call_id: Optional[str] = None
+    parent_call_id: Optional[str] = None
     request_id: Optional[str] = None
+    traceparent: Optional[str] = None
+    caller_service: Optional[str] = None
     caller_principal: Optional[str] = None
+    end_user_id: Optional[str] = None
+    tenant_id: Optional[str] = None
+    operation_type: Optional[str] = None
+    target_resource: Optional[str] = None
+    runtime: str = "mcp"
+    call_path: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class AdkTemporalSessionCallback:
+    """Durable callback target for an ADK session running in Temporal."""
+
+    workflow_id: str
+    run_id: Optional[str]
+    session_id: str
+
+
+@dataclass
+class ApprovalResolution:
+    """Terminal Agent Gateway result signaled back to an ADK session workflow."""
+
+    gateway_workflow_id: str
+    operation_id: str
+    status: str
+    adk_session_id: str
+    agent_run_id: Optional[str] = None
+    result: Optional[Any] = None
+    reason: Optional[str] = None
+    message: Optional[str] = None
 
 
 @dataclass
@@ -52,6 +99,7 @@ class ToolCallRequest:
     # gateway knows it up front (needed when a call converts to async before the
     # workflow responds).
     operation_id: str = ""
+    safe_arguments: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -69,6 +117,9 @@ class ToolCallResponse:
     reason: Optional[str] = None
     message: Optional[str] = None
     poll_after_seconds: Optional[int] = None
+    parent_operation_id: Optional[str] = None
+    call_path: list[str] = field(default_factory=list)
+    retry_required: bool = False
 
 
 @dataclass
@@ -78,6 +129,44 @@ class ApprovalDecision:
     operation_id: str
     approver: str
     reason: Optional[str] = None
+
+
+@dataclass
+class CancelOperation:
+    """A caller or operator cancellation delivered as a Signal."""
+
+    operation_id: str
+    canceled_by: str
+    reason: Optional[str] = None
+
+
+@dataclass
+class NestedToolCallRequest:
+    """A Tool1 call that discovers a nested Tool2 call through the gateway."""
+
+    tool1_name: str
+    tool1_arguments: dict[str, Any]
+    tool2_name: str
+    tool2_arguments: dict[str, Any]
+    idempotency_key: str
+    correlation: CorrelationContext
+    approval_timeout_seconds: int = 300
+    requested_action: str = ""
+    justification: Optional[str] = None
+    parent_operation_id: str = ""
+    nested_operation_id: str = ""
+    controlled_tool1: bool = True
+    replay_safe: bool = False
+    safe_tool1_arguments: dict[str, Any] = field(default_factory=dict)
+    safe_tool2_arguments: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ResumeNestedRequest:
+    """Explicit retry/resume request for an uncontrolled Tool1."""
+
+    operation_id: str
+    caller_principal: str
 
 
 @dataclass
@@ -130,6 +219,14 @@ class Operation:
     decided_iso: Optional[str] = None
     result: Optional[Any] = None
     error: Optional[str] = None
+    parent_operation_id: Optional[str] = None
+    child_operation_id: Optional[str] = None
+    call_path: list[str] = field(default_factory=list)
+    safe_arguments: dict[str, Any] = field(default_factory=dict)
+    workflow_id_source: str = ""
+    controlled_tool: bool = True
+    replay_safe: bool = False
+    checkpoint: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -154,6 +251,13 @@ class OperationView:
     decided_iso: Optional[str] = None
     decision_reason: Optional[str] = None
     result: Optional[Any] = None
+    parent_operation_id: Optional[str] = None
+    child_operation_id: Optional[str] = None
+    call_path: list[str] = field(default_factory=list)
+    workflow_id_source: str = ""
+    controlled_tool: bool = True
+    replay_safe: bool = False
+    checkpoint: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -161,6 +265,7 @@ class ChainState:
     """All chain state. This is what gets forwarded across Continue-As-New."""
 
     workflow_id: str
+    owner_principal: str = ""
     operations: dict[str, Operation] = field(default_factory=dict)
     # idempotency_key -> operation_id. Carried across CAN because Update IDs are
     # scoped to a single Execution and reset after Continue-As-New.
@@ -179,6 +284,7 @@ class ChainInput:
     """Workflow input. state is None on first start and populated on CAN."""
 
     workflow_id: str
+    owner_principal: str = ""
     state: Optional[ChainState] = None
 
 
@@ -190,3 +296,90 @@ class ChainSummary:
     status_counts: dict[str, int]
     operations: list[OperationView]
     closing: bool = False
+
+
+@dataclass
+class AutonomousAgentInput:
+    """Input for a durable Google ADK-style autonomous agent run."""
+
+    workflow_id: str
+    operation_id: str
+    idempotency_key: str
+    owner_principal: str
+    agent_run_id: str
+    agent_identity: str
+    tool_name: str
+    arguments: dict[str, Any]
+    safe_arguments: dict[str, Any]
+    requested_action: str
+    justification: Optional[str]
+    correlation: CorrelationContext
+    approval_timeout_seconds: int = 300
+    callback: Optional[AdkTemporalSessionCallback] = None
+
+
+@dataclass
+class AdkSessionWorkflowInput:
+    """Configuration for one long-lived Temporal-backed ADK session."""
+
+    user_id: str = "user"
+    session_id: str = ""
+    model: str = "gemini-2.5-flash"
+
+
+@dataclass
+class AdkSessionTurnInput:
+    """One user turn submitted to a running ADK session workflow."""
+
+    turn_id: str
+    prompt: str
+
+
+@dataclass
+class AdkSessionWorkflowResult:
+    """Current or completed result for one turn in the ADK session."""
+
+    workflow_id: str
+    session_id: str
+    turn_id: str = ""
+    initial_response: str = ""
+    resumed_response: Optional[str] = None
+    approval: Optional[ApprovalResolution] = None
+    complete: bool = False
+
+
+@dataclass
+class AgentRunSummary:
+    workflow_id: str
+    run_id: str
+    total_operations: int
+    status_counts: dict[str, int]
+    operations: list[OperationView]
+    agent_run_id: str
+    agent_identity: str
+    checkpoint: dict[str, Any] = field(default_factory=dict)
+    dependent_action_executed: bool = False
+
+
+@dataclass
+class WorkflowStatusResponse:
+    """Stable MCP output schema shared by chain and autonomous workflows."""
+
+    workflow_id: str
+    run_id: str
+    total_operations: int
+    status_counts: dict[str, int]
+    operations: list[OperationView]
+    closing: bool = False
+    agent_run_id: Optional[str] = None
+    agent_identity: Optional[str] = None
+    checkpoint: dict[str, Any] = field(default_factory=dict)
+    dependent_action_executed: bool = False
+
+
+@dataclass
+class WorkflowLedgerResponse:
+    """Stable MCP output schema for the durable human-input ledger."""
+
+    workflow_id: str
+    entries: list[LedgerEntry]

@@ -42,6 +42,10 @@ services:
       TASK_QUEUE: "agentic-gateway"
       MOCK_TOOL_URL: "http://mock-tool:9000/invoke"
       PROTECTED_ENVIRONMENTS: "prod,production"
+      AGENT_GATEWAY_MCP_URL: "http://gateway:8080/mcp"
+      AGENT_GATEWAY_TOKEN: "tok_adk"
+      ADK_MODEL: "${ADK_MODEL:-gemini-2.5-flash}"
+      GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
 
   gateway:
     build:
@@ -56,13 +60,33 @@ services:
       TASK_QUEUE: "agentic-gateway"
       APPROVAL_TIMEOUT_SECONDS: "300"
       GATEWAY_PORT: "8080"
+      # Read only fleet state for the dashboard's release panel.
+      MOCK_TOOL_STATE_URL: "http://mock-tool:9000/state"
+      PROTECTED_ENVIRONMENTS: "prod,production"
       # Static bearer-token to identity map. The gateway sets the approval
       # requester from a matching token, never from anything the agent says.
       # Connect Claude Code with: --header "Authorization: Bearer tok_dustin"
-      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>"}'
+      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@temporal.io>","tok_abe":"Abe Roover <Abe.Roover@temporal.io>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo"}'
+      GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@temporal.io>,Abe Roover <Abe.Roover@temporal.io>"
       GATEWAY_DEBUG: "1"
     ports:
       - "8080:8080"
+
+  adk-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    command: ["adk", "web", "--host", "0.0.0.0", "--port", "8000", "adk_agents"]
+    depends_on:
+      temporal:
+        condition: service_healthy
+    environment:
+      PYTHONPATH: "/app"
+      TEMPORAL_ADDRESS: "temporal:7233"
+      TASK_QUEUE: "agentic-gateway"
+      ADK_MODEL: "${ADK_MODEL:-gemini-2.5-flash}"
+    ports:
+      - "8000:8000"
 
 volumes:
   temporal-data:

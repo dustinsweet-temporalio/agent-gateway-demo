@@ -23,7 +23,7 @@ def evaluate_policy(input: EvaluatePolicyInput) -> PolicyDecision:
     a Workflow code change and without introducing non-determinism. Policy is a
     function of the tool identity and the requested arguments: promoting a release
     to a protected environment (prod) requires approval; everything else, including
-    reads and promotions to test or staging, runs immediately.
+    reads and promotions to staging, runs immediately.
     """
     if input.tool_name == "promote_release":
         environment = str(input.arguments.get("environment", "")).lower()

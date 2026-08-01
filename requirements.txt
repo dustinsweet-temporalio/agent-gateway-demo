@@ -1,8 +1,10 @@
 # Version floors. These are minimums known to carry the APIs this demo uses
 # (update-with-start in temporalio, streamable-http transport in mcp). Newer
 # releases are fine.
-temporalio>=1.9.0
+temporalio>=1.30.0
 mcp>=1.12.0
+google-adk[mcp]>=2.5.0,<3.0.0
 requests>=2.31.0
 starlette>=0.37.0
 uvicorn>=0.30.0
+python-multipart>=0.0.9
