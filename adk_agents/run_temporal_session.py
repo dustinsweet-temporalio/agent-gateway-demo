@@ -34,7 +34,7 @@ async def main() -> None:
     parser.add_argument("--workflow-id", default="")
     parser.add_argument(
         "--model",
-        default=os.getenv("ADK_MODEL", "gemini-2.5-flash"),
+        default=os.getenv("ADK_MODEL", "gemini-3.6-flash"),
     )
     args = parser.parse_args()
 

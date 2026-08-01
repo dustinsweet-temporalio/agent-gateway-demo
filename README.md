@@ -214,16 +214,26 @@ docker compose up --build worker adk-agent
 
 Docker Compose injects the key into the worker when the container starts. It is
 not baked into any image, and both `.env` and `.env.*` are excluded from the
-Docker build context. `ADK_MODEL` defaults to `gemini-2.5-flash` in the template
+Docker build context. `ADK_MODEL` defaults to `gemini-3.6-flash` in the template
 and is passed to new ADK session workflows, so either value can be changed
 without rebuilding the image; recreate the worker after changing `.env`.
 
 Open http://localhost:8000, select `release_approval_agent`, and ask:
 
 ```
-Start an autonomous release run for delivery-matching-service 2.5.0 to
-prod, with agent_run_id walkthrough-adk-run-1.
+Promote delivery-matching-service 2.5.0 to prod. The rollout is validated and
+ready to go.
 ```
+
+Service, version, and environment are the only facts the agent needs. It derives
+the durable run key itself as `release-<service>-<version>-<environment>`, so
+repeating the request recovers the same run rather than opening a second
+approval. Override it by naming one: `use agent_run_id walkthrough-adk-run-2`.
+
+`ADK_MODEL` must name a model the API key can call. Google closes older models
+such as `gemini-2.5-flash` to new keys, and the session turn then fails with a
+404; list the reachable models with
+`curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GOOGLE_API_KEY"`.
 
 The agent returns the durable `workflow_id` and `operation_id` when approval is
 needed. Leave the ADK turn open and decide it at http://localhost:8080. Agent
@@ -585,7 +595,7 @@ Set via environment in `docker-compose.yml`.
   Temporal MCP Activities. Compose sets it to `http://gateway:8080/mcp`.
 - `AGENT_GATEWAY_TOKEN` bearer identity used by the worker's MCP Activities. The
   local demo defaults to `tok_adk`; production should inject a real secret.
-- `ADK_MODEL` model used by the ADK agent. Default `gemini-2.5-flash`.
+- `ADK_MODEL` model used by the ADK agent. Default `gemini-3.6-flash`.
 - `GOOGLE_API_KEY` Gemini API credential injected into the worker at runtime. It
   is deliberately absent from the Docker image and ADK Web container.
 

@@ -329,7 +329,7 @@ class AdkSessionWorkflowInput:
 
     user_id: str = "user"
     session_id: str = ""
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3.6-flash"
 
 
 @dataclass
@@ -351,6 +351,7 @@ class AdkSessionWorkflowResult:
     resumed_response: Optional[str] = None
     approval: Optional[ApprovalResolution] = None
     complete: bool = False
+    error: Optional[str] = None
 
 
 @dataclass

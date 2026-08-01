@@ -423,12 +423,20 @@ Open http://localhost:8000 and select `release_approval_agent`.
 The key and `ADK_MODEL` are injected into the worker at container startup; they
 are not baked into an image or passed to ADK Web.
 
+`ADK_MODEL` must name a model your API key can actually call. Google closes older
+models such as `gemini-2.5-flash` to new keys, and the turn then fails with a 404.
+List what your key can reach with:
+
+```bash
+curl -s "https://generativelanguage.googleapis.com/v1beta/models?key=$GOOGLE_API_KEY"
+```
+
 If you prefer a terminal client, start the same Temporal execution model with:
 
 ```bash
 docker compose exec worker python -m adk_agents.run_temporal_session \
   --session-id walkthrough-temporal-adk-1 \
-  --prompt 'Start Scenario 3 for delivery-matching-service version 2.5.0 to prod. Use agent_run_id walkthrough-adk-run-1 and justification "autonomous walkthrough".'
+  --prompt 'Promote delivery-matching-service 2.5.0 to prod. The rollout is validated and ready to go.'
 ```
 
 ### B. Trigger Scenario 3
@@ -436,22 +444,27 @@ docker compose exec worker python -m adk_agents.run_temporal_session \
 Send this message to the ADK agent:
 
 ```text
-Start an autonomous release run for delivery-matching-service 2.5.0 to
-prod, with agent_run_id walkthrough-adk-run-1. The rollout is validated and
+Promote delivery-matching-service 2.5.0 to prod. The rollout is validated and
 ready to go.
 ```
 
 Expected result:
 
 ```text
-status: waiting_for_approval
-workflow_id: wf-adk-...
-operation_id: ...
+Status: waiting_for_approval
+Workflow ID: wf-adk-...
+Operation ID: op-...
 ```
 
-The `agent_run_id` is the durable run key. When no separate idempotency key is
-given, Agent Gateway also uses it as the caller key. Repeating this exact request
-recovers the same run; use `walkthrough-adk-run-2` for a new run.
+Nothing in that sentence is demo scaffolding. Service, version, and environment
+are the only facts the agent needs, and it picks the durable run key itself:
+`release-delivery-matching-service-2.5.0-prod`.
+
+That key is what makes the run recoverable. When no separate idempotency key is
+given, Agent Gateway also uses it as the caller key, so asking for the same
+service, version, and environment again recovers the same run instead of opening
+a second approval. To stage a fresh approval, promote a different version or name
+your own key: `use agent_run_id walkthrough-adk-run-2`.
 
 The autonomous workflow checkpoint in Temporal shows:
 

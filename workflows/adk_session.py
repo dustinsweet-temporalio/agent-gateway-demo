@@ -95,14 +95,20 @@ class TemporalAdkSessionWorkflow:
             )
             self._turns[turn.turn_id] = result
 
-            (
-                result.initial_response,
-                self._waiting_operation_id,
-            ) = await self._run_agent_turn(
-                self._runner,
-                self._input.user_id,
-                turn.prompt,
-            )
+            try:
+                (
+                    result.initial_response,
+                    self._waiting_operation_id,
+                ) = await self._run_agent_turn(
+                    self._runner,
+                    self._input.user_id,
+                    turn.prompt,
+                )
+            except Exception as err:
+                # A model or MCP Activity that exhausted its retries would
+                # otherwise leave the browser waiting on an Update that never
+                # resolves. Report the failure as the turn's answer instead.
+                return self._fail_turn(result, err)
 
             if self._waiting_operation_id is not None:
                 await workflow.wait_condition(
@@ -114,14 +120,17 @@ class TemporalAdkSessionWorkflow:
                 )
                 assert self._approval is not None
                 result.approval = self._approval
-                (
-                    result.resumed_response,
-                    _,
-                ) = await self._run_agent_turn(
-                    self._runner,
-                    self._input.user_id,
-                    build_adk_resume_prompt(self._approval),
-                )
+                try:
+                    (
+                        result.resumed_response,
+                        _,
+                    ) = await self._run_agent_turn(
+                        self._runner,
+                        self._input.user_id,
+                        build_adk_resume_prompt(self._approval),
+                    )
+                except Exception as err:
+                    return self._fail_turn(result, err)
 
             result.complete = True
             self._active_turn_id = None
@@ -138,6 +147,28 @@ class TemporalAdkSessionWorkflow:
         ):
             return
         self._approval = resolution
+
+    def _fail_turn(
+        self,
+        result: AdkSessionWorkflowResult,
+        err: Exception,
+    ) -> AdkSessionWorkflowResult:
+        """Close a turn that could not reach the model or gateway."""
+
+        result.error = f"{type(err).__name__}: {err}"
+        if not result.initial_response:
+            result.initial_response = (
+                "This session could not complete the turn: "
+                f"{result.error}"
+            )
+        result.complete = True
+        self._active_turn_id = None
+        self._waiting_operation_id = None
+        workflow.logger.warning(
+            "adk session turn failed",
+            extra={"turn_id": result.turn_id, "error": result.error},
+        )
+        return result
 
     @workflow.query
     def get_turn_status(

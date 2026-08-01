@@ -17,6 +17,7 @@ from temporalio.contrib.google_adk_agents import (
     TemporalMcpToolSetProvider,
     TemporalModel,
 )
+from temporalio.common import RetryPolicy
 from temporalio.workflow import ActivityConfig
 
 from adk_agents.release_approval_agent.agent import (
@@ -32,6 +33,15 @@ from common.models import (
 )
 
 TEMPORAL_GATEWAY_TOOLSET_NAME = "agent-gateway"
+
+# Model and MCP Activities retry, but they must not retry forever. A rejected
+# API key or a model that is closed to the caller never recovers, and an
+# unbounded retry loop shows the user an ADK turn that silently hangs.
+_TURN_RETRY_POLICY = RetryPolicy(
+    initial_interval=timedelta(seconds=1),
+    maximum_interval=timedelta(seconds=10),
+    maximum_attempts=4,
+)
 
 
 def _callback_from_factory_argument(
@@ -91,6 +101,7 @@ def build_temporal_agent(
             model,
             activity_config=ActivityConfig(
                 start_to_close_timeout=timedelta(minutes=2),
+                retry_policy=_TURN_RETRY_POLICY,
             ),
         ),
         description=(
@@ -103,6 +114,7 @@ def build_temporal_agent(
                 TEMPORAL_GATEWAY_TOOLSET_NAME,
                 config=ActivityConfig(
                     start_to_close_timeout=timedelta(minutes=2),
+                    retry_policy=_TURN_RETRY_POLICY,
                 ),
                 factory_argument=asdict(callback),
                 not_in_workflow_toolset=gateway_toolset_factory,

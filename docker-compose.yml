@@ -50,7 +50,7 @@ services:
       PROTECTED_ENVIRONMENTS: "prod,production"
       AGENT_GATEWAY_MCP_URL: "http://gateway:8080/mcp"
       AGENT_GATEWAY_TOKEN: "tok_adk"
-      ADK_MODEL: "${ADK_MODEL:-gemini-2.5-flash}"
+      ADK_MODEL: "${ADK_MODEL:-gemini-3.6-flash}"
       GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
 
   gateway:
@@ -90,7 +90,7 @@ services:
       PYTHONPATH: "/app"
       TEMPORAL_ADDRESS: "temporal:7233"
       TASK_QUEUE: "agentic-gateway"
-      ADK_MODEL: "${ADK_MODEL:-gemini-2.5-flash}"
+      ADK_MODEL: "${ADK_MODEL:-gemini-3.6-flash}"
     ports:
       - "8000:8000"
 

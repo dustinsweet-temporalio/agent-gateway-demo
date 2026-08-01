@@ -27,7 +27,7 @@ from common.models import (
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
-DEFAULT_MODEL = os.getenv("ADK_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("ADK_MODEL", "gemini-3.6-flash")
 WORKFLOW_STATE_KEY = "dashy_temporal_workflow_id"
 TURN_STATE_KEY = "dashy_temporal_turn_id"
 
@@ -177,16 +177,31 @@ class TemporalSessionProxyAgent(BaseAgent):
                 await asyncio.sleep(0.25)
                 continue
             if status is not None and status.initial_response:
-                yield _text_event(
-                    ctx,
-                    self.name,
-                    status.initial_response,
-                )
-                initial_reported = True
+                # Reattaching to a turn the approval already resolved must not
+                # replay its stale waiting_for_approval line; the resumed
+                # answer below supersedes it.
+                if not (observe_existing and status.resumed_response):
+                    yield _text_event(
+                        ctx,
+                        self.name,
+                        status.initial_response,
+                    )
+                    initial_reported = True
                 break
             await asyncio.sleep(0.25)
 
-        result: AdkSessionWorkflowResult = await result_task
+        try:
+            result: AdkSessionWorkflowResult = await result_task
+        except Exception as err:
+            # Never leave the browser on a spinner. The workflow keeps the
+            # session; the user can retry with another prompt.
+            yield _text_event(
+                ctx,
+                self.name,
+                "The durable session turn failed on "
+                f"{active_workflow_id}: {type(err).__name__}: {err}",
+            )
+            return
         if (
             result.initial_response
             and not initial_reported
