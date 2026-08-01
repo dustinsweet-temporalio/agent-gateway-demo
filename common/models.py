@@ -10,6 +10,19 @@ CALLBACK_WORKFLOW_ID_HEADER = "x-agent-gateway-callback-workflow-id"
 CALLBACK_RUN_ID_HEADER = "x-agent-gateway-callback-run-id"
 ADK_SESSION_ID_HEADER = "x-agent-gateway-adk-session-id"
 
+# The Waypoint team's Temporal namespace: Agent Gateway, AgenticChainWorkflow, the
+# release children, and the `agent-gateway` Nexus Endpoint all live here. Named
+# after the team that operates it, exactly as SECURITY_NAMESPACE is in
+# security_scan/models.py, so the Web UI's namespace selector reads as two teams
+# rather than as one team and a leftover.
+#
+# It is the default for TEMPORAL_NAMESPACE everywhere rather than a bare
+# Client.connect() -- the SDK's own fallback is "default", so a client that forgets
+# to pass a namespace silently connects to an empty one and simply never receives
+# tasks. Nothing errors; work just stops arriving. Every connect site in this repo
+# passes a namespace explicitly for that reason.
+WAYPOINT_NAMESPACE = "waypoint"
+
 # How the Security team runs a pre-prod scan today. Two ways of doing the same
 # job, and the distinction the whole of CASE-2 turns on:
 #

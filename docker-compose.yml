@@ -11,7 +11,10 @@ services:
     volumes:
       - temporal-data:/data
     healthcheck:
-      test: ["CMD", "temporal", "operator", "namespace", "describe", "-n", "default", "--address", "127.0.0.1:7233"]
+      # Probes the namespace the rest of the stack actually needs, not just "is
+      # the server up". start-dev creates namespaces at launch, so this also
+      # gates dependents on `waypoint` existing rather than racing it.
+      test: ["CMD", "temporal", "operator", "namespace", "describe", "-n", "waypoint", "--address", "127.0.0.1:7233"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -37,7 +40,7 @@ services:
         set -e
         temporal operator nexus endpoint create \
           --name agent-gateway \
-          --target-namespace default \
+          --target-namespace waypoint \
           --target-task-queue agentic-gateway \
           --address temporal:7233 2>&1 | grep -v "already exists" || true
         temporal operator nexus endpoint create \
@@ -94,7 +97,12 @@ services:
       # the Security team needs no configuration here at all: the `security`
       # Nexus Endpoint is a cluster object, and the endpoint name is in the code
       # as part of the contract.
-      TEMPORAL_NAMESPACE: "default"
+      #
+      # It is also the namespace the `agent-gateway` Endpoint targets, and this
+      # worker hosts that Endpoint's service handler -- so this value and
+      # `--target-namespace` above have to agree or the Security team's calls into
+      # the gateway go to a namespace nobody is polling and quietly time out.
+      TEMPORAL_NAMESPACE: "waypoint"
 
   # The Security team's pre-prod scanning platform. A separate process on purpose,
   # so the Temporal UI shows two workers with two identities in two namespaces
@@ -141,6 +149,7 @@ services:
         condition: service_healthy
     environment:
       TEMPORAL_ADDRESS: "temporal:7233"
+      TEMPORAL_NAMESPACE: "waypoint"
       TASK_QUEUE: "agentic-gateway"
       APPROVAL_TIMEOUT_SECONDS: "300"
       GATEWAY_PORT: "8080"
@@ -184,6 +193,7 @@ services:
     environment:
       PYTHONPATH: "/app"
       TEMPORAL_ADDRESS: "temporal:7233"
+      TEMPORAL_NAMESPACE: "waypoint"
       TASK_QUEUE: "agentic-gateway"
       ADK_MODEL: "${ADK_MODEL:-gemini-3.6-flash}"
     ports:

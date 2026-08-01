@@ -16,6 +16,7 @@ from adk_agents.release_approval_agent.temporal_integration import (
     build_google_adk_plugin,
 )
 from common.models import (
+    WAYPOINT_NAMESPACE,
     AdkSessionTurnInput,
     AdkSessionWorkflowInput,
     AdkSessionWorkflowResult,
@@ -24,6 +25,10 @@ from workflows.adk_session import TemporalAdkSessionWorkflow
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
+# The Waypoint team's namespace. Stated rather than left to the SDK's "default"
+# fallback, which would connect to an empty namespace and simply never find the
+# session workflow.
+TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", WAYPOINT_NAMESPACE)
 
 
 async def main() -> None:
@@ -43,6 +48,7 @@ async def main() -> None:
     plugin = build_google_adk_plugin()
     client = await Client.connect(
         TEMPORAL_ADDRESS,
+        namespace=TEMPORAL_NAMESPACE,
         plugins=[plugin],
     )
     handle = await client.start_workflow(

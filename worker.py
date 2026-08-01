@@ -7,6 +7,7 @@ import os
 from temporalio.client import Client
 from temporalio.worker import Worker
 
+from common.models import WAYPOINT_NAMESPACE
 from activities.gateway_activities import (
     archive_artifacts,
     await_quality_gate,
@@ -39,12 +40,20 @@ from workflows.release_children import (
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
+# The Waypoint team's namespace, and the only one this Worker connects to. Stated
+# rather than left to the SDK's "default" fallback, because this Worker also hosts
+# the `agent-gateway` Nexus service handler: the Endpoint targets this namespace by
+# name, so a Worker polling anywhere else leaves the Endpoint pointing at a
+# namespace nobody serves. Nothing errors -- the Security team's calls into the
+# gateway simply time out, which reads as a Nexus fault and is not one.
+TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", WAYPOINT_NAMESPACE)
 
 
 async def main() -> None:
     adk_plugin = build_google_adk_plugin()
     client = await Client.connect(
         TEMPORAL_ADDRESS,
+        namespace=TEMPORAL_NAMESPACE,
         plugins=[adk_plugin],
     )
     # Sync activities use requests, so they run on a thread pool executor.
@@ -93,7 +102,11 @@ async def main() -> None:
             nexus_service_handlers=[AgentGatewayServiceHandler()],
             activity_executor=executor,
         )
-        print(f"worker started, polling task queue '{TASK_QUEUE}'", flush=True)
+        print(
+            f"worker started, namespace '{TEMPORAL_NAMESPACE}', "
+            f"task queue '{TASK_QUEUE}'",
+            flush=True,
+        )
         await worker.run()
 
 

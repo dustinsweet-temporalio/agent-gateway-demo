@@ -24,8 +24,9 @@ both; if it is missing, step 6's Act Two will fail with an operation timeout.
 Keep this terminal open. The useful endpoints are:
 
 - Approval dashboard: http://localhost:8080
-- Temporal UI: http://localhost:8233 (two namespaces: `default` and
-  `security`)
+- Temporal UI: http://localhost:8233 (a namespace per team: `waypoint` and
+  `security`. A third, `default`, is empty and unused -- the Temporal dev server
+  always creates it and offers no way to turn it off)
 - MCP endpoint: http://localhost:8080/mcp
 
 Everything starts, including `security-scan-worker`, the Security team's pre-prod
@@ -406,7 +407,7 @@ docker compose kill worker && docker compose up -d worker
 Not the script. The script is already gone.
 
 **6. Look at what survived.** Open the Temporal Web UI at http://localhost:8233,
-namespace `default`, and find `wf-legacy`. The pending Operation is still there,
+namespace `waypoint`, and find `wf-legacy`. The pending Operation is still there,
 still `waiting_for_approval`, sitting in `AgenticChainWorkflow`'s Event History,
 completely unaffected by the restart.
 
@@ -696,7 +697,7 @@ For a step 6 Act Two run, the handoff and its resolution are in the same ledger:
 
 The same execution history is visible in the Temporal UI at
 http://localhost:8233. For an Act Two run there are three executions across two
-namespaces: the chain and its `protected-action::...` adapter under `default`,
+namespaces: the chain and its `protected-action::...` adapter under `waypoint`,
 and the scan's own under `security`. None is a subset of the others, which is
 the point -- each team's system keeps its own record of what it did, under its
 own retention policy.

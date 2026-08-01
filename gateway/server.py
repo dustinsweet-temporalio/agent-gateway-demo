@@ -29,6 +29,7 @@ from temporalio.service import RPCError, RPCStatusCode
 
 from common.models import (
     ADK_SESSION_ID_HEADER,
+    WAYPOINT_NAMESPACE,
     CALLBACK_RUN_ID_HEADER,
     CALLBACK_WORKFLOW_ID_HEADER,
     SCAN_MODE_LEGACY,
@@ -54,6 +55,11 @@ from workflows.chain import AgenticChainWorkflow
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
 TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
+# The Waypoint team's namespace: where AgenticChainWorkflow runs and where every
+# handle this process opens is resolved. Stated rather than left to the SDK's
+# "default" fallback -- a gateway pointed at the wrong namespace does not fail, it
+# starts a second, parallel chain nobody is polling, and every tool call hangs.
+TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", WAYPOINT_NAMESPACE)
 APPROVAL_TIMEOUT_SECONDS = int(os.getenv("APPROVAL_TIMEOUT_SECONDS", "300"))
 GATEWAY_HOST = os.getenv("GATEWAY_HOST", "0.0.0.0")
 GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8080"))
@@ -479,7 +485,9 @@ async def get_client() -> Client:
     if _client is None:
         async with _client_lock:
             if _client is None:
-                _client = await Client.connect(TEMPORAL_ADDRESS)
+                _client = await Client.connect(
+                    TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE
+                )
     return _client
 
 

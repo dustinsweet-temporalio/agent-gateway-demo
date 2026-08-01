@@ -12,6 +12,7 @@ from temporalio.client import Client
 from temporalio.exceptions import ApplicationError
 
 from common.models import (
+    WAYPOINT_NAMESPACE,
     ArchiveArtifactsInput,
     AwaitQualityGateInput,
     CalculateHashesInput,
@@ -38,7 +39,7 @@ TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
 # This worker's own namespace. Both Activities at the bottom of this file
 # connect here and nowhere else: there is no longer any code in the gateway that
 # reaches into another team's cluster, because the Nexus Endpoint does that.
-TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", "default")
+TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", WAYPOINT_NAMESPACE)
 OPERATION_RESOLVED_SIGNAL = "operation_resolved"
 
 

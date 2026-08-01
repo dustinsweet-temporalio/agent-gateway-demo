@@ -19,6 +19,7 @@ from temporalio.client import (
 from temporalio.common import WorkflowIDConflictPolicy
 
 from common.models import (
+    WAYPOINT_NAMESPACE,
     AdkSessionTurnInput,
     AdkSessionWorkflowInput,
     AdkSessionWorkflowResult,
@@ -26,6 +27,10 @@ from common.models import (
 
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "localhost:7233")
+# The Waypoint team's namespace. Stated rather than left to the SDK's "default"
+# fallback, which would connect to an empty namespace and simply never find the
+# session workflow.
+TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", WAYPOINT_NAMESPACE)
 TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
 DEFAULT_MODEL = os.getenv("ADK_MODEL", "gemini-3.6-flash")
 WORKFLOW_STATE_KEY = "dashy_temporal_workflow_id"
@@ -40,7 +45,9 @@ async def get_temporal_client() -> Client:
     if _client is None:
         async with _client_lock:
             if _client is None:
-                _client = await Client.connect(TEMPORAL_ADDRESS)
+                _client = await Client.connect(
+                    TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE
+                )
     return _client
 
 

@@ -18,7 +18,7 @@ gateway pauses it and a human approves or rejects before it proceeds.
 ## Architecture
 
 ```
-namespace: default                              namespace: security
+namespace: waypoint                             namespace: security
 =============================================   ===================
 
 Claude Code -------------MCP/HTTP-----> Agent Gateway
@@ -213,8 +213,8 @@ target namespace and task queue; callers address it by name and learn neither.
 | CASE-2b: uncontrolled Tool1 (walkthrough Act One) | `security_scan/legacy_security_scan_script.py` | A stateless process that cannot hold the pause: prints the operation id, exits non-zero, and requires a human `resume_nested_release` |
 | CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run correlation, plan checkpoint, gateway-owned decision, protected action then dependent action |
 
-Services in `docker-compose.yml`: `temporal` (dev server plus Web UI, with both
-the `default` and `security` namespaces), `nexus-endpoints` (registers the
+Services in `docker-compose.yml`: `temporal` (dev server plus Web UI, with the
+`waypoint` and `security` namespaces -- one per team), `nexus-endpoints` (registers the
 two Nexus Endpoints, then exits), `worker`, `gateway`, `mock-tool` (the pretend
 deployment backend), `adk-agent` (Google ADK Web for CASE-3), and
 `security-scan-worker` (the Security team's scanning platform).
