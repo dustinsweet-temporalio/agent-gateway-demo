@@ -155,6 +155,11 @@ class NestedToolCallRequest:
     justification: Optional[str] = None
     parent_operation_id: str = ""
     nested_operation_id: str = ""
+    # Set for the orchestrated CASE-2 path: Tool1 reads the deployed version and
+    # computes the version to cut and promote from this bump type, instead of the
+    # caller naming a version up front. Empty means the caller supplied an
+    # explicit version in tool1_arguments/tool2_arguments.
+    bump: str = ""
     controlled_tool1: bool = True
     replay_safe: bool = False
     safe_tool1_arguments: dict[str, Any] = field(default_factory=dict)

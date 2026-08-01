@@ -53,6 +53,25 @@ _releases: dict[tuple[str, str], dict] = {
 }
 _autonomous_followups: set[str] = set()
 
+# Last quality gate run, or None if the gates have never run. None is meaningful:
+# the fleet panel renders the gate card only once this exists, so the card is
+# absent for the whole of CASE-1 and appears the first time the CASE-2 pipeline
+# reaches it. That is the narrative, not a demo toggle: the capability shows up
+# when the team builds it. Restarting this service restores the "before" picture.
+_quality_gates: dict | None = None
+
+# How long a gate run takes. Long enough to watch the card work and to trip the
+# gateway's sync budget honestly, short enough to stay well inside the invoke
+# Activity's request timeout.
+QUALITY_GATE_SECONDS = float(os.getenv("QUALITY_GATE_SECONDS", "12"))
+# Demo knob: gates fail for these versions, so the fail-closed path can be shown
+# on demand. Empty by default, so gates pass.
+QUALITY_GATE_FAIL_VERSIONS = {
+    item.strip()
+    for item in os.getenv("QUALITY_GATE_FAIL_VERSIONS", "").split(",")
+    if item.strip()
+}
+
 # Idempotency store keyed by the Idempotency-Key header. A replayed activity
 # attempt with the same key returns the original result and does not apply the
 # effect a second time.
@@ -65,12 +84,52 @@ SLOW_CUT_VERSION = os.getenv("SLOW_CUT_VERSION", "2.3.1")
 SLOW_CUT_DELAY_SECONDS = float(os.getenv("SLOW_CUT_DELAY_SECONDS", "8"))
 
 
+def _gate_checks(version: str, passing: bool) -> list[dict]:
+    """The individual checks shown on the gate card and the approval request.
+
+    Fixed content: this is a demo backend, and the point is that the approver has
+    concrete evidence in front of them, not that the numbers are real.
+    """
+    if passing:
+        return [
+            {"name": "functional tests", "detail": "412 passed", "ok": True},
+            {"name": "user acceptance tests", "detail": "38 scenarios passed", "ok": True},
+            {"name": "performance tests", "detail": "p99 180ms, within budget", "ok": True},
+            {"name": "security scan", "detail": "no new findings", "ok": True},
+        ]
+    return [
+        {"name": "functional tests", "detail": "412 passed", "ok": True},
+        {"name": "user acceptance tests", "detail": "3 scenarios failed", "ok": False},
+        {"name": "performance tests", "detail": "p99 940ms, over budget", "ok": False},
+        {"name": "security scan", "detail": "no new findings", "ok": True},
+    ]
+
+
 async def _maybe_delay(tool_name: str, arguments: dict) -> None:
     if (
         tool_name == "cut_release"
         and str(arguments.get("version", "")) == SLOW_CUT_VERSION
     ):
         await asyncio.sleep(SLOW_CUT_DELAY_SECONDS)
+    if tool_name == "run_quality_gates":
+        # Publish the running state before sleeping, so the fleet panel can show
+        # the gate card appear and work while the pipeline waits on it. Without
+        # this the card would only exist after the run finished, and the audience
+        # would lose the causality between the gate and the promotion that waited
+        # on it.
+        global _quality_gates
+        _quality_gates = {
+            "service": str(arguments.get("service", "")),
+            "version": str(arguments.get("version", "")),
+            "environment": str(arguments.get("environment", "staging")),
+            "status": "running",
+            "passed": None,
+            "checks": [],
+            "started_at": time.time(),
+            "completed_at": None,
+            "duration_seconds": None,
+        }
+        await asyncio.sleep(QUALITY_GATE_SECONDS)
 
 
 def _handle(tool_name: str, arguments: dict) -> dict:
@@ -91,17 +150,27 @@ def _handle(tool_name: str, arguments: dict) -> dict:
     if tool_name == "cut_release":
         service = str(arguments.get("service", ""))
         version = str(arguments.get("version", ""))
-        prior_cut = _releases.pop((service, version), None)
-        _releases[(service, version)] = {
-            "service": service,
-            "version": version,
-            "cut_at": time.time(),
-            "seen_in": list(prior_cut["seen_in"]) if prior_cut else [],
-        }
+        # Cutting a version that is already cut is a no-op that reports the
+        # existing release, rather than an error or a second release. The
+        # orchestrated CASE-2 path can legitimately reach this twice for the same
+        # computed version (a replay-safe retry reruns Tool1's real work), and the
+        # gateway's own idempotency key already suppresses a repeat of the same
+        # attempt, so this covers the case where the two cuts are genuinely
+        # separate calls. cut_at is deliberately left alone: a re-cut must not
+        # reorder the release rail or make an old release look new.
+        already_cut = (service, version) in _releases
+        if not already_cut:
+            _releases[(service, version)] = {
+                "service": service,
+                "version": version,
+                "cut_at": time.time(),
+                "seen_in": [],
+            }
         return {
             "service": service,
             "version": version,
             "release": "cut",
+            "already_cut": already_cut,
             "message": f"release {version} of {service} is cut and ready to promote",
         }
 
@@ -137,6 +206,46 @@ def _handle(tool_name: str, arguments: dict) -> dict:
             "environment": env,
             "promoted": True,
             "message": f"promoted {service} {version} to {env}",
+        }
+
+    if tool_name == "run_quality_gates":
+        global _quality_gates
+        service = str(arguments.get("service", ""))
+        version = str(arguments.get("version", ""))
+        env = str(arguments.get("environment", "staging"))
+        passed = version not in QUALITY_GATE_FAIL_VERSIONS
+        checks = _gate_checks(version, passed)
+        started = (
+            _quality_gates["started_at"]
+            if _quality_gates and _quality_gates.get("status") == "running"
+            else time.time()
+        )
+        now = time.time()
+        _quality_gates = {
+            "service": service,
+            "version": version,
+            "environment": env,
+            "status": "passed" if passed else "failed",
+            "passed": passed,
+            "checks": checks,
+            "started_at": started,
+            "completed_at": now,
+            "duration_seconds": round(now - started, 1),
+        }
+        failures = [check["name"] for check in checks if not check["ok"]]
+        return {
+            "service": service,
+            "version": version,
+            "environment": env,
+            "passed": passed,
+            "checks": checks,
+            "duration_seconds": _quality_gates["duration_seconds"],
+            "message": (
+                f"quality gates passed for {version} in {env}"
+                if passed
+                else f"quality gates failed for {version} in {env}: "
+                + ", ".join(failures)
+            ),
         }
 
     if tool_name == "release_orchestrator_prepare":
@@ -201,6 +310,10 @@ async def state(request: Request) -> JSONResponse:
     return JSONResponse(
         {
             "generated_at": time.time(),
+            # Absent until the gates have run at least once. The dashboard keys the
+            # gate card on presence, so "the team has not built this yet" and "the
+            # team built it" are the same code path with different state.
+            "quality_gates": dict(_quality_gates) if _quality_gates else None,
             "environments": [
                 {"environment": env, **_deployed[env]}
                 for env in ENVIRONMENTS

@@ -10,7 +10,7 @@ from http.cookies import SimpleCookie
 from contextvars import ContextVar
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import requests
 import uvicorn
@@ -44,6 +44,7 @@ from common.models import (
     WorkflowLedgerResponse,
     WorkflowStatusResponse,
 )
+from common.semver import normalize_bump
 from workflows.autonomous_agent import AutonomousAgentWorkflow
 from workflows.chain import AgenticChainWorkflow
 
@@ -55,6 +56,14 @@ GATEWAY_PORT = int(os.getenv("GATEWAY_PORT", "8080"))
 MOCK_TOOL_STATE_URL = os.getenv(
     "MOCK_TOOL_STATE_URL", "http://mock-tool:9000/state"
 )
+# The service this deployment backend manages. Same env var mock_tool reads, so
+# the two cannot disagree. It exists so an orchestration request does not have to
+# name the service: "deploy the next minor version to staging" is a complete
+# instruction in a single-service demo.
+DEFAULT_SERVICE = os.getenv("DEMO_SERVICE", "delivery-matching-service")
+# Where the release pipeline ends when the caller does not say. "Deploy the next
+# minor version" means all the way to production, through staging and the gates.
+PIPELINE_TARGET_ENVIRONMENT = "prod"
 PROTECTED_ENVIRONMENTS = {
     item.strip().lower()
     for item in os.getenv("PROTECTED_ENVIRONMENTS", "prod,production").split(",")
@@ -350,6 +359,22 @@ def _derive_operation_id(idempotency_key: str) -> str:
     return "op-" + hashlib.sha256(idempotency_key.encode()).hexdigest()[:16]
 
 
+# Tools that read state rather than change it. A read has no effect to
+# deduplicate, only a value that moves, so deriving its key from its arguments
+# collapses every "what is deployed in prod" within a chain onto the first call
+# and hands back a stale version that looks fresh: same operation_id, same
+# executed_at, and idempotent_replay false, because the dedup happened in the
+# Workflow and the tool backend was never asked. Mutations keep the derived key,
+# which is what makes a retried cut_release safe.
+#
+# This belongs here and not in the Workflow's dedup check. The key is computed
+# before the Update is sent and is carried in Event History, so replay reads back
+# whatever this returned at the time. Branching on tool name inside
+# request_tool_call would instead re-decide on every replay, and editing this set
+# later would make in-flight histories replay down a different path.
+_READ_ONLY_TOOLS = {"get_deployed_version"}
+
+
 def _caller_idempotency_key(
     workflow_id: str,
     tool_name: str,
@@ -361,6 +386,10 @@ def _caller_idempotency_key(
         resolved_principal = principal or _resolve_principal()
         payload = f"{resolved_principal}:{workflow_id}:{supplied}"
         return "idem-" + hashlib.sha256(payload.encode()).hexdigest()[:24]
+    if tool_name in _READ_ONLY_TOOLS:
+        # A caller that genuinely wants the earlier answer can still supply its
+        # own key above and get the deduplicated operation back.
+        return "idem-" + uuid.uuid4().hex[:24]
     return _derive_idempotency_key(workflow_id, tool_name, arguments)
 
 
@@ -604,27 +633,34 @@ async def promote_release(
     )
 
 
-@mcp.tool(structured_output=True)
-async def run_nested_release(
+async def _submit_nested_release(
     service: str,
-    version: str,
     environment: str,
     ctx: Context,
-    tool1_mode: str = "controlled",
-    replay_safe: bool = False,
-    justification: str = "",
-    workflow_id: str = "",
-    idempotency_key: str = "",
+    tool1_mode: str,
+    replay_safe: bool,
+    justification: str,
+    workflow_id: str,
+    idempotency_key: str,
+    version: str = "",
+    bump: str = "",
 ) -> ToolCallResponse:
-    """Run Tool1 -> Tool2 where Tool2 is a release promotion.
+    """Start a CASE-2 Tool1 -> Tool2 nested release call.
 
-    A controlled Tool1 checkpoints and resumes automatically after approval.
-    An uncontrolled Tool1 fails closed; approval is recorded, but Tool2 executes
-    only after an explicit retry and only when replay_safe is true.
+    Shared by both CASE-2 entry points. Exactly one of version and bump is set:
+    version names the release to promote up front, bump asks Tool1 to work it out
+    from what is deployed. Everything downstream of that choice, including the
+    nested-approval mechanics, is identical for both.
     """
     normalized_mode = tool1_mode.strip().lower()
     if normalized_mode not in {"controlled", "uncontrolled"}:
         raise ValueError("tool1_mode must be controlled or uncontrolled")
+    if bool(version) == bool(bump):
+        raise ValueError(
+            "supply exactly one of version or bump: version promotes a named "
+            "release, bump derives one from the deployed version"
+        )
+    normalized_bump = normalize_bump(bump) if bump else ""
 
     client = await get_client()
     resolved_workflow_id, source = _resolve_workflow_id(
@@ -633,12 +669,33 @@ async def run_nested_release(
     principal = _resolve_principal(ctx)
     tool1_name = "release_orchestrator"
     tool2_name = "promote_release"
-    tool1_arguments = {
-        "service": service,
-        "version": version,
-        "environment": environment,
-    }
-    tool2_arguments = dict(tool1_arguments)
+    if normalized_bump:
+        # No version yet: Tool1 reads the deployed version inside the workflow
+        # and computes it. The idempotency key is derived from the bump type, so
+        # it is stable across a retry that has not resolved a version yet, and a
+        # duplicate call still dedups to the same operation pair rather than
+        # deriving a second version and cutting a second release.
+        tool1_arguments = {
+            "service": service,
+            "bump": normalized_bump,
+            "environment": environment,
+        }
+        # The version key is deliberately absent. The workflow adds it to the
+        # child operation once the release is actually cut, which is also when
+        # the approver-facing sentence can name it.
+        tool2_arguments = {"service": service, "environment": environment}
+        requested_action = (
+            f"Promote the next {normalized_bump} version of {service} "
+            f"to {environment}"
+        )
+    else:
+        tool1_arguments = {
+            "service": service,
+            "version": version,
+            "environment": environment,
+        }
+        tool2_arguments = dict(tool1_arguments)
+        requested_action = _requested_action(tool2_name, tool2_arguments)
     idem = _caller_idempotency_key(
         resolved_workflow_id,
         f"{tool1_name}->{tool2_name}",
@@ -667,10 +724,11 @@ async def run_nested_release(
         idempotency_key=idem,
         correlation=correlation,
         approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
-        requested_action=_requested_action(tool2_name, tool2_arguments),
+        requested_action=requested_action,
         justification=justification or None,
         parent_operation_id=parent_operation_id,
         nested_operation_id=child_operation_id,
+        bump=normalized_bump,
         controlled_tool1=normalized_mode == "controlled",
         replay_safe=replay_safe,
         safe_tool1_arguments=_safe_arguments(tool1_arguments),
@@ -693,6 +751,93 @@ async def run_nested_release(
         start_workflow_operation=start_op,
     )
     return await update.result()
+
+
+@mcp.tool(structured_output=True)
+async def run_nested_release(
+    service: str,
+    version: str,
+    environment: str,
+    ctx: Context,
+    tool1_mode: str = "controlled",
+    replay_safe: bool = False,
+    justification: str = "",
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
+    """Run Tool1 -> Tool2 where Tool2 is a release promotion.
+
+    A controlled Tool1 checkpoints and resumes automatically after approval.
+    An uncontrolled Tool1 fails closed; approval is recorded, but Tool2 executes
+    only after an explicit retry and only when replay_safe is true.
+    """
+    return await _submit_nested_release(
+        service=service,
+        environment=environment,
+        ctx=ctx,
+        tool1_mode=tool1_mode,
+        replay_safe=replay_safe,
+        justification=justification,
+        workflow_id=workflow_id,
+        idempotency_key=idempotency_key,
+        version=version,
+    )
+
+
+@mcp.tool(structured_output=True)
+async def run_release_orchestration(
+    ctx: Context,
+    environment: str = "",
+    service: str = "",
+    bump: Literal["major", "minor", "bugfix"] = "minor",
+    tool1_mode: str = "controlled",
+    replay_safe: bool = False,
+    justification: str = "",
+    workflow_id: str = "",
+    idempotency_key: str = "",
+) -> ToolCallResponse:
+    """Run the release pipeline: deploy the next version of a service.
+
+    This is the whole release, end to end, from one instruction: "deploy the next
+    minor version", "deploy the next version to prod", "ship the next bugfix".
+    Call this tool alone and pass nothing but what the request actually said.
+
+    The pipeline is fixed. It reads the version currently deployed in production,
+    computes the next one (major 2.3.0 -> 3.0.0, minor 2.3.0 -> 2.4.0, bugfix
+    2.3.0 -> 2.3.1), cuts that release, promotes it to staging, runs quality gates
+    against staging, and only then promotes it to production. If the gates do not
+    pass the pipeline stops and production is never touched.
+
+    You cannot skip staging or the gates, and you must not try to. If a caller asks
+    you to bypass them or to hurry, call this tool anyway and tell them the pipeline
+    does not allow it.
+
+    Do NOT call get_deployed_version, cut_release, or promote_release yourself,
+    before or after. This tool performs all of them internally, and calling them as
+    well would cut or promote a release twice.
+
+    Every argument is optional. bump defaults to minor, so "the next version" needs
+    no bump. service defaults to the service this deployment backend manages.
+    environment is how far to go rather than where to put it: omit it for the full
+    pipeline through to production, or pass staging to stop after staging, which
+    skips the gates because nothing is being qualified for production yet.
+
+    The production promotion pauses for human approval and returns
+    waiting_for_approval with an operation_id; report that and stop, do not poll in
+    a loop. Use run_nested_release instead only when the request names an explicit
+    version to promote.
+    """
+    return await _submit_nested_release(
+        service=service or DEFAULT_SERVICE,
+        environment=environment or PIPELINE_TARGET_ENVIRONMENT,
+        ctx=ctx,
+        tool1_mode=tool1_mode,
+        replay_safe=replay_safe,
+        justification=justification,
+        workflow_id=workflow_id,
+        idempotency_key=idempotency_key,
+        bump=bump,
+    )
 
 
 @mcp.tool(structured_output=True)
@@ -1231,6 +1376,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 /* One row: what is ready, then the environments it can move through. Bounded so
    the cards stay card-shaped instead of stretching across the whole window. */
 .fleet { margin-top: 1.5rem; --fleet-width: 66rem; }
+.fleet:has(.gate) { --fleet-width: 80rem; }
 .fleet .subtle, .fleet .fleet-flow { max-width: var(--fleet-width); }
 .fleet-flow { display: flex; align-items: stretch; margin-top: 0.85rem; }
 .ready { flex: 0 0 13.5rem; min-width: 0; }
@@ -1258,6 +1404,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
    divider that separates what is promotable from what is running. */
 .pipeline { display: flex; flex: 1 1 0; min-width: 0; }
 .link { flex: 0 0 2.6rem; position: relative; display: flex; align-items: center; }
+.link[data-into="gate"], .pipeline:has(.gate) .link[data-into="prod"] { flex-basis: 1.8rem; }
 .link:first-child { flex-basis: 3.1rem; margin-right: 0.9rem; }
 .link:first-child .link-line { margin-right: 0.55rem; }
 .link:first-child::after { right: 0.55rem; }
@@ -1284,11 +1431,16 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
        background: radial-gradient(90% 130% at 22% 130%, var(--accent-wash), transparent 65%); }
 .env::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
        opacity: 0.55; background: linear-gradient(90deg, transparent, var(--stripe), transparent); }
-.env-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
+/* Wraps rather than truncates: once the gate card is in the row there is not
+   always room for "PRODUCTION" and "approval required" side by side, and the tag
+   dropping to its own line reads better than either being cut off. */
+.env-top { display: flex; align-items: center; justify-content: space-between;
+       gap: 0.2rem 0.5rem; flex-wrap: wrap; }
 .env-body { min-width: 0; }
 .env-side { min-width: 0; }
-.env-name { font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--th); }
-.tag { flex: none; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em;
+.env-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+       font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--th); }
+.tag { flex: none; white-space: nowrap; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em;
        padding: 0.14rem 0.44rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
 .tag-protected { color: var(--protect); border-color: var(--protect); }
 /* Clips the version swap so it reads as an odometer roll rather than two numbers
@@ -1320,6 +1472,51 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
                   55% { opacity: 1; }
                   100% { transform: translateY(0); opacity: 1; filter: blur(0); } }
 @keyframes shine { 0% { left: -60%; opacity: 0; } 22% { opacity: 1; } 100% { left: 115%; opacity: 0; } }
+
+/* ------------------------------------------------------- quality gate card
+   Absent until the release pipeline has run its gates at least once, so during
+   CASE-1 the row is staging -> production exactly as before. It appears in place,
+   between the two environments, the first time the pipeline reaches it. Narrower
+   than an environment card and visually a checkpoint rather than a destination:
+   nothing is deployed here, it is the thing a candidate has to get past. */
+.gate { flex: 0 0 11rem; min-width: 0; position: relative; overflow: hidden;
+        padding: 0.7rem 0.8rem 0.8rem; border: 1px dashed var(--card-edge);
+        border-radius: 14px; background: var(--card);
+        transition: border-color 0.4s ease, box-shadow 0.4s ease; }
+.gate.appearing { animation: gate-in 0.6s cubic-bezier(0.16,1,0.3,1); }
+@keyframes gate-in { from { transform: scale(0.9); opacity: 0; } to { transform: none; opacity: 1; } }
+.gate-top { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
+.gate-name { font-size: 0.66rem; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 0.1em; color: var(--th); }
+.gate-verdict { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.95rem;
+        font-weight: 600; letter-spacing: -0.01em; margin: 0.4rem 0 0.1rem; }
+.gate-sub { font-size: 0.66rem; color: var(--muted); }
+.gate-checks { list-style: none; margin: 0.45rem 0 0; padding: 0; display: flex;
+        flex-direction: column; gap: 0.18rem; }
+.gate-checks li { display: flex; align-items: baseline; gap: 0.35rem; font-size: 0.66rem;
+        line-height: 1.25; color: var(--muted); }
+.gate-checks li span:last-child { min-width: 0; }
+.gate-checks .mark { flex: none; font-weight: 700; }
+.gate-checks li.ok .mark { color: var(--accent); }
+.gate-checks li.bad .mark { color: #ef4444; }
+/* Running: dashed border animates, verdict is a working label. */
+.gate.running { border-color: var(--accent); }
+.gate.running::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+        background: linear-gradient(90deg, transparent, var(--accent), transparent);
+        animation: gate-scan 1.4s linear infinite; }
+@keyframes gate-scan { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+.gate.passed { border-style: solid; border-color: var(--accent);
+        box-shadow: 0 12px 30px -20px var(--accent-glow); }
+.gate.passed .gate-verdict { color: var(--accent); }
+.gate.failed { border-style: solid; border-color: #ef4444; }
+.gate.failed .gate-verdict { color: #ef4444; }
+/* A failed gate stops the flow, so the outbound connector reads as dead. */
+.link.blocked .link-line { background: #ef4444; opacity: 0.5; }
+.link.blocked::after { border-left-color: #ef4444; opacity: 0.5; }
+
+@media (prefers-reduced-motion: reduce) {
+  .gate.appearing, .gate.running::after { animation: none; }
+}
 
 .rail-head { margin-top: 1.1rem; }
 /* Stacked in the ready column, so each release is a block that wraps its badges
@@ -1453,9 +1650,30 @@ var FLEET = (function () {
     return null;
   }
 
-  function buildPipeline(records) {
+  function buildGate() {
+    var card = el('div', 'gate');
+    card.setAttribute('data-gate', '1');
+    var top = el('div', 'gate-top');
+    top.appendChild(el('span', 'gate-name', 'Quality gates'));
+    card.appendChild(top);
+    card.appendChild(el('div', 'gate-verdict'));
+    card.appendChild(el('div', 'gate-sub'));
+    card.appendChild(el('ul', 'gate-checks'));
+    return card;
+  }
+
+  function buildPipeline(records, hasGate) {
     pipeline.innerHTML = '';
     records.forEach(function (rec) {
+      // The gate sits on the path into production, so a candidate visibly has to
+      // pass through it rather than around it.
+      if (hasGate && rec.environment === 'prod') {
+        var gateLink = el('div', 'link');
+        gateLink.setAttribute('data-into', 'gate');
+        gateLink.appendChild(el('span', 'link-line'));
+        pipeline.appendChild(gateLink);
+        pipeline.appendChild(buildGate());
+      }
       // Every card gets an inbound connector, including the first: releases flow
       // into staging from the ready list sitting directly above it.
       var link = el('div', 'link');
@@ -1533,6 +1751,32 @@ var FLEET = (function () {
 
   function hold() { holdUntil = Date.now() + ANIM_MS + 600; }
 
+  function paintGate(gate, appearing) {
+    var card = pipeline.querySelector('.gate');
+    if (!card || !gate) return;
+    var running = gate.status === 'running';
+    var failed = gate.status === 'failed';
+    card.className = 'gate ' + gate.status + (appearing ? ' appearing' : '');
+    card.querySelector('.gate-verdict').textContent = running
+      ? 'running' : (failed ? 'failed' : 'passed');
+    var sub = gate.version ? gate.version + ' on ' + label(gate.environment) : '';
+    if (!running && gate.duration_seconds) sub += ' \\u00b7 ' + gate.duration_seconds + 's';
+    card.querySelector('.gate-sub').textContent = sub;
+    var list = card.querySelector('.gate-checks');
+    list.innerHTML = '';
+    (gate.checks || []).forEach(function (check) {
+      var li = el('li', check.ok ? 'ok' : 'bad');
+      li.appendChild(el('span', 'mark', check.ok ? '\\u2713' : '\\u2717'));
+      li.appendChild(el('span', null, check.name));
+      list.appendChild(li);
+    });
+    // A failed gate means nothing moved past it, so say so with the connector
+    // rather than leaving a green arrow pointing at an untouched production card.
+    var out = linkInto('prod');
+    if (out) out.classList.toggle('blocked', failed);
+    if (running || appearing) hold();
+  }
+
   function paint(state, animate) {
     var records = state.environments || [];
     if (!records.length) return;
@@ -1544,11 +1788,20 @@ var FLEET = (function () {
       serviceEl.textContent = service ? ': ' + service : '';
     }
 
-    var shape = records.map(function (rec) { return rec.environment; }).join('|');
+    // The gate card's existence is state, not configuration. No gate state means
+    // the pipeline has never run its gates, which during CASE-1 is the truth: the
+    // team has not built them yet. The shape changing is what makes the card
+    // appear, so it animates in at the moment the capability first runs.
+    var gate = state.quality_gates || null;
+    var shape = records.map(function (rec) { return rec.environment; }).join('|') +
+      (gate ? '|gate' : '');
+    var appearing = false;
     if (pipeline.getAttribute('data-shape') !== shape) {
-      buildPipeline(records);
+      appearing = !!gate && (pipeline.getAttribute('data-shape') || '').indexOf('gate') < 0;
+      buildPipeline(records, !!gate);
       pipeline.setAttribute('data-shape', shape);
     }
+    paintGate(gate, appearing);
 
     var animated = false;
     records.forEach(function (rec) {

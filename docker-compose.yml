@@ -25,7 +25,13 @@ services:
       MOCK_TOOL_PORT: "9000"
       # Cutting this release runs long and trips the gateway convert-to-async path.
       SLOW_CUT_VERSION: "2.3.1"
-      SLOW_CUT_DELAY_SECONDS: "30"
+      SLOW_CUT_DELAY_SECONDS: "12"
+      # How long the CASE-2 quality gates take. Long enough to watch the gate card
+      # work, short enough to stay inside the invoke Activity's request timeout.
+      QUALITY_GATE_SECONDS: "${QUALITY_GATE_SECONDS:-12}"
+      # Versions the gates reject. Empty by default, so gates pass. Set it to show
+      # the fail-closed path, then recreate the service to clear it.
+      QUALITY_GATE_FAIL_VERSIONS: "${QUALITY_GATE_FAIL_VERSIONS:-}"
     ports:
       - "9000:9000"
 

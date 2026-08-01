@@ -78,7 +78,7 @@ Google ADK Web -> TemporalAdkSessionWorkflow -> MCP Activity ---+
 | Scenario | Entry tool | Durable behavior |
 | --- | --- | --- |
 | CASE-1: simple tool | `promote_release` | Policy gate, wait payload, approve/reject/expire/cancel, invoke, poll result |
-| CASE-2: nested Tool1 -> Tool2 | `run_nested_release` | Full call path, child operation, controlled checkpoint/resume, uncontrolled fail-closed/retry |
+| CASE-2: nested Tool1 -> Tool2 | `run_release_orchestration` (the pipeline) or `run_nested_release` (explicit version) | Fixed release pipeline, quality gates, full call path, child operation, controlled checkpoint/resume, uncontrolled fail-closed/retry |
 | CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run correlation, plan checkpoint, gateway-owned decision, protected action then dependent action |
 
 Services in `docker-compose.yml`: `temporal` (dev server plus Web UI), `worker`,
@@ -95,9 +95,22 @@ ADK Web for CASE-3). All services are in the default Compose project so plain
 - `promote_release(service, version, environment, justification)` requests that an
   environment move to a release. Test and staging run immediately; prod pauses for
   approval. `justification` is optional and is shown to the approver.
-- `run_nested_release(..., tool1_mode, replay_safe)` runs the CASE-2 chain.
-  `tool1_mode=controlled` resumes automatically. `tool1_mode=uncontrolled`
-  returns `blocked_nested_approval`.
+- `run_nested_release(service, version, environment, tool1_mode, replay_safe)`
+  runs the CASE-2 chain for a named version. `tool1_mode=controlled` resumes
+  automatically. `tool1_mode=uncontrolled` returns `blocked_nested_approval`.
+- `run_release_orchestration(bump, environment, service, tool1_mode, replay_safe)`
+  runs the team's release pipeline from one instruction. Every argument is
+  optional: `bump` defaults to `minor`, `service` to the demo service, and
+  `environment` means how far to go rather than where to put it, defaulting to the
+  full pipeline. Tool1 reads the version deployed in production, computes the next
+  one, cuts it, promotes it to staging, runs quality gates there, and only then
+  reaches the production promotion. If the gates fail the pipeline stops and no
+  approval is ever requested. Same nested-approval mechanics, flags, and statuses
+  as `run_nested_release`.
+- `run_quality_gates(service, version, environment)` qualifies a candidate on
+  staging. Deliberately **not** exposed as an MCP tool: the pipeline calls it
+  internally, so an agent cannot run the gates itself and then promote around
+  them. Its last result is what the dashboard's gate card renders.
 - `resume_nested_release(workflow_id, operation_id)` explicitly retries an
   approved uncontrolled nested call; it succeeds only when `replay_safe=true`.
 - `start_google_adk_release_run(..., agent_run_id)` starts or recovers CASE-3.
@@ -208,8 +221,8 @@ without rebuilding the image; recreate the worker after changing `.env`.
 Open http://localhost:8000, select `release_approval_agent`, and ask:
 
 ```
-Start Scenario 3 for delivery-matching-service version 2.5.0 to prod.
-Use agent_run_id walkthrough-adk-run-1.
+Start an autonomous release run for delivery-matching-service 2.5.0 to
+prod, with agent_run_id walkthrough-adk-run-1.
 ```
 
 The agent returns the durable `workflow_id` and `operation_id` when approval is
@@ -238,7 +251,7 @@ With the base stack running, start a session from the worker container:
 ```
 docker compose exec worker python -m adk_agents.run_temporal_session \
   --session-id walkthrough-temporal-adk-1 \
-  --prompt 'Start Scenario 3 for delivery-matching-service version 2.5.0 to prod. Use agent_run_id walkthrough-temporal-adk-run-1 and justification "Temporal callback walkthrough".'
+  --prompt 'Start an autonomous release run for delivery-matching-service 2.5.0 to prod, with agent_run_id walkthrough-temporal-adk-run-1. The rollout is validated and ready to go.'
 ```
 
 The command waits while the workflow is durably paused. Approve the operation at
@@ -289,7 +302,7 @@ gateway exposes; the model maps to them.
    returns `status: processing` with a `workflow_id`, an `operation_id`, and
    `poll_after_seconds`, while the cut keeps running in the workflow. Poll
    `get_operation_result` with those ids; it reads `processing` until the cut
-   finishes (about 30 seconds), then flips to `completed`. Cuts of other versions
+   finishes (about 12 seconds), then flips to `completed`. Cuts of other versions
    are fast and return synchronously without converting.
 
 3. Promote to staging (not gated). Ask it to promote `2.3.1` to staging
@@ -364,6 +377,48 @@ gateway exposes; the model maps to them.
    `replay_safe=true`, the explicit resume invokes Tool2 idempotently and replays
    Tool1.
 
+### CASE-2 orchestrated: the team evolved the solution
+
+CASE-1 is the engineering team's first pass at automating a manual process:
+AI-assisted, one step at a time, three prompts for three tool calls, with the plan
+between them living in the operator's head.
+
+CASE-2 is the same team later. They built a release pipeline that always runs in
+the same order, and quality gates that qualify a candidate on staging before
+anything reaches production. That pipeline is what makes this a nested tool call:
+it has to reach the protected promotion from inside itself.
+
+1. Say `Deploy the next minor version.` No version, no environment, no service, no
+   flags. Claude Code makes one call, to `run_release_orchestration`.
+2. Inside Tool1 the workflow reads the production version, computes the next one,
+   cuts it, promotes it to staging, and runs quality gates against staging. Every
+   step is an Activity, so the ledger shows `tool1_version_resolved`,
+   `tool1_release_cut`, `tool1_staged`, and `tool1_quality_gates`, and a Worker
+   restart mid-flow resumes rather than starting over. No prompting happens
+   between them.
+3. Only once the candidate is green does the child `promote_release` operation
+   appear. It is the only protected step and the only row on the approval queue:
+   four tool calls, one decision. The approval card names the computed version,
+   which the caller never supplied, and the gate card directly above it is the
+   evidence the approver decides on.
+4. Approve it. Tool1 resumes from its checkpoint, and the gates do **not** run
+   again. That is the value of the pause being durable: the minutes the gates took
+   are in Temporal, not in a context window.
+5. Ask it to skip staging or the gates and it runs them anyway. A fixed flow can
+   refuse; a prompt cannot.
+6. If the gates fail, the pipeline stops, production is untouched, and nothing is
+   ever put in front of an approver. The system declines to ask.
+7. With `environment=staging` the pipeline runs its first leg and stops, skipping
+   the gates because nothing is being qualified for production yet.
+8. With `tool1_mode=uncontrolled` the fail-closed and replay-safe retry behavior is
+   unchanged, but the cost is now visible. The replay finds the cut and the staging
+   promotion already done, because mutations are keyed once, and reruns the quality
+   gates, because a verdict from before the pause is not evidence about now.
+
+The dashboard's quality gate card is keyed on whether gate state exists, so it is
+absent for the whole of CASE-1 and appears the first time the pipeline reaches it.
+Restarting `mock-tool` restores that "before" state for the next run-through.
+
 ### CASE-3: autonomous run with the Google ADK agent
 
 Use the ADK agent for this scenario rather than calling
@@ -382,9 +437,9 @@ docker compose up --build worker adk-agent
 2. Ask the agent:
 
    ```
-   Start Scenario 3 for delivery-matching-service version 2.5.0 to prod.
-   Use agent_run_id walkthrough-adk-run-1 and justification
-   "autonomous walkthrough".
+   Start an autonomous release run for delivery-matching-service 2.5.0 to
+   prod, with agent_run_id walkthrough-adk-run-1. The rollout is validated
+   and ready to go.
    ```
 
    The first response is `waiting_for_approval` and includes the durable
@@ -551,6 +606,8 @@ agrees on it. Lower it and rebuild the worker to demo the idle close.
 
 ```
 common/models.py            shared dataclasses and enums
+common/semver.py            version bump arithmetic for the release pipeline
+gateway_call.py             call one gateway tool directly, for operator actions
 workflows/chain.py          AgenticChainWorkflow (entity workflow, CAN, idle close)
 workflows/autonomous_agent.py  CASE-3 durable autonomous-agent checkpoint
 workflows/adk_session.py     long-lived ADK session, turn Updates, callback receiver
