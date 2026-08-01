@@ -49,6 +49,8 @@ from activities.gateway_activities import (
     submit_nested_tool_call,
 )
 from common.models import (
+    SCAN_MODE_LEGACY,
+    SCAN_MODE_PLATFORM,
     ApprovalDecision,
     ChainInput,
     CorrelationContext,
@@ -56,6 +58,7 @@ from common.models import (
     InvokeToolInput,
     NestedToolCallRequest,
     PolicyDecision,
+    ToolCallRequest,
 )
 from mock_tool import server as backend
 import security_scan.models as security_models
@@ -123,10 +126,12 @@ def _reset_backend(*, scan_available: bool, fail_versions: set[str] | None = Non
     security_models.SCAN_CHECK_COUNT = TEST_STAGE_COUNT
     security_models.SECURITY_TASK_QUEUE = SECURITY_TASK_QUEUE
     os.environ["SCAN_FAIL_VERSIONS"] = ",".join(sorted(fail_versions or set()))
-    # Registering a provider is what "the Security team has onboarded Waypoint"
-    # means. Not registering one is CASE-2a, and the pipeline cannot tell the
-    # difference between a team that has not built it yet and a team whose worker
-    # is currently down, which is correct: in both cases nobody is offering it.
+    # A registered provider means the Security team's platform is answering. It no
+    # longer decides WHETHER a scan happens -- the mandate and the scanner switch
+    # do that, and they arrive on the request -- so an empty registry is not
+    # "there is no scan step" any more. It is a required scanner that cannot be
+    # reached, which stops the release. See
+    # test_an_unreachable_scanner_stops_the_release_rather_than_skipping_it.
     #
     # Note what the registration no longer carries: no namespace, no task queue,
     # no workflow type. Just who, and the endpoint to reach them on.
@@ -304,14 +309,25 @@ async def _start_chain(env: WorkflowEnvironment, name: str) -> WorkflowHandle:
 
 
 def _pipeline_request(
-    workflow_id: str, key: str, *, security_mandate: bool = True
+    workflow_id: str,
+    key: str,
+    *,
+    security_mandate: bool = True,
+    scan_mode: str = SCAN_MODE_PLATFORM,
 ) -> NestedToolCallRequest:
     """A CASE-2 pipeline run, made under the security mandate by default.
 
-    The mandate is what puts a scan in the pipeline's path at all, so every test
-    in this file that expects to see one has to be running under it. The default
-    is True for exactly that reason; the one test that turns it off is asserting
-    the absence.
+    Two switches have to be set for a scan to be in the path, and both default to
+    the position that puts one there:
+
+      security_mandate -- the rule that a production release is scanned at all.
+      scan_mode        -- which of the Security team's two scanners runs it. Only
+                          `platform` is something the gateway can hand off to; in
+                          `legacy` mode a human runs their host script and the
+                          script asks for the promotion itself, so the gateway
+                          inserts no step.
+
+    Tests asserting an absence turn one of the two off and say which.
     """
     tool1_arguments = {"service": SERVICE, "bump": "minor", "environment": "prod"}
     tool2_arguments = {"service": SERVICE, "environment": "prod"}
@@ -336,6 +352,7 @@ def _pipeline_request(
         bump="minor",
         controlled_tool1=True,
         security_mandate=security_mandate,
+        scan_mode=scan_mode,
     )
 
 
@@ -694,14 +711,21 @@ async def _failed_parent(handle: WorkflowHandle, operation_id: str):
     return parent if parent.status == "failed" else None
 
 
-def test_without_a_registered_provider_the_pipeline_is_unchanged() -> None:
-    """CASE-2a, verified as still being CASE-2a.
+def test_an_unreachable_scanner_stops_the_release_rather_than_skipping_it() -> None:
+    """The regression this file exists to prevent from coming back.
 
-    Two things have to be true for a scan to happen: the mandate has to be on,
-    and somebody has to be offering the capability. This is the second one
-    failing -- the mandate is on, but the Security team's worker is not running,
-    so the pipeline looks for a provider, finds none, and opens the production
-    promotion itself.
+    The pipeline used to treat "nobody is offering a scan" as "then there is no
+    scan step", and promote to production anyway. That made a company-wide security
+    mandate evaporate whenever the Security team's worker happened to be down, and
+    -- worse -- it reported success while doing it, so the only way to discover the
+    checkpoint had been skipped was to go looking in the Temporal UI for a workflow
+    that was never started.
+
+    The mandate is on and the scanner switch is on Temporal, so a scan is required.
+    Their platform is not answering. The release fails, the failure says which two
+    things could fix it, and nothing is put in front of an approver -- because
+    approving a production promotion that skipped a mandated checkpoint is exactly
+    what the checkpoint exists to prevent.
     """
 
     async def run() -> None:
@@ -714,21 +738,228 @@ def test_without_a_registered_provider_the_pipeline_is_unchanged() -> None:
                     _pipeline_request(handle.id, "no-scan"),
                 )
 
-                assert response.status == "waiting_for_approval"
-                assert response.call_path == [
-                    "ClaudeCode",
-                    "release_orchestrator",
-                    "promote_release",
-                ]
+                # Not waiting_for_approval. Nobody is asked.
+                assert response.status == "failed"
                 parent = await _operation_view(handle, "no-scan-parent")
-                assert parent.status == "waiting_for_dependency"
-                assert parent.checkpoint["stage"] == "waiting_for_tool2"
-                assert "scan_workflow_id" not in parent.checkpoint
+                assert parent.status == "failed"
+                assert "not reachable" in (parent.decision_reason or "")
+                # Both fixes are named, because they are different fixes.
+                assert "worker" in (parent.decision_reason or "")
+                assert "legacy script" in (parent.decision_reason or "")
+                # It did ask, and the answer stopped the release.
+                assert "get_security_scan_status" in _tool_names()
                 assert backend._scan is None
                 events = await _ledger_events(handle)
+                assert "security_scan_unavailable" in events
                 assert "security_scan_handoff" not in events
-                # It did ask. Nobody answered.
-                assert "get_security_scan_status" in _tool_names()
+                # And production was never touched.
+                assert backend._deployed["prod"]["version"] == "2.2.0"
+
+    asyncio.run(run())
+
+
+def _direct_promotion_request(
+    workflow_id: str,
+    key: str,
+    *,
+    version: str = "2.3.0",
+    environment: str = "prod",
+    caller_service: str | None = None,
+    security_mandate: bool = True,
+    scan_mode: str = SCAN_MODE_PLATFORM,
+) -> ToolCallRequest:
+    """A single promote_release call, the way an agent makes one by hand.
+
+    No pipeline, no bump, no orchestrator: this is what arrives when an agent
+    decides to call promote_release itself rather than run_release_orchestration.
+    It is the shape the mandate used to be blind to.
+    """
+    arguments = {
+        "service": SERVICE,
+        "version": version,
+        "environment": environment,
+    }
+    return ToolCallRequest(
+        tool_name="promote_release",
+        arguments=arguments,
+        safe_arguments=dict(arguments),
+        idempotency_key=key,
+        operation_id=f"{key}-op",
+        correlation=CorrelationContext(
+            workflow_id=workflow_id,
+            workflow_id_source="explicit_authorized",
+            caller_principal=PRINCIPAL,
+            caller_service=caller_service,
+            runtime="ClaudeCode",
+            call_path=["ClaudeCode", "promote_release"],
+        ),
+        requested_action=f"Promote {SERVICE} {version} to {environment}",
+        security_mandate=security_mandate,
+        scan_mode=scan_mode,
+    )
+
+
+def test_a_hand_rolled_promotion_cannot_step_around_the_mandate() -> None:
+    """The bug this whole change exists to fix.
+
+    The scan used to live inside the release pipeline, which meant an agent that
+    skipped the pipeline skipped the scan. Ask for a production promotion with
+    promote_release directly -- no orchestrator, no bump -- and the release went
+    from green quality gates straight to the approval queue with no scan started,
+    no scan workflow in the Temporal UI, and nothing anywhere saying a checkpoint
+    had been missed. The mandate held only on the path the agent was supposed to
+    take, which is not what a mandate is.
+
+    Now the check is at the single-tool boundary. The promotion is parked on the
+    Security team's scan exactly as a pipeline run would be, and it is the scan --
+    not this call -- that eventually asks a human.
+    """
+
+    async def run() -> None:
+        _reset_backend(scan_available=True)
+        async with await _environment() as env:
+            scan_client = await _scan_client(env)
+            async with _gateway_worker(env):
+                async with _scan_worker(scan_client):
+                    handle = await _start_chain(env, "direct-promote")
+                    response = await handle.execute_update(
+                        AgenticChainWorkflow.request_tool_call,
+                        _direct_promotion_request(handle.id, "direct-promote"),
+                    )
+
+                    # Not waiting_for_approval. Nobody is asked to approve a
+                    # promotion that has not been scanned yet.
+                    assert response.status == "processing"
+                    op = await _operation_view(handle, "direct-promote-op")
+                    assert op.status == "waiting_for_dependency"
+                    assert op.checkpoint["stage"] == "awaiting_security_scan"
+                    assert op.checkpoint["scan_provider"] == "security"
+                    # An endpoint name, not a namespace or a task queue.
+                    assert op.checkpoint["scan_endpoint"] == "security"
+                    assert op.checkpoint["scan_workflow_id"]
+                    events = await _ledger_events(handle)
+                    assert "security_scan_handoff" in events
+                    # And a scan really did start, in the other namespace.
+                    scan = scan_client.get_workflow_handle(
+                        op.checkpoint["scan_workflow_id"]
+                    )
+                    assert await scan.query("get_status") is not None
+
+    asyncio.run(run())
+
+
+def test_a_scanners_own_promotion_is_not_handed_back_to_be_scanned() -> None:
+    """The exemption, without which platform mode would never terminate.
+
+    The Security team's scan clears a release and then asks Agent Gateway for the
+    production promotion, because promoting is a protected action and they have no
+    more right to do it unsupervised than anyone else. If that request were itself
+    subject to the mandate's scan insertion, the gateway would hand the Security
+    team's promotion back to the Security team to scan again, and again.
+
+    caller_service is what breaks the loop, and it is resolved from the caller's
+    bearer token rather than read off the request -- "I am a scanner, do not scan
+    me" is not a claim a caller gets to make about itself. Both of their scanners
+    identify this way: the workflow states it over Nexus, the legacy host script
+    gets it from its own token.
+    """
+
+    async def run() -> None:
+        _reset_backend(scan_available=True)
+        async with await _environment() as env:
+            async with _gateway_worker(env):
+                handle = await _start_chain(env, "scanner-promote")
+                response = await handle.execute_update(
+                    AgenticChainWorkflow.request_tool_call,
+                    _direct_promotion_request(
+                        handle.id, "scanner-promote", caller_service="security"
+                    ),
+                )
+
+                # Straight to a human, with no scan inserted: this request IS the
+                # output of a scan.
+                assert response.status == "waiting_for_approval"
+                op = await _operation_view(handle, "scanner-promote-op")
+                assert op.status == "waiting_for_approval"
+                assert "scan_workflow_id" not in op.checkpoint
+                assert "get_security_scan_status" not in _tool_names()
+                # Still the Security team's to approve, on both grounds.
+                assert op.required_approver_team == "security"
+
+    asyncio.run(run())
+
+
+def test_a_hand_rolled_staging_promotion_is_untouched() -> None:
+    """The mandate covers production, and only production.
+
+    Worth pinning because the new check runs on every single-tool call now. A
+    staging promotion is not a mandate-covered action, was never scanned, and must
+    stay exactly as cheap as it was -- the pipeline promotes through staging on its
+    way to production and would deadlock on a scan that had no business being
+    there.
+    """
+
+    async def run() -> None:
+        _reset_backend(scan_available=True)
+        async with await _environment() as env:
+            async with _gateway_worker(env):
+                handle = await _start_chain(env, "staging-promote")
+                await handle.execute_update(
+                    AgenticChainWorkflow.request_tool_call,
+                    _direct_promotion_request(
+                        handle.id, "staging-promote", environment="staging"
+                    ),
+                )
+
+                assert "get_security_scan_status" not in _tool_names()
+                events = await _ledger_events(handle)
+                assert "security_scan_handoff" not in events
+
+    asyncio.run(run())
+
+
+def test_in_legacy_mode_the_gateway_inserts_no_scan_step() -> None:
+    """Act One of the walkthrough, as a contract rather than a container state.
+
+    The mandate is on, and the Security team's Temporal platform is up and
+    advertising -- it always is now, because it starts with everything else. What
+    decides the shape of the run is the scanner switch, and it is on `legacy`:
+    their scanner is a script somebody runs by hand, so there is nothing for the
+    gateway to hand off to and it inserts no step. The capability lookup does not
+    even happen.
+
+    This is what used to be expressed by not starting a container, which meant the
+    demo's central claim depended on operator setup and a release silently lost its
+    scan whenever the setup was wrong.
+    """
+
+    async def run() -> None:
+        _reset_backend(scan_available=True)
+        async with await _environment() as env:
+            async with _gateway_worker(env):
+                handle = await _start_chain(env, "legacy-mode")
+                response = await handle.execute_update(
+                    AgenticChainWorkflow.request_nested_tool_call,
+                    _pipeline_request(
+                        handle.id, "legacy-mode", scan_mode=SCAN_MODE_LEGACY
+                    ),
+                )
+
+                assert response.status == "waiting_for_approval"
+                parent = await _operation_view(handle, "legacy-mode-parent")
+                assert parent.status == "waiting_for_dependency"
+                assert "scan_workflow_id" not in parent.checkpoint
+                assert backend._scan is None
+                # Never asked. The provider was there and would have said yes.
+                assert "get_security_scan_status" not in _tool_names()
+                events = await _ledger_events(handle)
+                assert "security_scan_handoff" not in events
+                assert "security_scan_unavailable" not in events
+                # The mandate's other half still applies: the promotion that comes
+                # out is the Security team's to approve, whoever asked for it. That
+                # is what makes their legacy script hit a wall it cannot wait at.
+                child = await _operation_view(handle, "legacy-mode-child")
+                assert child.required_approver_team == "security"
 
     asyncio.run(run())
 

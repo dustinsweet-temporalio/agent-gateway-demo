@@ -52,6 +52,8 @@ from temporalio.worker import Worker
 import activities.gateway_activities as gateway_activities
 from activities.gateway_activities import await_quality_gate
 from common.models import (
+    SCAN_MODE_LEGACY,
+    SCAN_MODE_PLATFORM,
     ApprovalDecision,
     ChainInput,
     CorrelationContext,
@@ -66,7 +68,9 @@ from common.models import (
 import gateway.server as server
 from gateway.server import (
     MANDATE_TOGGLE,
+    SCAN_MODE_TOGGLE,
     _MandateToggle,
+    _ScanModeToggle,
     _render_dashboard,
     _render_mandate_switch,
 )
@@ -176,7 +180,7 @@ def test_the_dashboard_switch_says_what_it_did_only_when_it_is_on() -> None:
     explain. On, the walkthrough points at the sentence several minutes after
     flipping the switch, so it has to still be on the page then.
     """
-    off = _render_mandate_switch(False)
+    off = _render_mandate_switch(False, SCAN_MODE_LEGACY)
     # The control that turns it on, and nothing else: no label, no note.
     assert 'value="on"' in off and 'value="off"' not in off
     assert 'aria-checked="false"' in off
@@ -185,12 +189,47 @@ def test_the_dashboard_switch_says_what_it_did_only_when_it_is_on() -> None:
     # The accessible name is not a visible label, and is the only text either
     # state carries besides the note.
     assert 'aria-label="Security mandate"' in off
+    # And no scanner control at all: with no mandate there is no scan for either
+    # of the Security team's scanners to perform, and a control that changes
+    # nothing is worse than no control.
+    assert "scanmode" not in off
 
-    on = _render_mandate_switch(True)
+    on = _render_mandate_switch(True, SCAN_MODE_LEGACY)
     assert 'value="off"' in on and 'value="on"' not in on
     assert 'aria-checked="true"' in on
     assert "switch-on" in on
     assert "Production releases require Security Team approval." in on
+
+
+def test_the_scanner_control_appears_with_the_mandate_and_defaults_to_the_script() -> None:
+    """Which scanner is a stated position, not something inferred from a container.
+
+    Two named sides rather than an unlabelled switch, because both positions are
+    "on": the Security team scans either way, and the difference is whether the
+    thing doing it can survive a pause. Defaults to the script, which is the
+    "before" picture -- the mandate lands on a team that has not adopted Temporal
+    yet.
+
+    The words on screen are Script and Temporal. `legacy` and `platform` are the
+    code's names for those positions and say nothing to a room.
+    """
+    legacy = _render_mandate_switch(True, SCAN_MODE_LEGACY)
+    assert "scanmode" in legacy
+    assert ">Script<" in legacy and ">Temporal<" in legacy
+    # The script side is the one selected, and it is the side that does NOT offer
+    # to switch to itself.
+    assert f'value="{SCAN_MODE_PLATFORM}"' in legacy
+    assert legacy.index(f'value="{SCAN_MODE_LEGACY}"') < legacy.index(">Script<")
+
+    platform = _render_mandate_switch(True, SCAN_MODE_PLATFORM)
+    assert "scanmode" in platform
+    # Exactly one side is pressed in either position.
+    assert legacy.count('aria-pressed="true"') == 1
+    assert platform.count('aria-pressed="true"') == 1
+    # And they are not the same side.
+    assert legacy.index('aria-pressed="true"') != platform.index(
+        'aria-pressed="true"'
+    )
 
 
 def test_the_release_pipeline_row_is_drawn_from_the_toggle() -> None:

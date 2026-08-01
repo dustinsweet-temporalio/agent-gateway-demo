@@ -193,6 +193,13 @@ def publish_scan_state(input: PublishScanStateInput) -> dict[str, Any]:
                 "verdict": input.verdict,
                 "gateway_operation_id": input.gateway_operation_id,
                 "error": input.error,
+                # Stated rather than left to a default, because it is what the
+                # dashboard keys the whole card treatment off. And no ttl_seconds:
+                # this record does not age out. There is a Workflow behind it whose
+                # Event History is the truth, so silence here means a Worker is
+                # busy or restarting, not that the scan stopped existing. That
+                # asymmetry with the legacy scanner is the point, not an oversight.
+                "mode": "platform",
             },
         },
         timeout=5,

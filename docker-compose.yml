@@ -100,19 +100,17 @@ services:
   # so the Temporal UI shows two workers with two identities in two namespaces
   # rather than one worker wearing two hats.
   #
-  # Deliberately NOT started by default. The security scan is the CASE-2b beat: for
-  # CASE-1 and CASE-2a this team has not onboarded Waypoint yet, the pipeline's
-  # capability lookup comes back empty, and the release goes from green gates
-  # straight to the production approval exactly as it always did. Bring it up live,
-  # mid-demo, with:
+  # Started with everything else. `docker compose up -d` brings the whole demo up
+  # and `docker compose down -v` takes it all down; there is no profile to
+  # remember and none to forget under pressure in front of an audience.
   #
-  #     docker compose up -d security-scan-worker
-  #
-  # and the next pipeline run routes through the scan and the card animates in.
-  # Stopping the container takes the capability away again, because the
-  # registration it heartbeats expires on its own.
+  # This worker being up is deliberately NOT what decides whether a release gets
+  # scanned. That is the scan-mode switch on the dashboard: legacy runs the
+  # Security team's old host script, platform routes through the workflow this
+  # worker serves. An idle worker with nothing routed to it is invisible, so
+  # CASE-1 and CASE-2a look exactly as they did while it sat behind a profile,
+  # and Act One of CASE-2 stays a switch position rather than a container state.
   security-scan-worker:
-    profiles: ["security"]
     build:
       context: .
       dockerfile: Dockerfile.app
@@ -152,8 +150,17 @@ services:
       # Static bearer-token to identity map. The gateway sets the approval
       # requester from a matching token, never from anything the agent says.
       # Connect Claude Code with: --header "Authorization: Bearer tok_dustin"
-      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@quickmeals.com>","tok_abe":"Abe Roover <abe.roover@quickmeals.com>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo"}'
+      GATEWAY_PRINCIPALS: '{"tok_dustin":"Dustin Sweet <dustin.sweet@quickmeals.com>","tok_abe":"Abe Roover <abe.roover@quickmeals.com>","tok_adk":"release-agent@google-adk","tok_approver":"approver@demo","tok_legacy_scanner":"legacy-scanner@security"}'
       GATEWAY_APPROVERS: "approver@demo,Dustin Sweet <dustin.sweet@quickmeals.com>,Abe Roover <abe.roover@quickmeals.com>"
+      # Which service, if any, a principal is calling on behalf of. Read from the
+      # token the same way the principal itself is, and for the same reason: a
+      # caller does not get to name its own service. The Security team's legacy
+      # host script authenticates as `tok_legacy_scanner`, so the promotion it
+      # asks for carries caller_service=security -- which makes it the Security
+      # team's to approve, and exempts it from having a second scan put in front
+      # of it. Their Temporal workflow states the same thing over Nexus, so both
+      # of their scanners identify identically no matter which one is in use.
+      GATEWAY_PRINCIPAL_SERVICES: '{"legacy-scanner@security":"security"}'
       # Which QuickMeals engineering team each principal belongs to. Explicit and
       # auditable on purpose: an Operation gated by the Security team's scan may
       # only be approved by a Security-team member, and inferring that from an

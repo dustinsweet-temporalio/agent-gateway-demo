@@ -10,6 +10,26 @@ CALLBACK_WORKFLOW_ID_HEADER = "x-agent-gateway-callback-workflow-id"
 CALLBACK_RUN_ID_HEADER = "x-agent-gateway-callback-run-id"
 ADK_SESSION_ID_HEADER = "x-agent-gateway-adk-session-id"
 
+# How the Security team runs a pre-prod scan today. Two ways of doing the same
+# job, and the distinction the whole of CASE-2 turns on:
+#
+#   legacy   -- the host script they have run for years. No Temporal, no Event
+#               History, no worker. The gateway inserts no scan step of its own,
+#               because there is nothing durable to insert; somebody runs the
+#               script by hand and the script asks for the promotion itself.
+#   platform -- SecurityScanWorkflow, in the Security team's own namespace,
+#               reached over their Nexus Endpoint. The gateway routes every
+#               protected promotion through it.
+#
+# Which one is current is a dashboard switch, not a deployed state. Both
+# scanners exist and both are reachable at all times; the switch says which one
+# the company is using. Inferring it from whether a container happened to be
+# running made the demo's central claim depend on operator setup, and made a
+# release quietly skip its scan when the answer came back "nobody is home".
+SCAN_MODE_LEGACY = "legacy"
+SCAN_MODE_PLATFORM = "platform"
+SCAN_MODES = (SCAN_MODE_LEGACY, SCAN_MODE_PLATFORM)
+
 
 class OperationStatus(str, Enum):
     """Lifecycle states for a single approval-gated operation."""
@@ -107,6 +127,19 @@ class ToolCallRequest:
     # Carrying it makes the value part of Event History, so a replay reaches the
     # same answer even if the toggle has been flipped since.
     security_mandate: bool = False
+    # How the Security team performs a scan right now: "legacy" for the host
+    # script they have always run, "platform" for their Temporal workflow. Read
+    # from the gateway's second toggle at the same boundary and carried for the
+    # same reason as security_mandate.
+    #
+    # This is the only thing that decides whether the gateway inserts a scan step
+    # of its own. In legacy mode it does not: there is nothing durable to hand
+    # off to, so a human runs the script and the script asks for the promotion
+    # itself. In platform mode it does, on every path to a protected environment
+    # rather than only inside the orchestrated pipeline -- a company-wide mandate
+    # an agent can step around by calling promote_release directly instead of
+    # run_release_orchestration is not a mandate.
+    scan_mode: str = SCAN_MODE_LEGACY
 
 
 @dataclass
@@ -195,6 +228,8 @@ class NestedToolCallRequest:
     # that arrives over Nexus from the Security team already carries its own team
     # restriction through caller_service and does not need it.
     security_mandate: bool = False
+    # As on ToolCallRequest: which of the Security team's two scanners is current.
+    scan_mode: str = SCAN_MODE_LEGACY
 
 
 @dataclass

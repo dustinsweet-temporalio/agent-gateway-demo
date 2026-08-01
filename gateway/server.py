@@ -31,6 +31,8 @@ from common.models import (
     ADK_SESSION_ID_HEADER,
     CALLBACK_RUN_ID_HEADER,
     CALLBACK_WORKFLOW_ID_HEADER,
+    SCAN_MODE_LEGACY,
+    SCAN_MODE_PLATFORM,
     AdkTemporalSessionCallback,
     ApprovalDecision,
     AutonomousAgentInput,
@@ -194,6 +196,54 @@ def _load_principal_teams() -> dict[str, str]:
 _PRINCIPAL_TEAMS = _load_principal_teams()
 
 
+def _load_principal_services() -> dict[str, str]:
+    """Principal to caller-service map from GATEWAY_PRINCIPAL_SERVICES.
+
+    Example:
+      {"legacy-scanner@security": "security"}
+
+    caller_service is what says "this request comes from a scanner", and two
+    things key off it: the promotion becomes the Security team's to approve, and
+    it is exempt from having another scan inserted in front of it. Something that
+    load-bearing cannot be self-declared, so it is resolved from the bearer token
+    exactly as the principal is, and never read from the request body. An agent
+    that decides to claim caller_service=security to dodge the scan gets nowhere,
+    because nothing on the wire is consulted.
+
+    The Security team's Temporal workflow states the same value over Nexus, which
+    is a different trust path and legitimately so: that call arrives from inside
+    their namespace, addressed to an endpoint only they hold.
+    """
+    raw = os.getenv("GATEWAY_PRINCIPAL_SERVICES", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return {str(k).strip(): str(v).strip().lower() for k, v in data.items()}
+    except Exception:
+        return {}
+
+
+_PRINCIPAL_SERVICES = _load_principal_services()
+
+
+def _service_for_principal(principal: str) -> Optional[str]:
+    """The service this principal calls on behalf of, or None for a human.
+
+    Same key normalization as _team_for_principal: the full principal string or
+    just the address inside the angle brackets. Ordinary human callers and the
+    agent runtimes are absent from the map and get None, which is what leaves
+    every CASE-1 and CASE-3 call unrestricted.
+    """
+    service = _PRINCIPAL_SERVICES.get(principal)
+    if service is not None:
+        return service
+    if "<" in principal and ">" in principal:
+        address = principal.split("<", 1)[1].split(">", 1)[0].strip()
+        return _PRINCIPAL_SERVICES.get(address)
+    return None
+
+
 class _MandateToggle:
     """The company-wide security mandate, on or off, for this gateway process.
 
@@ -225,6 +275,48 @@ class _MandateToggle:
 
 
 MANDATE_TOGGLE = _MandateToggle()
+
+
+class _ScanModeToggle:
+    """Which of the Security team's two scanners the company is using.
+
+    The mandate says a scan happens. This says who runs it and how: the host
+    script they have always had (`legacy`), or the Temporal workflow they built
+    (`platform`). Defaults to legacy, because that is the "before" picture --
+    the mandate lands on a team that has not adopted Temporal yet.
+
+    Same in-memory, non-durable shape as _MandateToggle, snapshotted onto each
+    request for the same reason, and meaningless while the mandate is off: with
+    no mandate there is no scan step for either scanner to be.
+
+    Why a switch rather than a lookup. The gateway used to ask a service registry
+    whether anyone was offering scanning and let the answer decide, which meant
+    the demo's central claim rode on whether a container happened to be running,
+    and meant a release silently skipped its scan whenever the answer was no.
+    Both scanners are always reachable now. This states which one is in use, and
+    the registry is only consulted to check that the one we chose is actually
+    answering -- see _scan_provider_health.
+    """
+
+    def __init__(self, mode: str = SCAN_MODE_LEGACY) -> None:
+        self._mode = mode
+
+    def mode(self) -> str:
+        return self._mode
+
+    def is_platform(self) -> bool:
+        return self._mode == SCAN_MODE_PLATFORM
+
+    def set(self, mode: str) -> str:
+        self._mode = (
+            SCAN_MODE_PLATFORM
+            if str(mode).lower() == SCAN_MODE_PLATFORM
+            else SCAN_MODE_LEGACY
+        )
+        return self._mode
+
+
+SCAN_MODE_TOGGLE = _ScanModeToggle()
 
 
 def _team_for_principal(principal: str) -> Optional[str]:
@@ -618,6 +710,10 @@ async def _submit_tool_call(
         idempotency_key=idem,
         agent_session_id=_session_key(ctx),
         caller_principal=caller_principal,
+        # Resolved from the token, never from the request. The Security team's
+        # legacy host script authenticates as itself and so reaches the Workflow
+        # already identified as a scanner; every other caller here is None.
+        caller_service=_service_for_principal(caller_principal),
         runtime=runtime,
         call_path=[runtime, tool_name],
     )
@@ -635,6 +731,12 @@ async def _submit_tool_call(
         # Workflow decides what the mandate means; it does not get to look up
         # whether it is on.
         security_mandate=MANDATE_TOGGLE.is_on(),
+        # Both toggles ride on the single-tool path too, not just the pipeline's.
+        # This is the path an agent takes when it decides to call promote_release
+        # itself instead of run_release_orchestration, and it is precisely the
+        # path a company-wide mandate has to hold on: a control an agent can step
+        # around by picking a different tool is not a control.
+        scan_mode=SCAN_MODE_TOGGLE.mode(),
     )
 
     # Deliver the tool call as an Update. wait_for_stage=ACCEPTED returns the handle
@@ -842,6 +944,9 @@ async def _submit_nested_release(
         idempotency_key=idem,
         agent_session_id=_session_key(ctx),
         caller_principal=principal,
+        # As on the single-tool path: token-resolved, so the legacy scanner's own
+        # nested call arrives identified as a scanner and is not handed a scan.
+        caller_service=_service_for_principal(principal),
         runtime="ClaudeCode",
         call_path=["ClaudeCode", tool1_name],
     )
@@ -863,6 +968,7 @@ async def _submit_nested_release(
         safe_tool1_arguments=_safe_arguments(tool1_arguments),
         safe_tool2_arguments=_safe_arguments(tool2_arguments),
         security_mandate=MANDATE_TOGGLE.is_on(),
+        scan_mode=SCAN_MODE_TOGGLE.mode(),
     )
     start_op = WithStartWorkflowOperation(
         AgenticChainWorkflow.run,
@@ -1305,7 +1411,9 @@ async def dashboard(request: Request) -> HTMLResponse:
                     history.append((wf.id, op))
     history.sort(key=lambda row: (row[1].decided_iso or ""), reverse=True)
     return HTMLResponse(
-        _render_dashboard(pending, history, MANDATE_TOGGLE.is_on())
+        _render_dashboard(
+            pending, history, MANDATE_TOGGLE.is_on(), SCAN_MODE_TOGGLE.mode()
+        )
     )
 
 
@@ -1322,6 +1430,27 @@ async def mandate(request: Request) -> Response:
         return RedirectResponse("/login", status_code=303)
     form = await request.form()
     MANDATE_TOGGLE.set(str(form.get("state") or "").lower() == "on")
+    return RedirectResponse("/", status_code=303)
+
+
+@mcp.custom_route("/scan-mode", methods=["POST"])
+async def scan_mode(request: Request) -> Response:
+    """Switch between the Security team's legacy script and their Temporal workflow.
+
+    Only meaningful while the mandate is on, which is why the control is only
+    rendered then: with no mandate there is no scan step for either scanner to be.
+    The value is not reset when the mandate is switched off, so flipping the
+    mandate off and on again returns to the same scanner rather than silently
+    dropping back to legacy mid-demo.
+
+    Gated on approver identity like /mandate, and equally non-durable: the next
+    call the gateway accepts reads the new value, and anything already in the
+    queue keeps the mode it was created under.
+    """
+    if not _is_approver(_resolve_principal()):
+        return RedirectResponse("/login", status_code=303)
+    form = await request.form()
+    SCAN_MODE_TOGGLE.set(str(form.get("mode") or ""))
     return RedirectResponse("/", status_code=303)
 
 
@@ -1363,6 +1492,11 @@ async def fleet(request: Request) -> JSONResponse:
     state["available"] = True
     state["protected_environments"] = sorted(PROTECTED_ENVIRONMENTS)
     state["security_mandate"] = MANDATE_TOGGLE.is_on()
+    # Which scanner is current rides along with the mandate, because it decides
+    # what the scan card is a card *of*: the same slot in the pipeline holds the
+    # Security team's untemporalized script or their workflow, and those are not
+    # the same object however similar the step looks on the row.
+    state["scan_mode"] = SCAN_MODE_TOGGLE.mode()
     return JSONResponse(state)
 
 
@@ -1568,6 +1702,20 @@ _CSS = """
   --card: #151924; --card-edge: #1c2130; --protect: #f59e0b;
   --on-accent: #04211e; --accent-glow: rgba(19,196,176,0.34);
   --accent-wash: rgba(19,196,176,0.16); --shine: rgba(19,196,176,0.16);
+  /* Card titles. Separate from --th, which still dresses table headers: the
+     pipeline's card names are the labels you read from across a room and they
+     were sitting at the same weight as a column heading. */
+  --card-title: #d7dbe2;
+  /* The Security team's colour, used for nothing else on the page. Ownership is
+     carried by hue here and durability is carried by card content, so this stays
+     the same in both scanner modes -- the step belongs to Security whether or
+     not they have adopted Temporal. Brightened off true cobalt (#0047ab) for
+     legibility on the dark surface; the light theme uses cobalt itself. */
+  --cobalt: #5b8bff; --cobalt-tint: rgba(91,139,255,0.05);
+  --cobalt-edge: rgba(91,139,255,0.55);
+  /* The ownership fence. Medium-light gray on purpose: it marks a boundary, it
+     is not itself a status, so it must not compete with anything that is. */
+  --fence-line: #6b7280;
 }
 [data-theme="light"] {
   --bg: #ffffff; --fg: #0f1117; --muted: #6b7280; --border: #e5e7eb;
@@ -1575,6 +1723,13 @@ _CSS = """
   --card: #fbfcfd; --card-edge: #eef1f4; --protect: #b45309;
   --on-accent: #ffffff; --accent-glow: rgba(15,155,142,0.26);
   --accent-wash: rgba(15,155,142,0.12); --shine: rgba(15,155,142,0.12);
+  /* The same role, one step toward the foreground rather than literally
+     near-white: a near-white title on a white page is not a lighter title, it
+     is a missing one. */
+  --card-title: #414b5a;
+  --cobalt: #0047ab; --cobalt-tint: rgba(0,71,171,0.05);
+  --cobalt-edge: rgba(0,71,171,0.45);
+  --fence-line: #a7aeba;
 }
 body { background: var(--bg); color: var(--fg); font-family: Inter, system-ui, sans-serif; margin: 2rem; }
 header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
@@ -1619,6 +1774,18 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .switch-on { background: #22c55e; border-color: #22c55e; }
 .switch-on::after { transform: translate(0.87rem, -50%); }
 .mandate-note { font-size: 0.72rem; text-align: right; max-width: 20rem; }
+/* Which of the Security team's two scanners is current. Appears only under a
+   live mandate, and unlike the mandate switch it is labelled on both sides,
+   because both positions are "on" and the difference between them is the thing
+   the demo is about. Cobalt on the selected side ties it to the card it governs
+   down in the pipeline. */
+.scanmode { display: flex; align-items: center; gap: 0.4rem; }
+.scanmode-label { font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.08em; }
+.scanmode-seg { display: inline-block; margin: 0; }
+.seg { margin: 0; padding: 0.2rem 0.55rem; font-size: 0.68rem; background: transparent;
+        border: 1px solid var(--border); color: var(--muted); border-radius: 999px;
+        transition: color 140ms ease, border-color 140ms ease, background 140ms ease; }
+.seg-on { color: var(--cobalt); border-color: var(--cobalt-edge); background: var(--cobalt-tint); }
 .forbidden { max-width: 34rem; margin: 12vh auto; padding: 2rem;
         border: 1px solid #ef4444; border-radius: 8px; }
 .forbidden h1 { color: #ef4444; }
@@ -1649,7 +1816,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
        font-weight: 600; letter-spacing: -0.01em; }
 .section-head { display: flex; align-items: center; gap: 0; }
 .section-head .live { margin-left: 0.7rem; }
-.eyebrow { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--th); }
+.eyebrow { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.1em; color: var(--card-title); }
 .subtle { margin: 0.3rem 0 0; font-size: 0.78rem; }
 .divider { border: 0; border-top: 1px solid var(--border); margin: 1.9rem 0 0; }
 .queue-head { margin-top: 1.6rem; }
@@ -1703,7 +1870,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .env-body { min-width: 0; }
 .env-side { min-width: 0; }
 .env-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-       font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--th); }
+       font-size: 0.68rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; color: var(--card-title); }
 .tag { flex: none; white-space: nowrap; font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em;
        padding: 0.14rem 0.44rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); }
 .tag-protected { color: var(--protect); border-color: var(--protect); }
@@ -1760,7 +1927,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .gate.idle .gate-verdict { color: var(--muted); }
 .gate-top { display: flex; align-items: center; justify-content: space-between; gap: 0.4rem; }
 .gate-name { font-size: 0.66rem; font-weight: 600; text-transform: uppercase;
-        letter-spacing: 0.1em; color: var(--th); }
+        letter-spacing: 0.1em; color: var(--card-title); }
 .gate-verdict { font-family: "JetBrains Mono", ui-monospace, monospace; font-size: 0.95rem;
         font-weight: 600; letter-spacing: -0.01em; margin: 0.4rem 0 0.1rem; }
 .gate-sub { font-size: 0.66rem; color: var(--muted); }
@@ -1796,9 +1963,69 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
    it is not the Waypoint team's -- it belongs to another QuickMeals engineering
    team, running in another Temporal namespace, and the demo's whole CASE-2b
    beat is that distinction. */
-.gate.scan { flex: 0 0 12rem; }
-.gate-owner { margin-top: 0.05rem; font-size: 0.58rem; text-transform: uppercase;
-        letter-spacing: 0.09em; color: var(--muted); opacity: 0.85; }
+
+/* --- ownership chrome: this step is not the Waypoint team's ----------------
+   Two dashed verticals fence the scan card off from the cards on either side,
+   with the owning team named above the fence. Everything else on this row is
+   Waypoint's; this one card is another team's system, reached over a Nexus
+   endpoint, and the row should say so without a sentence.
+
+   Drawn on the two connectors flanking the card rather than on the card itself,
+   which is what puts each line exactly halfway between the scan card and its
+   neighbour: those connectors ARE the gaps. --fence is the distance the lines
+   run past the cards, applied equally above and below, with the pipeline's top
+   padding making room for the overhang and the label.
+
+   Keyed on data-scan-shown rather than on the mandate toggle, because the card
+   itself is: a scan still running when the mandate is switched off keeps its
+   card, and stripping the fence and label off it would leave another team's
+   workflow looking like ours. Chrome and card appear and disappear together. */
+.pipeline { --fence: 1.45rem; }
+.pipeline[data-scan-shown="1"] { padding-top: 2.55rem; }
+.pipeline[data-scan-shown="1"] .link[data-into="scan"]::before,
+.pipeline[data-scan-shown="1"] .link[data-into="prod"]::before {
+        content: ""; position: absolute; left: 50%; width: 0;
+        top: calc(-1 * var(--fence)); bottom: calc(-1 * var(--fence));
+        border-left: 1px dashed var(--fence-line); pointer-events: none; }
+/* The owner, above the fence and centred on the card it owns. Sits just inside
+   the top of the dashed lines. Needs the card to stop clipping, hence the
+   overflow exception below. */
+.scan-fence-label { position: absolute; left: 50%; transform: translateX(-50%);
+        bottom: calc(100% + var(--fence) - 0.95rem); white-space: nowrap;
+        font-size: 0.62rem; font-weight: 600; text-transform: uppercase;
+        letter-spacing: 0.1em; color: var(--card-title); }
+
+/* --- the card itself ------------------------------------------------------
+   Cobalt, used nowhere else on the page, and identical in both scanner modes:
+   the step belongs to the Security team whether or not they have adopted
+   Temporal. Ownership is carried by colour; how durable the thing is gets
+   carried by the card's contents, further down. */
+.gate.scan { flex: 0 0 15.5rem; overflow: visible;
+        border-color: var(--cobalt-edge); background:
+        linear-gradient(var(--cobalt-tint), var(--cobalt-tint)), var(--card); }
+/* Cobalt wins over the status border colours the other cards use. On this one
+   card the border is saying whose it is, not how it is going, and ownership does
+   not change while a scan runs. Status is still fully legible without it: the
+   verdict word is coloured, the stage dots fill in, and a running scan animates a
+   line along the bottom edge.
+
+   The single exception is a failed scan, which stays red. A security scan that
+   found something is the one state on this row that must be unmistakable from the
+   back of the room, and no ownership convention is worth muting it. A stale legacy
+   scan keeps cobalt and goes dashed instead -- abandoned is not the same as
+   failed, and drawing them the same colour would be a lie about what happened. */
+.gate.scan.idle, .gate.scan.running, .gate.scan.waiting, .gate.scan.passed,
+.gate.scan.stale { border-color: var(--cobalt-edge); }
+.gate.scan.running::after { background: linear-gradient(90deg, transparent,
+        var(--cobalt), transparent); }
+.gate.scan.stale { border-style: dashed; }
+.gate.scan .gate-name { color: var(--card-title); }
+/* Badge, top right, cobalt: a shield with a star on it. Inline SVG rather than
+   an emoji or a font glyph, so it renders identically everywhere and takes the
+   card's own colour. */
+.scan-badge { flex: none; width: 0.95rem; height: 0.95rem; color: var(--cobalt);
+        opacity: 0.9; }
+.scan-badge svg { display: block; width: 100%; height: 100%; }
 .scan-stages { display: flex; align-items: center; gap: 0.28rem; margin: 0.5rem 0 0.35rem; }
 .scan-dot { flex: 0 0 auto; width: 0.5rem; height: 0.5rem; border-radius: 50%;
         border: 1px solid var(--card-edge); background: transparent; }
@@ -1822,6 +2049,61 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .scan-stage .finding.bad { color: #ef4444; }
 .gate.waiting { border-style: solid; border-color: var(--protect); }
 .gate.waiting .gate-verdict { color: var(--protect); }
+
+/* --- how durable the scanner is, said by the card's contents ---------------
+   The same slot holds two different systems, and the audience has to be able to
+   tell which one is in it from across a room. Ownership is already spent on
+   colour, so the difference lives in structure:
+
+     platform -- stage dots, a named stage with its severity, and the scan's own
+                 workflow id as a link into the Security team's namespace. It is
+                 an object in a system you can go and look at.
+     legacy   -- the tail of a process's stdout. No dots, no severity chips, no
+                 progress bar, no id, because there is no workflow to have one.
+                 A counter and four lines of monospace, which is genuinely all
+                 the platform can know about a script running on somebody's host.
+
+   Deliberately not caricatured. The legacy card is not broken or ugly; it is
+   thin, and thin is the accurate word. What sells it is the footer: one card
+   offers you somewhere to click and the other says there is nowhere. */
+.scan-prov { display: flex; align-items: center; gap: 0.3rem; margin-top: 0.45rem;
+        padding-top: 0.4rem; border-top: 1px dashed var(--card-edge); min-width: 0; }
+.scan-prov-tag { flex: none; font-size: 0.55rem; font-weight: 700;
+        text-transform: uppercase; letter-spacing: 0.08em; padding: 0.06rem 0.3rem;
+        border-radius: 3px; }
+.scan-prov-tag.platform { color: var(--cobalt); border: 1px solid var(--cobalt-edge);
+        background: var(--cobalt-tint); }
+.scan-prov-tag.script { color: var(--muted); border: 1px dashed var(--fence-line); }
+/* The link into the other team's namespace, and the reason the legacy card's
+   footer reads as an absence. */
+.scan-wfid { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 0.55rem; color: var(--cobalt); text-decoration: none;
+        border-bottom: 1px dotted var(--cobalt-edge); }
+.scan-wfid:hover { color: var(--fg); }
+.scan-noid { min-width: 0; overflow: hidden; text-overflow: ellipsis;
+        white-space: nowrap; font-size: 0.55rem; font-style: italic;
+        color: var(--muted); opacity: 0.8; }
+/* stdout, tailed. Fixed height so the card does not resize line by line, and
+   older lines fade upward so the newest is the one being read. */
+.scan-tail { margin: 0.45rem 0 0; padding: 0.3rem 0.36rem; list-style: none;
+        display: flex; flex-direction: column; justify-content: flex-end;
+        gap: 0.05rem; height: 3.5rem; overflow: hidden; border-radius: 4px;
+        background: rgba(0,0,0,0.16); }
+[data-theme="light"] .scan-tail { background: rgba(15,17,23,0.045); }
+.scan-tail li { font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 0.53rem; line-height: 1.3; color: var(--muted);
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.scan-tail li.last { color: var(--fg); opacity: 0.9; }
+.scan-tail li.bad { color: #ef4444; }
+.scan-count { flex: none; font-family: "JetBrains Mono", ui-monospace, monospace;
+        font-size: 0.6rem; color: var(--muted); }
+/* Nobody reported this dead. It stopped refreshing and the platform noticed,
+   which is the whole difference between a process and a workflow. */
+.gate.scan.stale .scan-tail, .gate.scan.stale .gate-verdict,
+.gate.scan.stale .scan-count { opacity: 0.45; }
+.scan-stale-note { margin-top: 0.35rem; font-size: 0.58rem; color: var(--protect);
+        text-transform: uppercase; letter-spacing: 0.07em; }
 
 @media (prefers-reduced-motion: reduce) {
   .gate.scan.appearing, .gate.running::after, .scan-dot.live { animation: none; }
@@ -1894,6 +2176,11 @@ var FLEET = (function () {
   var LABELS = { staging: 'Staging', prod: 'Production' };
   var KNOWN_ENVS = { staging: 1, prod: 1 };
   var ANIM_MS = 2200;
+  // The Temporal Web UI, for the one link on this page that leaves it: the
+  // security scan's own workflow, in the Security team's namespace. Derived from
+  // the page's own host so it works whether the dashboard is opened on
+  // localhost or over a LAN address during a demo.
+  var TEMPORAL_UI = location.protocol + '//' + location.hostname + ':8233';
   var pipeline, rail, statusEl, serviceEl;
   var protectedEnvs = {};
   var seen = {};
@@ -1971,22 +2258,52 @@ var FLEET = (function () {
     return card;
   }
 
+  // A shield with a star, in the card's own colour. Inline so it needs no
+  // network request under the artifact CSP and no icon font.
+  var SCAN_BADGE_SVG = '<svg viewBox="0 0 24 24" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.7" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    '<path d="M12 2.6 4.6 5.4v5.9c0 4.6 3.1 8.4 7.4 9.9 4.3-1.5 7.4-5.3 7.4-9.9V5.4Z"/>' +
+    '<path d="m12 8.1 1.2 2.5 2.7.4-2 1.9.5 2.7-2.4-1.3-2.4 1.3.5-2.7-2-1.9 2.7-.4Z"/>' +
+    '</svg>';
+
   function buildScan() {
     var card = el('div', 'gate scan');
     card.setAttribute('data-scan', '1');
+    // The owning team, above the card and between the dashed fence lines. Part
+    // of the card's own DOM so it tracks the card automatically -- built, moved
+    // and removed with it, with no second element to keep in step.
+    card.appendChild(el('div', 'scan-fence-label', 'Security Team'));
     var top = el('div', 'gate-top');
     top.appendChild(el('span', 'gate-name', 'Security scan'));
+    var badge = el('span', 'scan-badge');
+    badge.innerHTML = SCAN_BADGE_SVG;
+    top.appendChild(badge);
     card.appendChild(top);
-    // The only card in this row that names an owner, because it is the only one
-    // that belongs to a different team.
-    card.appendChild(el('div', 'gate-owner', 'Security team'));
+    // No owner line inside the card: the fence label above it already names the
+    // team, and saying it twice in two type sizes six pixels apart read as a
+    // mistake rather than as emphasis.
     card.appendChild(el('div', 'gate-verdict'));
     card.appendChild(el('div', 'gate-sub'));
+    // Platform body: dots plus the named stage and its finding.
     card.appendChild(el('div', 'scan-stages'));
     var stage = el('div', 'scan-stage');
     stage.appendChild(el('span', 'name'));
     stage.appendChild(el('span', 'finding'));
     card.appendChild(stage);
+    // Legacy body: the tail of the script's stdout, and nothing else, because
+    // nothing else is knowable about it.
+    card.appendChild(el('ul', 'scan-tail'));
+    card.appendChild(el('div', 'scan-stale-note', 'stale \\u00b7 no scanner reporting'));
+    // Provenance, which is where the two modes differ most plainly: a link into
+    // the Security team's namespace, or a statement that there is nothing to
+    // link to.
+    var prov = el('div', 'scan-prov');
+    prov.appendChild(el('span', 'scan-prov-tag'));
+    prov.appendChild(el('a', 'scan-wfid'));
+    prov.appendChild(el('span', 'scan-noid'));
+    prov.appendChild(el('span', 'scan-count'));
+    card.appendChild(prov);
     return card;
   }
 
@@ -2173,19 +2490,118 @@ var FLEET = (function () {
   var SCAN_STAGE_NAMES = ['dependency_scan', 'container_image_scan',
     'secret_detection', 'static_analysis'];
 
-  function paintScan(scan, appearing) {
+  // Which of the Security team's two scanners this record came from, and what
+  // the card says about each. Both are the Security team's; only one of them is
+  // an object this platform can see into.
+  function scanIsLegacy(scan, scanMode) {
+    // A scan that is still going keeps the treatment of whatever produced it:
+    // moving the switch under a running scan must not repaint it as the other
+    // kind of thing, any more than it should erase the card.
+    //
+    // Anything else follows the switch, including a finished record from the
+    // other mode. The switch is the demo's one moving part and flipping it has
+    // to visibly change this card immediately -- a card still dressed as the
+    // last scan that happened to run would contradict the operator mid-sentence,
+    // which is the exact failure this whole change is fixing.
+    if (scan && !scan.stale && scan.mode &&
+        (scan.phase === 'running_scan' || scan.phase === 'awaiting_prod_approval')) {
+      return scan.mode === 'legacy';
+    }
+    return scanMode !== 'platform';
+  }
+
+  // Show and hide the two bodies. The card carries the DOM for both so a mode
+  // flip is a class change rather than a rebuild, which keeps the reveal
+  // animation from replaying every time the switch moves.
+  function setScanBody(card, legacy) {
+    card.classList.toggle('legacy', legacy);
+    card.classList.toggle('platform', !legacy);
+    card.querySelector('.scan-stages').style.display = legacy ? 'none' : '';
+    card.querySelector('.scan-stage').style.display = legacy ? 'none' : '';
+    card.querySelector('.scan-tail').style.display = legacy ? '' : 'none';
+  }
+
+  // The provenance footer. This is the line that carries "durable or not":
+  // either the scan's own workflow id, clickable into the Security team's
+  // namespace in the Temporal UI, or a plain statement that there is no such
+  // thing to point at because the scanner is a process on somebody's host.
+  function setScanProvenance(card, legacy, scan) {
+    var tag = card.querySelector('.scan-prov-tag');
+    var link = card.querySelector('.scan-wfid');
+    var noid = card.querySelector('.scan-noid');
+    var count = card.querySelector('.scan-count');
+    var wfid = (scan && scan.scan_workflow_id) || '';
+    tag.className = 'scan-prov-tag ' + (legacy ? 'script' : 'platform');
+    tag.textContent = legacy ? 'script' : 'temporal';
+    if (legacy) {
+      link.style.display = 'none';
+      link.removeAttribute('href');
+      noid.style.display = '';
+      noid.textContent = 'no workflow id · local process';
+    } else {
+      noid.style.display = 'none';
+      link.style.display = '';
+      if (wfid) {
+        link.textContent = wfid;
+        link.setAttribute('href', TEMPORAL_UI + '/namespaces/security/workflows/' +
+          encodeURIComponent(wfid));
+        link.setAttribute('target', '_blank');
+        link.setAttribute('rel', 'noreferrer');
+        link.setAttribute('title', wfid);
+      } else {
+        link.textContent = 'awaiting workflow';
+        link.removeAttribute('href');
+        link.removeAttribute('title');
+      }
+    }
+    var total = (scan && scan.stage_count) || 4;
+    var done = (scan && scan.stages_completed) || 0;
+    count.textContent = scan ? done + '/' + total : '';
+  }
+
+  // stdout, tailed. Every line the script has printed so far, oldest trimmed
+  // off the top. The platform knows this much and no more, which is the point.
+  function setScanTail(card, scan) {
+    var tail = card.querySelector('.scan-tail');
+    tail.innerHTML = '';
+    var lines = (scan && scan.lines) || [];
+    // An empty box reads as a rendering bug rather than as a scanner that has not
+    // been run. Say which it is.
+    if (!lines.length) lines = ['(no output \u2014 scanner has not been run)'];
+    var shown = lines.slice(-4);
+    for (var i = 0; i < shown.length; i++) {
+      var cls = 'scan-tail-line';
+      if (i === shown.length - 1) cls += ' last';
+      if (/fail|blocked|cannot|high|critical/i.test(shown[i])) cls += ' bad';
+      tail.appendChild(el('li', cls, shown[i]));
+    }
+  }
+
+  function paintScan(scan, appearing, scanMode) {
     var card = pipeline.querySelector('.gate.scan');
     if (!card) return;
+    var legacy = scanIsLegacy(scan, scanMode);
+    // Drawing a Temporal scan's stages inside a card the switch says is a script
+    // (or the reverse) would be a straightforwardly false picture, so a record
+    // belonging to the other scanner is dropped and the card goes back to idle.
+    if (scan && scan.mode && (scan.mode === 'legacy') !== legacy) scan = null;
 
     // The card is on the row because the mandate put a scan on the path to
     // production, which happens the moment the switch is flipped rather than
     // the moment a scan first runs. Until one has run there is no verdict to
     // report, and an idle card saying so is the accurate picture -- the same
     // contract the gate card has, one checkpoint further along.
+    //
+    // Idle still commits to a scanner, because the scanner switch has already
+    // been set: flipping it repaints this card immediately rather than waiting
+    // for a release to prove which one is armed.
     if (!scan) {
       card.className = 'gate scan idle' + (appearing ? ' appearing' : '');
+      setScanBody(card, legacy);
       card.querySelector('.gate-verdict').textContent = 'idle';
-      card.querySelector('.gate-sub').textContent = 'no candidate scanned yet';
+      card.querySelector('.gate-sub').textContent = legacy
+        ? 'run by hand · nothing reporting'
+        : 'no candidate scanned yet';
       var idleDots = card.querySelector('.scan-stages');
       idleDots.innerHTML = '';
       for (var d = 0; d < SCAN_STAGE_NAMES.length; d++) {
@@ -2196,6 +2612,9 @@ var FLEET = (function () {
       var idleFinding = idleStage.querySelector('.finding');
       idleFinding.className = 'finding';
       idleFinding.textContent = '';
+      setScanTail(card, null);
+      setScanProvenance(card, legacy, null);
+      card.querySelector('.scan-stale-note').style.display = 'none';
       var idleOut = linkInto('prod');
       if (idleOut) idleOut.classList.remove('blocked');
       if (appearing) hold();
@@ -2206,8 +2625,16 @@ var FLEET = (function () {
     var total = scan.stage_count || 4;
     var done = scan.stages_completed || 0;
     var running = phase[0] === 'running';
-    card.className = 'gate scan ' + phase[0] + (appearing ? ' appearing' : '');
-    card.querySelector('.gate-verdict').textContent = phase[1];
+    // A legacy scan that stopped refreshing its heartbeat. Nobody reported it
+    // dead -- it simply stopped saying it was alive, and the registration aged
+    // out on its own. That is the honest end state for a process, and it is the
+    // exact case the platform scan survives.
+    var stale = !!scan.stale;
+    card.className = 'gate scan ' + (stale ? 'stale' : phase[0]) +
+      (appearing ? ' appearing' : '');
+    setScanBody(card, legacy);
+    card.querySelector('.gate-verdict').textContent = stale ? 'abandoned' : phase[1];
+    card.querySelector('.scan-stale-note').style.display = stale ? '' : 'none';
 
     // The stage number, the stage name, and the severity all refer to the SAME
     // stage: the last one to report. Pairing the in-flight stage's name with the
@@ -2218,47 +2645,54 @@ var FLEET = (function () {
     var latest = results.length ? results[results.length - 1] : null;
     var shown = Math.max(Math.min(done, total), 1);
     var sub = scan.version || '';
-    if (running) sub += ' \\u00b7 stage ' + shown + '/' + total;
-    else if (scan.phase === 'scan_failed') sub += ' \\u00b7 failed at stage ' + done;
-    else sub += ' \\u00b7 ' + done + '/' + total + ' clean';
+    if (stale) sub += ' · stopped at stage ' + done;
+    else if (running) sub += ' · stage ' + shown + '/' + total;
+    else if (scan.phase === 'scan_failed') sub += ' · failed at stage ' + done;
+    else sub += ' · ' + done + '/' + total + ' clean';
     card.querySelector('.gate-sub').textContent = sub;
 
-    // One dot per stage: filled as each stage reports, pulsing on the one running
-    // right now, red on the one that ended the scan.
-    var dots = card.querySelector('.scan-stages');
-    dots.innerHTML = '';
-    for (var i = 0; i < total; i++) {
-      var result = results[i];
-      var cls = 'scan-dot';
-      if (result) cls += result.passed ? ' ok' : ' bad';
-      else if (running && i === done) cls += ' live';
-      dots.appendChild(el('span', cls));
+    if (legacy) {
+      setScanTail(card, scan);
+    } else {
+      // One dot per stage: filled as each stage reports, pulsing on the one
+      // running right now, red on the one that ended the scan.
+      var dots = card.querySelector('.scan-stages');
+      dots.innerHTML = '';
+      for (var i = 0; i < total; i++) {
+        var result = results[i];
+        var cls = 'scan-dot';
+        if (result) cls += result.passed ? ' ok' : ' bad';
+        else if (running && i === done) cls += ' live';
+        dots.appendChild(el('span', cls));
+      }
+
+      // Which stage, and what that same stage found. Before the first stage
+      // reports there is nothing to attribute, so the name of the stage about to
+      // run goes up on its own rather than leaving the line blank.
+      var stageEl = card.querySelector('.scan-stage');
+      var findingEl = stageEl.querySelector('.finding');
+      var text = '';
+      var findingCls = 'finding';
+      var current = latest
+        ? (latest.stage_name || '')
+        : (SCAN_STAGE_NAMES[0] || '');
+      if (latest && !latest.passed) {
+        text = latest.findings + ' · ' + latest.max_severity;
+        findingCls += ' bad';
+      } else if (latest) {
+        text = latest.max_severity;
+        findingCls += ' ok';
+      }
+      stageEl.querySelector('.name').textContent = current;
+      findingEl.className = findingCls;
+      findingEl.textContent = text;
     }
 
-    // Which stage, and what that same stage found. Before the first stage
-    // reports there is nothing to attribute, so the name of the stage about to
-    // run goes up on its own rather than leaving the line blank.
-    var stageEl = card.querySelector('.scan-stage');
-    var findingEl = stageEl.querySelector('.finding');
-    var text = '';
-    var findingCls = 'finding';
-    var current = latest
-      ? (latest.stage_name || '')
-      : (SCAN_STAGE_NAMES[0] || '');
-    if (latest && !latest.passed) {
-      text = latest.findings + ' \\u00b7 ' + latest.max_severity;
-      findingCls += ' bad';
-    } else if (latest) {
-      text = latest.max_severity;
-      findingCls += ' ok';
-    }
-    stageEl.querySelector('.name').textContent = current;
-    findingEl.className = findingCls;
-    findingEl.textContent = text;
+    setScanProvenance(card, legacy, scan);
 
     var out = linkInto('prod');
-    if (out) out.classList.toggle('blocked', phase[0] === 'failed');
-    if (running || appearing) hold();
+    if (out) out.classList.toggle('blocked', phase[0] === 'failed' || stale);
+    if ((running && !stale) || appearing) hold();
   }
 
   function paint(state, animate) {
@@ -2294,9 +2728,21 @@ var FLEET = (function () {
     // A scan that is still live keeps the card even if the mandate is lifted
     // under it: operations already in flight keep the restriction they were
     // created with, and the row should not erase one that is still running.
-    var scanLive = !!scan &&
+    var scanLive = !!scan && !scan.stale &&
       (scan.phase === 'running_scan' || scan.phase === 'awaiting_prod_approval');
     var hasScan = mandateOn || scanLive;
+    // Which scanner is armed, carried the same way and for the same reason as
+    // the mandate: the page's own attribute covers the first paint after the
+    // switch moves, before /fleet has been polled again.
+    var scanMode = state.scan_mode === undefined
+      ? (pipeline.getAttribute('data-scan-mode') || 'legacy')
+      : state.scan_mode;
+    pipeline.setAttribute('data-scan-mode', scanMode);
+    // The ownership fence and the owning team's label are gated on the CARD
+    // being present, not on the mandate being on. A scan still running when the
+    // mandate is lifted keeps its card, and a card stripped of the marks saying
+    // it is another team's would read as ours.
+    pipeline.setAttribute('data-scan-shown', hasScan ? '1' : '0');
     var previous = pipeline.getAttribute('data-shape') || '';
     var shape = records.map(function (rec) { return rec.environment; }).join('|') +
       '|gate' + (hasScan ? '|scan' : '');
@@ -2313,7 +2759,7 @@ var FLEET = (function () {
       pipeline.setAttribute('data-shape', shape);
     }
     paintGate(gate);
-    paintScan(hasScan ? scan : null, revealing());
+    paintScan(hasScan ? scan : null, revealing(), scanMode);
 
     var animated = false;
     records.forEach(function (rec) {
@@ -2437,6 +2883,7 @@ var FLEET = (function () {
       // mandate on this page is as new as this request, and flipping the switch
       // is precisely what reloaded the page. Take the fresh one.
       cached.security_mandate = pipeline.getAttribute('data-mandate') === '1';
+      cached.scan_mode = pipeline.getAttribute('data-scan-mode') || 'legacy';
       paint(cached, false);
       Object.keys(pending).forEach(function (env) {
         var card = cardFor(env);
@@ -2517,7 +2964,7 @@ _MAIN_JS = """
 """
 
 
-def _render_mandate_switch(mandate_on: bool) -> str:
+def _render_mandate_switch(mandate_on: bool, scan_mode: str) -> str:
     """The mandate control: one unlabelled switch, and a sentence when it is on.
 
     Off is the default and the quiet state, so it carries no text at all -- there
@@ -2547,7 +2994,45 @@ def _render_mandate_switch(mandate_on: bool) -> str:
                 aria-label="Security mandate"></button>
       </form>
       {note}
+      {_render_scan_mode_switch(mandate_on, scan_mode) if mandate_on else ""}
     </div>
+    """
+
+
+def _render_scan_mode_switch(mandate_on: bool, scan_mode: str) -> str:
+    """Which scanner the Security team is using, shown only under a live mandate.
+
+    Two named positions rather than an unlabelled switch, because unlike the
+    mandate this one is not a yes/no: both positions are on, and the difference
+    between them is the entire point of the demo. "Script" and "Temporal" are the
+    words to put on screen -- not "legacy"/"platform", which are the code's names
+    for them and say nothing to a room.
+
+    Absent entirely while the mandate is off, because with no mandate there is no
+    scan for either scanner to perform, and a control that changes nothing is
+    worse than no control.
+    """
+    if not mandate_on:
+        return ""
+    platform = scan_mode == SCAN_MODE_PLATFORM
+    return f"""
+      <div class="scanmode" role="group" aria-label="Security scanner">
+        <span class="scanmode-label muted">Scanner</span>
+        <form method="post" action="/scan-mode" class="scanmode-seg">
+          <input type="hidden" name="mode" value="{SCAN_MODE_LEGACY}">
+          <button class="seg{'' if platform else ' seg-on'}" type="submit"
+                  aria-pressed="{'false' if platform else 'true'}"
+                  title="The Security team's host script. No Temporal."
+          >Script</button>
+        </form>
+        <form method="post" action="/scan-mode" class="scanmode-seg">
+          <input type="hidden" name="mode" value="{SCAN_MODE_PLATFORM}">
+          <button class="seg{' seg-on' if platform else ''}" type="submit"
+                  aria-pressed="{'true' if platform else 'false'}"
+                  title="The Security team's Temporal workflow, in their own namespace."
+          >Temporal</button>
+        </form>
+      </div>
     """
 
 
@@ -2555,6 +3040,7 @@ def _render_dashboard(
     pending: list[tuple[str, Any]],
     history: list[tuple[str, Any]],
     mandate_on: bool = False,
+    scan_mode: str = SCAN_MODE_LEGACY,
 ) -> str:
     pending_rows = (
         "".join(_render_pending_row(wf, op) for wf, op in pending)
@@ -2591,7 +3077,7 @@ def _render_dashboard(
       <form method="post" action="/logout" class="inline" style="display:inline">
         <button class="toggle" type="submit">Log out</button>
       </form>
-      {_render_mandate_switch(mandate_on)}
+      {_render_mandate_switch(mandate_on, scan_mode)}
     </div>
   </header>
   <section class="fleet" id="fleet">
@@ -2612,7 +3098,8 @@ def _render_dashboard(
            this attribute the scan card would appear a poll late, which is exactly
            the moment someone is pointing at the switch. -->
       <div class="pipeline" id="fleet-pipeline"
-           data-mandate="{'1' if mandate_on else '0'}"></div>
+           data-mandate="{'1' if mandate_on else '0'}"
+           data-scan-mode="{html.escape(scan_mode)}"></div>
     </div>
   </section>
 

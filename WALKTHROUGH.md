@@ -28,22 +28,28 @@ Keep this terminal open. The useful endpoints are:
   `security`)
 - MCP endpoint: http://localhost:8080/mcp
 
-One service deliberately does **not** start: `security-scan-worker`, the Security
-team's pre-prod scanning platform. It belongs to step 6's Act Two, and starting it
-early gives away the reveal -- Act One is the mandate landing *before* that team has
-adopted Temporal. If you have run this walkthrough before, check with
-`docker compose ps` and stop it before you begin.
+Everything starts, including `security-scan-worker`, the Security team's pre-prod
+scanning platform. There is no profile to remember and nothing to stop before you
+begin; `docker compose down -v` takes the whole thing down again.
 
-If one is left running, nothing breaks: the mandate switch is off until step 6, and
-with it off the pipeline has no scan step at all, so steps 4 and 5 run scan-free
-either way.
+That worker being up does not give anything away, because it is not what decides
+whether a release gets scanned. Two switches on the dashboard decide that, and both
+start in the "before" position:
 
-If you have changed any code since you last ran this, build with the profile or
-the security scan worker keeps a stale image:
+- the **security mandate**, off, so there is no scan step in the pipeline at all;
+- the **scanner**, on `Script`, so when the mandate does land, the scan is the
+  Security team's old host script rather than the workflow this worker serves.
 
-```bash
-docker compose --profile '*' build
-```
+An idle worker with nothing routed to it is invisible. Steps 4 and 5 run scan-free
+because the mandate is off, and step 6's Act One runs on the script because the
+scanner switch says so -- not because a container is missing.
+
+> This used to work the other way round: the pipeline asked a service registry
+> whether anyone was offering scanning and let the answer decide, so Act One was
+> staged by *not starting* this container. That made the demo's central claim
+> depend on operator setup, and worse, it meant a production release silently
+> skipped its mandated scan whenever the worker was down -- and reported success.
+> An unreachable scanner now stops the release with an error naming both fixes.
 
 ## 2. Connect Claude Code
 
@@ -277,16 +283,41 @@ Production releases require Security Team approval.
 
 Point at it. It stays there for the rest of the demo, so you can come back to it
 without re-querying anything. Flipping it did two things: production promotions are
-now Security's to approve, and the release pipeline now routes candidates through
-the Security team's scan on the way to production -- which is the shape Act Two
-runs in. Until this moment there was no scan step in the flow at all, which is why
+now Security's to approve, and every path to production now has a security scan on
+it. Until this moment there was no scan step in the flow at all, which is why
 everything before this step ran without one.
 
-The fleet panel says the second half of that immediately: a **Security scan** card
-animates in between the quality gates and production, owned by the Security team,
-reading `idle` because nothing has been through it yet. The pipeline grew a
-checkpoint the instant the rule landed, before any release has met it. Nothing has
-run; the shape changed.
+The fleet panel says the second half of that immediately. A **Security scan** card
+animates in between the quality gates and production, and it is dressed unlike
+anything else on the row: dashed vertical lines fence it off from its neighbours,
+**Security Team** is written above the fence, and the card itself is cobalt with a
+shield on it. Everything else in that pipeline is the Waypoint team's. This one card
+is another team's system. The pipeline grew a checkpoint the instant the rule
+landed, before any release has met it -- nothing has run; the shape changed.
+
+**1b. Note the second switch, and leave it alone.** A **Scanner** control appeared
+next to the mandate when you flipped it, with two positions:
+
+```text
+SCANNER   [ Script ]  [ Temporal ]
+```
+
+It is on `Script`, which is the whole of Act One: the Security team scans, and the
+thing doing the scanning is a program on somebody's host. Look at the card it
+governs -- the body is a small black box waiting for output, and along the bottom,
+where Act Two will show a workflow id you can click, it says:
+
+```text
+SCRIPT   no workflow id · local process
+```
+
+That absence is the point, and it is worth pointing at now so the audience
+recognises what fills it in later.
+
+> The scan step exists because the *mandate* is on. Which scanner performs it is
+> this second switch. Neither is inferred from what happens to be running -- both
+> of the Security team's scanners are reachable the whole time, and these two
+> controls say what the company is doing.
 
 **2. Run the Security team's scanning process.** This is a plain Python script on
 the host, not a prompt: nobody phrases a scanner run as a sentence to an agent. It
@@ -311,10 +342,29 @@ stage 4/4 static_analysis: max_severity=none threshold=medium
 Security scan passed. Requesting the production promotion via Agent Gateway.
 ```
 
+Watch the **Security scan** card while it runs. Its little black box fills in with
+the same lines the terminal is printing, one at a time, and a `2/4` counter ticks
+along the bottom. This is everything the platform can know about this scanner: the
+tail of its stdout. There are no stage dots, no severity chips, no progress bar,
+and no id -- the footer still says `no workflow id · local process`, because there
+is no workflow to have one.
+
+> It is publishing telemetry, and that buys it nothing. It already speaks MCP to
+> the gateway; an HTTP client is still just a client. Being able to *talk* to the
+> platform is not the same as being *part* of it, and the next thirty seconds are
+> about the difference.
+
 **3. The scan asks for the promotion, and the gateway holds it.** The script calls
 `run_nested_release` with `tool1_mode=uncontrolled` -- an honest self-description,
-because it cannot hold a pause. The mandate is on, so the Operation the gateway
-creates carries `required_approver_team="security"`, and the answer comes back
+because it cannot hold a pause. It authenticates as itself, `tok_legacy_scanner`,
+which the gateway resolves to `legacy-scanner@security`; the requester column on
+the dashboard says so. That identity is also what tells the gateway this request
+came from a scanner, so it is not handed a scan of its own -- and it is read from
+the token, never from the request, because "I am a scanner, don't scan me" is not a
+claim a caller gets to make about itself.
+
+The mandate is on, so the Operation the gateway creates carries
+`required_approver_team="security"`, and the answer comes back
 `blocked_nested_approval`.
 
 **4. The script dies on its own.** It prints the identifiers and exits `2`:
@@ -328,6 +378,23 @@ Record these to finish the promotion by hand once it is approved:
 
 Narrate this as the script dying, not as something you killed. Nobody stopped it;
 it had nowhere to wait. Check with `echo $?`. The process is gone.
+
+**4b. Watch the card notice, without being told.** Give it about five seconds. The
+scan card fades, its verdict changes to `abandoned`, and a line appears:
+
+```text
+STALE · NO SCANNER REPORTING
+```
+
+Nothing reported the death. The script published its progress on a short TTL and
+refreshed it while it was alive; it stopped refreshing, and the record aged out on
+its own. A `kill -9` would have looked identical, which is the point -- nothing
+here depended on the script being polite on its way out. The last line frozen in
+the box is `promotion requested · approval required`, so the card is now a record
+of a scan that got as far as asking and then ceased to exist.
+
+Point at the fence and the label above it while you say it: that was another team's
+system, and it is gone.
 
 **5. The kill.** Now crash the gateway's own worker -- the process serving the
 `agentic-gateway` task queue and hosting `AgenticChainWorkflow`:
@@ -384,22 +451,32 @@ gateway's Operation, survived a hard crash without losing anything.
 > scanning process as a proper, durable workflow, behind their own Nexus endpoint,
 > in their own namespace. Watch what changes.
 
-**1. Bring up the Security team's own platform.** A separate process, a separate
-namespace, a separate task queue, a separate worker identity:
-
-```bash
-docker compose up -d security-scan-worker
-```
+**1. Move the scanner switch to Temporal.** One click, on the dashboard, next to
+the mandate you left on:
 
 ```text
-security scan worker started, namespace 'security', task queue 'security-tq'
+SCANNER   [ Script ]  [ Temporal ]
+                        ^^^^^^^^
 ```
 
-Give it about five seconds to advertise itself.
+The Security team's platform has been running in its own namespace, on its own task
+queue, under its own worker identity, since you started the stack -- you can see it
+in the Temporal UI's namespace selector. What just changed is not what is deployed.
+It is which of their two scanners the company is using.
+
+The card answers immediately, before any release has been through it. The stdout box
+is gone, replaced by four stage dots, and the footer has changed from an absence to
+a link:
+
+```text
+TEMPORAL   awaiting workflow
+```
+
+Same slot, same fence, same team, same cobalt. A different kind of thing inside it.
 
 **2. Kick off a new run.** Leave the mandate switch on -- it is what puts the scan
-in the pipeline's path, and Act Two is the same mandate as Act One. Then get a fresh
-staged candidate and let the pipeline reach it, the same way the prerequisite did:
+in the path, and Act Two is the same mandate as Act One. Then get a fresh staged
+candidate and let the pipeline reach it, the same way the prerequisite did:
 
 ```text
 Deploy the next minor version.
@@ -408,8 +485,11 @@ Deploy the next minor version.
 The Waypoint pipeline runs as it always has and then hands off. `SecurityScanWorkflow`
 appears in the `security` namespace and runs its own four stages over about
 fifteen seconds -- this time as a real, durable workflow rather than a stateless
-script. The scan card that has been sitting `idle` since Act One fills in: a dot
-per stage, the stage running right now, and the highest severity it turned up.
+script. The card fills in properly now: a dot per stage, the stage running right
+now, the highest severity it turned up, and along the bottom the scan's own workflow
+id, which is a link. Click it. It opens that workflow in the `security` namespace.
+
+That is the whole contrast in one gesture: in Act One there was nothing to click.
 
 **3. The scan makes the nested call.** On a clean pass, `SecurityScanWorkflow`
 calls `AgentGatewayService.request_protected_action` -- a Nexus operation, straight
@@ -648,29 +728,27 @@ from a blocking response to asynchronous recovery.
 
 ### The prerequisite pipeline returns `processing`, not `waiting_for_approval`
 
-The Security team's worker is already running, so the pipeline found a scan
-provider and handed off. That is step 6's Act Two arriving during Act One. Check
-with `docker compose ps`, and see "Start over" below for why plain
-`docker compose down` leaves it up.
+The scanner switch is on `Temporal`, so the pipeline handed off to the Security
+team's workflow. That is step 6's Act Two arriving during Act One. Move the switch
+back to `Script` on the dashboard. Nothing needs restarting -- and note that the
+worker running is *not* the cause; it always runs.
 
 ### Act Two fails with "Could not start a pre-prod security scan"
 
 The Nexus operation timed out, which means nothing was polling `security-tq` in
 the `security` namespace for Nexus tasks. Two causes, in order of likelihood:
 
-**A stale image.** `docker compose build` skips services behind a profile, so
-`security-scan-worker` can be running last week's code. Check that the Nexus
-handler is even in the image:
+**A stale image.** The worker can be running older code than you are reading.
+Check that the Nexus handler is even in the image:
 
 ```bash
 docker compose exec security-scan-worker ls /app/security_scan/
 ```
 
-If `nexus_handlers.py` is missing, rebuild properly:
+If `nexus_handlers.py` is missing, rebuild:
 
 ```bash
-docker compose --profile '*' build security-scan-worker
-docker compose up -d --force-recreate security-scan-worker
+docker compose up -d --build security-scan-worker
 ```
 
 **Missing endpoints.** Confirm both are registered:
@@ -685,9 +763,19 @@ with `docker compose up nexus-endpoints`.
 
 ### Act Two returns `waiting_for_approval` instead of `processing`
 
-No scan provider was found, so the pipeline opened the production promotion
-itself. Either the worker is not running, or it has not advertised itself yet.
-Confirm it started:
+The scanner switch is still on `Script`, so the gateway inserted no scan step and
+opened the production promotion itself. Move it to `Temporal` and run again. This is
+the *only* cause: the switch is what decides, and it does not fall back.
+
+### A release fails with "the Security team's scanning platform is not reachable"
+
+The scanner switch is on `Temporal` and their worker is not answering. The release
+stops rather than promoting past a checkpoint the mandate says it needs, and it
+does not go anywhere near an approver.
+
+This is deliberate, and it is the one behaviour worth understanding: it used to
+degrade silently -- no provider meant no scan step, production got promoted anyway,
+and the run reported success. Confirm the worker:
 
 ```bash
 docker compose logs security-scan-worker
@@ -704,11 +792,24 @@ curl -s -X POST localhost:9000/invoke -H 'content-type: application/json' \
   -d '{"tool_name":"get_security_scan_status","arguments":{}}'
 ```
 
-`available: true` means the pipeline will route through the scan on its next run.
-Note how little the answer contains -- a provider and an endpoint, no namespace
-and no task queue -- which is the same restraint the code shows. Registration is
-a heartbeat with a TTL, so give it about five seconds after the worker starts,
-and expect the same delay after any `mock-tool` recreate.
+`available: true` means the handoff will work on the next run. Note how little the
+answer contains -- a provider and an endpoint, no namespace and no task queue --
+which is the same restraint the code shows. Registration is a heartbeat with a TTL,
+so give it about five seconds after the worker starts, and expect the same delay
+after any `mock-tool` recreate. The other fix is to put the scanner switch back on
+`Script` and run their host script by hand, which the error message says too.
+
+### The security scan card says `abandoned` / `STALE · NO SCANNER REPORTING`
+
+Working as intended, and only possible on `Script`. The legacy scanner publishes its
+progress on a short TTL and refreshes it while it is alive. When the process ends --
+at the approval pause, or from a `kill`, or from a crash -- nothing refreshes it and
+the record ages out. Nobody reported the death because there was nobody left to
+report it. Run the script again and the card comes back to life.
+
+A card on `Temporal` never does this: that record has a workflow behind it whose
+Event History is authoritative, so silence there means a worker is busy or
+restarting, not that the scan stopped existing.
 
 ### The security scan card is stuck partway through
 
@@ -747,24 +848,22 @@ has not moved, look for `controlled_caller_unreachable` in the chain ledger.
 Stop the stack while preserving Temporal data:
 
 ```bash
-docker compose --profile '*' down
+docker compose down
 ```
 
 To delete all demo workflow history and start completely clean:
 
 ```bash
-docker compose --profile '*' down -v
+docker compose down -v
 ```
 
-The `-v` command permanently removes the demo's Temporal volume.
+The `-v` permanently removes the demo's Temporal volume. Everything comes up with
+`docker compose up -d` and goes down with `docker compose down -v` -- there are no
+profiles and no per-service steps in either direction.
 
-The `--profile '*'` matters, and forgetting it is the most likely way to spoil a
-second run-through. `security-scan-worker` sits behind a Compose profile so it
-does not start with the stack, and plain `docker compose down` leaves services
-from inactive profiles running. If it is still up when you start step 6, the
-pipeline finds a scan provider and hands off, and Act Two's reveal happens during
-Act One. Check with `docker compose ps` if the prerequisite pipeline returns
-`processing` instead of `waiting_for_approval`.
-
-The same flag applies to `docker compose build`, which otherwise leaves that
-worker on a stale image. Both omissions fail quietly, in opposite directions.
+Both dashboard switches live in the gateway process and are not durable, so they
+reset to the "before" position -- mandate off, scanner on `Script` -- on any gateway
+restart. That is deliberate: a re-run starts from the same picture as the first one,
+and setting them up again is two clicks. `mock-tool` holds the fleet and both card
+projections, so recreating it alone is enough to reset the pipeline row without
+touching Temporal history.

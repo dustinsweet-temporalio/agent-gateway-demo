@@ -293,6 +293,30 @@ def _handle(tool_name: str, arguments: dict) -> dict:
             "gateway_operation_id": arguments.get("gateway_operation_id"),
             "error": arguments.get("error"),
             "updated_at": time.time(),
+            # Which of the Security team's two scanners published this. The
+            # dashboard draws the same slot differently for each, because they are
+            # not the same kind of thing: one is a workflow you can open in the
+            # Temporal UI, the other is a process on somebody's host.
+            "mode": (
+                "legacy"
+                if str(arguments.get("mode", "platform")).lower() == "legacy"
+                else "platform"
+            ),
+            # stdout, for the legacy scanner only. A workflow does not need this:
+            # its stages, verdict and history are all durable objects the card can
+            # read properly. A script has nothing but what it printed.
+            "lines": [str(line) for line in (arguments.get("lines") or [])],
+            # How long this record stays believable without a refresh. The legacy
+            # scanner heartbeats while it runs and stops when it dies, so the
+            # record ages out on its own and the card goes stale without anybody
+            # reporting the death -- which is the honest failure mode for a
+            # process, and the one the platform scan survives. Absent for the
+            # workflow, whose state is authoritative until it says otherwise.
+            "ttl_seconds": (
+                float(arguments["ttl_seconds"])
+                if arguments.get("ttl_seconds") is not None
+                else None
+            ),
         }
         return {"recorded": True, "phase": _scan["phase"]}
 
@@ -369,6 +393,39 @@ async def invoke(request: Request) -> JSONResponse:
     return JSONResponse(result)
 
 
+def _scan_projection() -> dict | None:
+    """The last scan record, with staleness decided here rather than by the caller.
+
+    A legacy scan record carries a TTL because the thing that published it is a
+    process that can simply stop existing. Nobody sends a "the script died"
+    message -- there is nobody left to send it. So the record ages: while the
+    script is running it keeps refreshing, and the moment it stops, the record
+    stops being believable and the dashboard says so.
+
+    That is the entire difference the CASE-2 contrast rests on. The platform scan
+    publishes no TTL because it does not need one: its state lives in its own
+    Event History, a Worker restart replays it, and it is authoritative until the
+    workflow itself says otherwise. A record that never goes stale and a record
+    that ages out on its own are the two behaviours, side by side, in one field.
+    """
+    if not _scan:
+        return None
+    record = dict(_scan)
+    ttl = record.get("ttl_seconds")
+    record["stale"] = bool(
+        ttl
+        and record.get("phase") not in _SCAN_TERMINAL_PHASES
+        and (time.time() - float(record.get("updated_at", 0))) > float(ttl)
+    )
+    return record
+
+
+# A scan that reached one of these is finished, and a finished record does not go
+# stale: there is nothing left to heartbeat. Only a scan that stopped mid-flight
+# is abandoned, which is exactly the state the walkthrough's Act One produces.
+_SCAN_TERMINAL_PHASES = {"completed", "scan_failed", "rejected", "expired", "failed"}
+
+
 async def state(request: Request) -> JSONResponse:
     """Read only view of the fleet: what is running where, and what is promotable.
 
@@ -389,7 +446,7 @@ async def state(request: Request) -> JSONResponse:
             # Absent until the Security team has run a scan at least once. What
             # decides whether the card is on the row is the gateway's mandate
             # toggle, not this: absent here only means there is no verdict yet.
-            "security_scan": dict(_scan) if _scan else None,
+            "security_scan": _scan_projection(),
             "environments": [
                 {"environment": env, **_deployed[env]}
                 for env in ENVIRONMENTS

@@ -10,6 +10,7 @@ from temporalio.exceptions import ActivityError, ChildWorkflowError
 
 with workflow.unsafe.imports_passed_through():
     from common.models import (
+        SCAN_MODE_PLATFORM,
         ApprovalDecision,
         AwaitQualityGateInput,
         CancelOperation,
@@ -180,6 +181,64 @@ def _required_approver_team_for(
         return MANDATE_APPROVER_TEAM
     return None
 
+
+# A caller that is itself a scanner. Both of the Security team's scanners identify
+# as this -- their Temporal workflow states it over Nexus, their legacy host script
+# gets it from its own bearer token -- and it is the one thing that exempts a
+# promotion from having a scan put in front of it.
+#
+# Without the exemption the platform mode would scan the output of a scan: the
+# Security team's own promotion request would be handed back to the Security team
+# to scan again, forever. Keyed on who is calling rather than on which mode is
+# current, so it holds even if somebody flips the scanner switch to Temporal while
+# the legacy script is mid-run.
+SCANNER_CALLER_SERVICE = "security"
+
+
+def _scan_required_for(
+    caller_service: str | None,
+    environment: str,
+    security_mandate: bool,
+    scan_mode: str,
+) -> bool:
+    """Whether the gateway inserts a pre-prod security scan ahead of this action.
+
+    Three conditions, all of them about the request rather than about what happens
+    to be deployed:
+
+    1. The mandate is on. It is the rule that puts a scan in the path at all.
+    2. The action targets a mandate-covered environment. Staging promotions and
+       reads are not covered and never were.
+    3. The Security team is running their Temporal workflow. In legacy mode there
+       is nothing for the gateway to hand off TO -- their scanner is a script on
+       somebody's host, started by a person, and the gateway inserting a step it
+       cannot start would park the release on a dependency that never arrives.
+       Legacy mode is the mode where the human runs the scan and the scan asks for
+       the promotion itself.
+
+    And one exemption: a request that came from a scanner is already the output of
+    a scan.
+
+    Deliberately not a condition: which tool the caller used. This check runs on
+    the single-tool path and the orchestrated path alike, because a company-wide
+    mandate that an agent sidesteps by calling promote_release instead of
+    run_release_orchestration is not a mandate -- and an agent hand-rolling its own
+    steps is exactly the case the boundary exists for.
+
+    Also deliberately not a condition: whether anyone is currently answering on
+    the Security team's task queue. That used to decide this, which meant a
+    release quietly skipped its scan whenever their worker was down, reporting
+    success. Liveness is checked separately and failure is loud; see
+    _scan_capability.
+    """
+    if not security_mandate:
+        return False
+    if scan_mode != SCAN_MODE_PLATFORM:
+        return False
+    if environment.strip().lower() not in MANDATE_ENVIRONMENTS:
+        return False
+    return str(caller_service or "").lower() != SCANNER_CALLER_SERVICE
+
 # Executing a tool step raises one of these depending on whether the step is an
 # Activity or a Child Workflow. Callers care that the step failed, not which
 # shape it had, so they catch the pair.
@@ -192,6 +251,17 @@ class QualityGateFailure(Exception):
     Raised inside the Workflow and caught by the calling handler, which fails the
     parent operation without ever creating the child. A candidate that failed its
     gates does not reach the approval queue: the system declines to ask.
+    """
+
+
+class SecurityScanUnavailable(Exception):
+    """The mandated security scan could not be reached, so the release stops.
+
+    Raised instead of quietly degrading. The gateway used to treat an unreachable
+    scanner as "there is no scan step", which meant the mandate evaporated
+    whenever the Security team's worker was down and the release reported success
+    with a checkpoint silently missing. Failing is the safety property: an
+    unreachable checkpoint is an unmet one.
     """
 
 
@@ -340,6 +410,48 @@ class AgenticChainWorkflow:
                 await self._invoke(op)
                 return self._response_for(op)
 
+            # The mandate applies here too, and this is the path that matters
+            # most. An agent that decides to call promote_release itself rather
+            # than run_release_orchestration used to reach production having
+            # skipped the scan entirely, with the approval gate as the only thing
+            # left standing -- the pipeline was where the scan lived, so stepping
+            # outside the pipeline stepped outside the scan. A company-wide rule
+            # that holds only on the path the agent was supposed to take is not a
+            # rule, so the check is here, at the single-tool boundary, and not
+            # only in the orchestrator.
+            #
+            # The operation is parked on the scan rather than sent for approval.
+            # Nobody is asked to approve a promotion that has not been scanned
+            # yet; the scan asks for it once it clears, and that request is the
+            # one that reaches a human.
+            if _scan_required_for(
+                req.correlation.caller_service,
+                str(req.arguments.get("environment", "")),
+                req.security_mandate,
+                req.scan_mode,
+            ):
+                try:
+                    handoff = await self._scan_capability(
+                        op,
+                        str(req.arguments.get("service", "")),
+                        str(req.arguments.get("version", "")),
+                        str(req.arguments.get("environment", "")),
+                        req.idempotency_key,
+                        "direct",
+                    )
+                except SecurityScanUnavailable:
+                    # Failed, with the reason and both fixes already on the
+                    # operation. The promotion is not offered for approval:
+                    # nobody approves a production release that skipped a
+                    # checkpoint the mandate says it needs.
+                    return self._response_for(op)
+                return await self._hand_off_to_scan(
+                    op,
+                    req.idempotency_key,
+                    handoff,
+                    str(req.arguments.get("version", "")),
+                )
+
             op.status = OperationStatus.WAITING_FOR_APPROVAL
             op.deadline_epoch = workflow.now().timestamp() + req.approval_timeout_seconds
             op.deadline_iso = self._iso(op.deadline_epoch)
@@ -407,7 +519,12 @@ class AgenticChainWorkflow:
                         parent,
                         req.bump,
                         req.idempotency_key,
-                        allow_scan=req.controlled_tool1 and req.security_mandate,
+                        allow_scan=_scan_required_for(
+                            req.correlation.caller_service,
+                            str(req.tool2_arguments.get("environment", "")),
+                            req.security_mandate,
+                            req.scan_mode,
+                        ),
                     )
                     resolved_tool2_arguments = {
                         **req.tool2_arguments,
@@ -464,6 +581,10 @@ class AgenticChainWorkflow:
                     {"error": str(err)},
                 )
                 return self._response_for(parent)
+            except SecurityScanUnavailable:
+                # _scan_capability already failed the operation and wrote the
+                # reason, which names both fixes. Nothing to add.
+                return self._response_for(parent)
             parent.checkpoint = {
                 "stage": "waiting_for_tool2",
                 "tool1_prepare_result": prepare,
@@ -488,7 +609,7 @@ class AgenticChainWorkflow:
             handoff = prepare.get("scan_handoff") if req.bump else None
             if handoff:
                 return await self._hand_off_to_scan(
-                    parent, req, handoff, resolved_version
+                    parent, req.idempotency_key, handoff, resolved_version
                 )
 
             child = self._new_nested_child(
@@ -670,6 +791,11 @@ class AgenticChainWorkflow:
                 self._log(
                     "tool1_pipeline_policy_conflict", parent, {"error": str(err)}
                 )
+                return self._response_for(parent)
+            except SecurityScanUnavailable:
+                # The scanner went away between the approval and the retry. Same
+                # answer as everywhere else: the release stops rather than
+                # promoting past a checkpoint it cannot reach.
                 return self._response_for(parent)
             parent.checkpoint = {
                 **parent.checkpoint,
@@ -1510,14 +1636,17 @@ class AgenticChainWorkflow:
                 + (": " + ", ".join(failed) if failed else "")
             )
 
-        # The candidate is qualified. If the mandate put a scan in this pipeline's
-        # path, then before opening the production promotion itself it asks whether
-        # anyone is offering a pre-prod security scan for this service. Who provides
-        # it is a lookup, not a setting: the Security team owns that capability and
-        # advertises it while their platform is running, so the pipeline routes
-        # through whoever answers. With the mandate off, or with nobody answering,
-        # the next line of this function is the production promotion, which is what
-        # the pipeline did for its whole life before the mandate landed.
+        # The candidate is qualified. Whether a scan stands between it and
+        # production was decided before this pipeline started running, by the
+        # mandate and the scanner switch, and arrived on the request -- see
+        # _scan_required_for. allow_scan is that answer, already computed.
+        #
+        # So this is no longer a question about whether the step exists. It is a
+        # check that the scanner is answering before the release is parked on it,
+        # and an unreachable one stops the release rather than being treated as an
+        # absent one. With allow_scan false -- no mandate, or the Security team on
+        # their legacy script -- nothing is asked and the next line is the
+        # production promotion, exactly as the pipeline behaved before the mandate.
         handoff = None
         if allow_scan:
             handoff = await self._scan_capability(
@@ -1551,20 +1680,29 @@ class AgenticChainWorkflow:
         target: str,
         idempotency_key: str,
         pass_label: str,
-    ) -> dict | None:
-        """Ask the shared platform whether pre-prod security scanning is on offer.
+    ) -> dict:
+        """Check that the scanner we are about to hand off to is actually there.
 
-        Keyed per pass, like the gate run and the production read, because it is
-        a read of something that moves: the Security team can onboard a service, or
-        take their platform down for a deploy, between one pipeline run and the
-        next.
+        A health check, not a decision. Whether a scan happens was already settled
+        before this is called -- by the mandate and the scanner switch, both of
+        which are stated on the request -- and all this does is confirm the
+        Security team's platform is answering before the release is parked on it.
 
-        A failure to reach the registry is not a reason to stop the release. It
-        means the pipeline could not learn that the scan exists, so it behaves the
-        way it behaves when the scan does not exist, and the production promotion
-        still goes in front of a human either way. Nothing is skipped by
-        failing this lookup; a checkpoint is skipped, and the one that actually
-        protects production is still there.
+        It used to be the decision, and that was the bug. The pipeline asked a
+        service registry "is anyone offering pre-prod scanning?" and treated no as
+        "then there is no scan step", which meant a company-wide security mandate
+        silently evaporated whenever the Security team's worker was down, restarting,
+        or simply had not been started -- and the release reported success. A
+        checkpoint that disappears when the thing behind it is unavailable is not a
+        checkpoint. So: unavailable now stops the release, loudly, with an error
+        that names what was unreachable.
+
+        Keyed per pass, like the gate run and the production read, because it is a
+        read of something that moves.
+
+        Returns the provider on success. On failure it fails `parent` with the
+        reason and raises SecurityScanUnavailable, so callers on both paths report
+        the same thing and neither can fall through to promoting unscanned.
         """
         try:
             status = await self._execute_tool_step(
@@ -1577,14 +1715,20 @@ class AgenticChainWorkflow:
                 idempotency_key=f"{idempotency_key}:{pass_label}:scan-status",
             )
         except ActivityError as err:
-            self._log(
-                "scan_capability_unavailable",
+            return self._scan_unavailable(
                 parent,
-                {"error": str(err)},
+                version,
+                f"the capability registry could not be reached ({err})",
             )
-            return None
         if not status.get("available"):
-            return None
+            return self._scan_unavailable(
+                parent,
+                version,
+                str(
+                    status.get("message")
+                    or "no pre-prod security scan provider is currently registered"
+                ),
+            )
         # Just who is offering, and nothing about how they do it. Which stages
         # run, the severity threshold, and which versions it rejects all used to be
         # relayed through here, which meant the caller was telling the scan what
@@ -1597,10 +1741,38 @@ class AgenticChainWorkflow:
         )
         return handoff
 
+    def _scan_unavailable(
+        self, parent: Operation, version: str, detail: str
+    ) -> None:  # always raises
+        """Stop the release because the required scan could not be reached.
+
+        Fails loudly and says which of the two things went wrong, because the fix
+        is different for each: the Security team's Temporal worker is not running,
+        or the scanner switch is on Temporal when their platform is not up. Neither
+        is a reason to promote to production anyway -- the mandate is in force, and
+        an unreachable checkpoint is an unmet one.
+        """
+        parent.status = OperationStatus.FAILED
+        parent.error = (
+            f"The security mandate requires a pre-prod security scan for "
+            f"{version or 'this release'} and the Security team's scanning "
+            f"platform is not reachable: {detail}. The release stops here rather "
+            "than promoting to production without a scan. Either start the "
+            "Security team's worker, or switch the scanner to their legacy script "
+            "and run it by hand."
+        )
+        parent.decided_iso = workflow.now().isoformat()
+        self._log(
+            "security_scan_unavailable",
+            parent,
+            {"version": version, "detail": detail},
+        )
+        raise SecurityScanUnavailable(parent.error)
+
     async def _hand_off_to_scan(
         self,
         parent: Operation,
-        req: NestedToolCallRequest,
+        idempotency_key: str,
         handoff: dict,
         version: str,
     ) -> ToolCallResponse:
@@ -1649,7 +1821,7 @@ class AgenticChainWorkflow:
                     service=str(parent.arguments.get("service", "")),
                     version=version,
                     environment=str(parent.arguments.get("environment", "")),
-                    idempotency_key=f"{req.idempotency_key}:security-scan",
+                    idempotency_key=f"{idempotency_key}:security-scan",
                     requester=parent.requester or "",
                 ),
                 schedule_to_close_timeout=SCAN_HANDOFF_TIMEOUT,
@@ -2042,7 +2214,14 @@ class AgenticChainWorkflow:
             workflow_id=wf_id,
             operation_id=op.operation_id,
             reason=op.error,
-            message="The downstream tool invocation failed.",
+            # The operation's own error, when it has one, rather than a canned
+            # sentence. The caller here is usually an agent, and "The downstream
+            # tool invocation failed." tells it nothing it can act on -- it reads
+            # as transient, so the agent retries, and retries the same way. A
+            # release stopped because a mandated security scan was unreachable
+            # needs to say exactly that, and say what would fix it, or the agent
+            # will keep trying to get to production by other means.
+            message=op.error or "The downstream tool invocation failed.",
             parent_operation_id=op.parent_operation_id,
             call_path=op.call_path,
         )

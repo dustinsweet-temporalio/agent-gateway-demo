@@ -209,7 +209,7 @@ target namespace and task queue; callers address it by name and learn neither.
 | --- | --- | --- |
 | CASE-1: simple tool | `promote_release` | Policy gate, wait payload, approve/reject/expire/cancel, invoke, poll result |
 | CASE-2a: pipeline and gates | `run_release_orchestration` (the pipeline) or `run_nested_release` (explicit version) | Fixed release pipeline, quality gates, full call path, child operation, controlled checkpoint/resume, uncontrolled fail-closed/retry |
-| CASE-2b: security scan as a separate Tool1 (walkthrough Act Two) | same pipeline, with the Security team's worker running | Nexus handoff to another team's endpoint, a real nested Tool1 -> Tool2 call back into the same `workflow_id`, Tool1 suspending on a pending Nexus operation across the approval, fail-closed on a blocking finding |
+| CASE-2b: security scan as a separate Tool1 (walkthrough Act Two) | any path to prod, with the scanner switch on `Temporal` | Nexus handoff to another team's endpoint, a real nested Tool1 -> Tool2 call back into the same `workflow_id`, Tool1 suspending on a pending Nexus operation across the approval, fail-closed on a blocking finding |
 | CASE-2b: uncontrolled Tool1 (walkthrough Act One) | `security_scan/legacy_security_scan_script.py` | A stateless process that cannot hold the pause: prints the operation id, exits non-zero, and requires a human `resume_nested_release` |
 | CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run correlation, plan checkpoint, gateway-owned decision, protected action then dependent action |
 
@@ -219,36 +219,46 @@ two Nexus Endpoints, then exits), `worker`, `gateway`, `mock-tool` (the pretend
 deployment backend), `adk-agent` (Google ADK Web for CASE-3), and
 `security-scan-worker` (the Security team's scanning platform).
 
-`security-scan-worker` sits behind a Compose profile, so **two commands need
-`--profile '*'`** or they silently skip it:
+Every service starts with `docker compose up -d` and stops with
+`docker compose down -v`. There are no Compose profiles and no per-service steps in
+either direction.
 
-```
-docker compose --profile '*' build      # or its image stays stale
-docker compose --profile '*' down -v    # or it keeps running after teardown
-```
+### What decides whether a release gets scanned
 
-Both failure modes are quiet. A stale image runs last week's code against this
-week's endpoints; a surviving container leaves the scan capability advertised into
-your next run-through.
+Two switches on the dashboard, and nothing else:
 
-`security-scan-worker` does **not** start with `docker compose up`, which is the
-walkthrough beat: through CASE-1, CASE-2a, and Act One the capability does not
-exist, and you bring it up live, mid-demo, at the top of Act Two with
+| Switch | Off / left | On / right | Effect |
+| --- | --- | --- | --- |
+| Security mandate | off (default) | on | Off: no scan step anywhere, and production is approvable by anyone. On: every path to production has a scan on it, and the promotion is the Security team's to approve. |
+| Scanner (shown only under a live mandate) | `Script` (default) | `Temporal` | `Script`: the gateway inserts no step; a human runs `legacy_security_scan_script.py`, which asks for the promotion itself. `Temporal`: the gateway routes the promotion through `SecurityScanWorkflow` over the `security` Nexus Endpoint. |
 
-```
-docker compose up -d security-scan-worker
-```
+Both are snapshotted onto each request at the trust boundary and recorded in Event
+History, so an operation keeps the rules it was created under even if a switch moves
+a second later. Neither survives a gateway restart, which is how a re-run starts from
+the same picture as the first one.
 
-after which the next pipeline run routes through the scan and fills in the scan
-card. The card itself arrives earlier, with the mandate: the switch is what puts
-a scan step in the pipeline, so the dashboard grows one the moment it is flipped
-and shows it idle until a scan reports.
-`docker compose stop security-scan-worker` takes the provider away again.
+Two things are deliberately **not** inputs to that decision:
 
-A worker left running by mistake does not, on its own, give away Act Two. The
-mandate switch is off by default, and with it off the pipeline never asks who is
-offering a scan, so CASE-1 and CASE-2a run scan-free whatever is up. Both
-conditions have to hold — mandate on, provider answering — for a scan to happen.
+- **What is running.** `security-scan-worker` is up the whole time. Both of the
+  Security team's scanners are reachable at all times; the switch says which one the
+  company is using. The capability registry is still there, but only as a health
+  check — if the switch says `Temporal` and their platform is not answering, the
+  release **fails**, with an error naming both fixes. It used to be the decision,
+  which meant a mandated scan silently evaporated whenever that worker was down and
+  the run reported success.
+- **Which tool the agent used.** The check runs on the single-tool
+  `promote_release` path as well as inside the pipeline. A mandate an agent can step
+  around by hand-rolling `cut_release` + `promote_release` instead of calling
+  `run_release_orchestration` is not a mandate, and an agent improvising its own
+  steps is precisely the case the boundary exists for.
+
+The one exemption is a request that came *from* a scanner
+(`caller_service=security`), which is already the output of a scan and is not handed
+another one. Both scanners identify that way: the workflow states it over Nexus, the
+host script gets it from its own bearer token (`tok_legacy_scanner` →
+`legacy-scanner@security`). It is resolved server-side from the token and never read
+from the request, because "I am a scanner, do not scan me" is not a claim a caller
+gets to make about itself.
 
 ## Tools
 

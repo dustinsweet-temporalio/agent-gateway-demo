@@ -36,13 +36,33 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 
+import requests
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 GATEWAY_MCP_URL = os.getenv("GATEWAY_MCP_URL", "http://localhost:8080/mcp")
-GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "tok_dustin")
+# This scanner's own bearer token, not a person's. The gateway maps it to
+# `legacy-scanner@security` and from there to caller_service=security, which is
+# what makes the promotion this script asks for the Security team's to approve and
+# exempts it from having another scan inserted in front of it. Resolving that
+# server-side from the token, rather than letting the request assert it, is the
+# whole point: "I am a scanner, do not scan me" is not a claim a caller gets to
+# make about itself.
+GATEWAY_TOKEN = os.getenv("GATEWAY_TOKEN", "tok_legacy_scanner")
+# Where progress goes so the dashboard can draw this scan at all. Publishing
+# telemetry buys this script exactly nothing in durability -- it already speaks
+# MCP to the gateway, and an HTTP client is still just a client. What it buys is
+# an audience that can see the scan running, and then see what happens to it.
+STATE_URL = os.getenv("SECURITY_SCAN_BACKEND_URL", "http://localhost:9000/invoke")
+# The record this script publishes expires on its own. While the script runs it
+# refreshes; when the script dies at the pause, nothing refreshes it and the card
+# goes stale by itself. Nobody reports the death, because there is nobody left to
+# report it -- which is the accurate failure mode for a process, and precisely
+# what the Temporal scan survives.
+STATE_TTL_SECONDS = float(os.getenv("LEGACY_SCAN_TTL_SECONDS", "6"))
 
 SEVERITY_ORDER = ["none", "low", "medium", "high", "critical"]
 SEVERITY_THRESHOLD = "medium"
@@ -60,6 +80,89 @@ SCHEDULE = {
 }
 
 
+class _Tail:
+    """Everything this scanner can tell the platform about itself: its stdout.
+
+    Deliberately thin, because that is honest. A workflow publishes stages, a
+    verdict, and a workflow id that can be opened and inspected. A script has the
+    lines it printed, and if it stops printing there is no way to tell the
+    difference between slow and gone -- which is why the record it publishes
+    carries a TTL and the dashboard treats silence as abandonment.
+
+    Every failure here is swallowed. A scanner whose telemetry endpoint is down
+    still has a scan to run, and the run is the part that matters.
+    """
+
+    def __init__(self, service: str, version: str, environment: str,
+                 stage_count: int) -> None:
+        self._service = service
+        self._version = version
+        self._environment = environment
+        self._stage_count = stage_count
+        self._lines: list[str] = []
+        self._stages_completed = 0
+        self._results: list[dict] = []
+
+    def say(self, line: str, *, echo: bool = True) -> None:
+        """Print a line and publish the tail. The two never diverge."""
+        if echo:
+            print(line, flush=True)
+        self._lines.append(line)
+        self.publish("running_scan")
+
+    def stage_done(self, name: str, severity: str, passed: bool) -> None:
+        self._stages_completed += 1
+        self._results.append(
+            {
+                "stage_name": name,
+                "max_severity": severity,
+                "passed": passed,
+                "findings": 0 if passed else 1,
+            }
+        )
+
+    def publish(self, phase: str) -> None:
+        try:
+            requests.post(
+                STATE_URL,
+                json={
+                    "tool_name": "record_scan_state",
+                    "arguments": {
+                        # No scan_workflow_id. There is no workflow. The dashboard
+                        # renders that absence rather than papering over it.
+                        "mode": "legacy",
+                        "service": self._service,
+                        "version": self._version,
+                        "environment": self._environment,
+                        "phase": phase,
+                        "stages_completed": self._stages_completed,
+                        "stage_count": self._stage_count,
+                        "severity_threshold": SEVERITY_THRESHOLD,
+                        "stage_results": self._results,
+                        "lines": self._lines[-6:],
+                        "ttl_seconds": STATE_TTL_SECONDS,
+                    },
+                },
+                timeout=3,
+            )
+        except Exception:  # noqa: BLE001 - telemetry is best effort, always
+            pass
+
+
+def _heartbeat_forever(tail: _Tail, phase: dict) -> None:
+    """Keep the published record fresh while this process is alive.
+
+    A daemon thread, so it dies with the process and cannot keep the record alive
+    past the run. That is the mechanism: the card stays current for exactly as
+    long as there is a process, and not one second longer. No cooperative
+    shutdown, no goodbye message -- a ctrl-C, a kill -9 and an orderly exit at the
+    approval pause all strand it identically, which is the point.
+    """
+    while True:
+        time.sleep(STATE_TTL_SECONDS / 3.0)
+        tail.publish(phase["name"])
+
+
 def _blocking(severity: str) -> bool:
     try:
         return SEVERITY_ORDER.index(severity) >= SEVERITY_ORDER.index(
@@ -69,22 +172,28 @@ def _blocking(severity: str) -> bool:
         return True
 
 
-def run_scan(scripted_outcome: str, check_seconds: int, stage_count: int) -> bool:
+def run_scan(
+    scripted_outcome: str,
+    check_seconds: int,
+    stage_count: int,
+    tail: _Tail,
+) -> bool:
     severities = SCHEDULE[scripted_outcome]
     for stage in range(1, stage_count + 1):
         name = STAGE_NAMES[min(stage - 1, len(STAGE_NAMES) - 1)]
         max_severity = severities[min(stage - 1, len(severities) - 1)]
-        print(
+        blocked = _blocking(max_severity)
+        tail.stage_done(name, max_severity, not blocked)
+        tail.say(
             f"stage {stage}/{stage_count} {name}: max_severity={max_severity} "
-            f"threshold={SEVERITY_THRESHOLD}",
-            flush=True,
+            f"threshold={SEVERITY_THRESHOLD}"
         )
-        if _blocking(max_severity):
-            print(
+        if blocked:
+            tail.say(
                 f"SECURITY SCAN FAILED at {name} (1 finding, {max_severity}). "
-                f"Stopping.",
-                flush=True,
+                f"Stopping."
             )
+            tail.publish("scan_failed")
             return False
         if stage < stage_count:
             time.sleep(check_seconds)
@@ -156,13 +265,23 @@ def main() -> None:
     parser.add_argument("--token", default=GATEWAY_TOKEN)
     args = parser.parse_args()
 
-    if not run_scan(args.scripted_outcome, args.check_seconds, args.stage_count):
+    tail = _Tail(args.service, args.version, args.environment, args.stage_count)
+    # Named so the heartbeat thread can follow the phase without being restarted.
+    phase = {"name": "running_scan"}
+    tail.publish("running_scan")
+    heartbeat = threading.Thread(
+        target=_heartbeat_forever, args=(tail, phase), daemon=True
+    )
+    heartbeat.start()
+
+    if not run_scan(
+        args.scripted_outcome, args.check_seconds, args.stage_count, tail
+    ):
         sys.exit(1)
 
-    print(
+    tail.say(
         "Security scan passed. Requesting the production promotion via Agent "
-        "Gateway.",
-        flush=True,
+        "Gateway."
     )
     body = asyncio.run(
         request_promotion(
@@ -178,6 +297,20 @@ def main() -> None:
 
     status = body.get("status")
     if status in ("waiting_for_approval", "blocked_nested_approval"):
+        # The last thing this record will ever say. Note what is NOT done here:
+        # the phase is not set to "abandoned" and no farewell is published. The
+        # script has no idea whether it is about to be approved, rejected, or
+        # forgotten -- all it knows is that it cannot wait. So it says the true
+        # thing, and then stops refreshing. The card goes stale on its own a few
+        # seconds later, and it would do so identically if this process were
+        # killed here instead of exiting.
+        phase["name"] = "awaiting_prod_approval"
+        tail.say(
+            f"promotion requested \u00b7 operation {body.get('operation_id')} "
+            "\u00b7 approval required",
+            echo=False,
+        )
+        tail.publish("awaiting_prod_approval")
         # Everything this process knows is about to stop existing. All it can do
         # is print the identifiers and hope somebody writes them down.
         print(
