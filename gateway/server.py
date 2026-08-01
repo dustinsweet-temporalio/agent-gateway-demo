@@ -21,9 +21,11 @@ from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Re
 from temporalio.client import (
     Client,
     WithStartWorkflowOperation,
+    WorkflowQueryFailedError,
     WorkflowUpdateStage,
 )
 from temporalio.common import WorkflowIDConflictPolicy
+from temporalio.service import RPCError, RPCStatusCode
 
 from common.models import (
     ADK_SESSION_ID_HEADER,
@@ -505,10 +507,47 @@ def _safe_arguments(arguments: dict) -> dict:
     return redact(arguments)
 
 
+# Every tool that goes through _authorized_handle reads an AgenticChainWorkflow,
+# and it proves the caller owns that chain by asking the Workflow itself who its
+# owner is. Hand it any other workflow id -- a QualityGateChildWorkflow, a
+# release child, anything the gateway did not start on this caller's behalf --
+# and there is no such query handler, so Temporal answers with
+# "Query handler for 'get_workflow_owner' expected but not found, known queries:
+# [...]". That reads like the gateway is broken when the real fact is much
+# simpler and much more useful: it is the wrong kind of workflow. An agent that
+# gets the raw message learns nothing it can act on, and the failure looks
+# transient enough to shrug at and carry on. Translate it here, at the boundary,
+# into the fact plus where the answer actually lives.
+_CHAIN_ONLY_MESSAGE = (
+    "workflow_id {workflow_id!r} is not an agentic chain workflow: it has no "
+    "owner, no operations, and no ledger. get_workflow_status, "
+    "get_workflow_ledger, get_operation_status, get_operation_result and "
+    "cancel_operation only accept the workflow_id a gateway tool call returned. "
+    "Quality gates and release children are separate Workflows, readable in the "
+    "Temporal UI and on the approval dashboard, not through these tools."
+)
+
+
 async def _authorized_handle(workflow_id: str, ctx: Optional[Context]):
     client = await get_client()
     handle = client.get_workflow_handle(workflow_id)
-    owner = await handle.query("get_workflow_owner", result_type=str)
+    try:
+        owner = await handle.query("get_workflow_owner", result_type=str)
+    except WorkflowQueryFailedError as err:
+        # Matched on the handler name rather than the sentence around it, so an
+        # unrelated query failure inside a chain still surfaces as itself.
+        if "get_workflow_owner" in str(err):
+            raise ValueError(
+                _CHAIN_ONLY_MESSAGE.format(workflow_id=workflow_id)
+            ) from err
+        raise
+    except RPCError as err:
+        if err.status is RPCStatusCode.NOT_FOUND:
+            raise ValueError(
+                f"no workflow with id {workflow_id!r} exists. Use the "
+                "workflow_id returned by the tool call you are asking about."
+            ) from err
+        raise
     principal = _resolve_principal(ctx)
     if owner != principal:
         raise PermissionError("workflow_id is owned by a different principal")
