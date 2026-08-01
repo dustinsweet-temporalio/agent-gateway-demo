@@ -60,9 +60,10 @@ _autonomous_followups: set[str] = set()
 # staged yet. It moves to running the first time any promotion reaches staging,
 # by any route, including a CASE-1 manual one.
 #
-# Contrast the security scan below, which IS still absent until it first runs,
-# because a scan really is another team's capability that gets switched on
-# mid-demo.
+# Contrast the security scan below, which reports nothing until it first runs.
+# Its card still arrives mid-demo, but on the security mandate being switched on
+# rather than on this state existing: the mandate is what puts a scan in the
+# pipeline, so the card is drawn from the toggle and filled in from here.
 _IDLE_GATES = {
     "status": "idle",
     "service": None,
@@ -77,10 +78,10 @@ _IDLE_GATES = {
 _quality_gates: dict = dict(_IDLE_GATES)
 
 # Last security scan, or None if a scan has never run. Same contract as
-# _quality_gates above: the fleet panel renders the security scan card only once
-# this exists, so the card is absent for CASE-1 and CASE-2a and appears the first
-# time the Security team's platform starts a scan. Restarting this service
-# restores the "before" picture for both cards.
+# _quality_gates above: a projection for the dashboard, never the verdict itself.
+# None means no scan has reported here, which the panel draws as an idle scan
+# card while the mandate is on and as no card at all while it is off. Restarting
+# this service restores the "before" picture for both cards.
 _scan: dict | None = None
 
 # Who is currently offering pre-prod security scanning, and when they last said
@@ -385,9 +386,9 @@ async def state(request: Request) -> JSONResponse:
             # hiding: the gate is standing infrastructure, not a capability that
             # gets built partway through the demo.
             "quality_gates": dict(_quality_gates),
-            # Absent until the Security team has run a scan at least once. Same
-            # "the card exists because the capability ran" contract as the gate
-            # above, one checkpoint further along the pipeline.
+            # Absent until the Security team has run a scan at least once. What
+            # decides whether the card is on the row is the gateway's mandate
+            # toggle, not this: absent here only means there is no verdict yet.
             "security_scan": dict(_scan) if _scan else None,
             "environments": [
                 {"environment": env, **_deployed[env]}

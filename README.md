@@ -126,7 +126,8 @@ target namespace and task queue; callers address it by name and learn neither.
     approver's team there: it is process configuration, and Workflow code must
     not read it. Because the value lands in Event History, an operation created
     under the mandate keeps its restriction even if the toggle is flipped off a
-    moment later.
+    moment later. The same toggle is what puts the pre-prod scan in the release
+    pipeline's path at all — see below.
 
   Everything else — every staging promotion, every read, CASE-1's production
   promotions before the mandate lands, and CASE-3 — carries no team restriction
@@ -168,14 +169,21 @@ target namespace and task queue; callers address it by name and learn neither.
 - Workflow code makes the Nexus calls directly; no client, no Activity. The two
   Activities that remain (`submit_nested_tool_call`, `signal_operation_callback`)
   connect only to their own namespace.
-- The pipeline discovers the scan rather than being configured for it. After the
-  quality gates pass it asks the shared platform whether anyone is offering
-  pre-prod security scanning; the Security team's worker heartbeats that
-  registration while it runs, and the entry expires on its own when it stops. The
-  answer is *who*, and nothing about how: which stages run, the severity
-  threshold, and which versions fail all live behind the endpoint. With no
-  provider, the pipeline opens the production promotion itself, exactly as it did
-  before the Security team onboarded it.
+- **The mandate is what puts a scan in the pipeline at all.** With the toggle off
+  there is no scan step in the release flow, and the pipeline does not even ask
+  whether one is on offer: a run is the plain cut → stage → gate → promote pipeline
+  it was before the Security team onboarded, which is what makes the CASE-1
+  scenarios demoable with the Security worker running. With the toggle on the scan
+  is inserted after the gates and before production.
+- Given the mandate, the pipeline still *discovers* the scan rather than being
+  configured for it. After the quality gates pass it asks the shared platform
+  whether anyone is offering pre-prod security scanning; the Security team's worker
+  heartbeats that registration while it runs, and the entry expires on its own when
+  it stops. The answer is *who*, and nothing about how: which stages run, the
+  severity threshold, and which versions fail all live behind the endpoint. With no
+  provider answering, the pipeline opens the production promotion itself. So a scan
+  happens when the mandate says it must and someone is there to run it; the
+  approval requirement on production is the mandate's alone and holds either way.
 - Each ADK Web session maps to one running `TemporalAdkSessionWorkflow`. ADK Web
   submits later user turns as Updates to that same workflow, which owns one ADK
   runner and its conversation state. A new workflow ID is created only when no
@@ -220,21 +228,27 @@ docker compose --profile '*' down -v    # or it keeps running after teardown
 ```
 
 Both failure modes are quiet. A stale image runs last week's code against this
-week's endpoints; a surviving container carries the scan capability into your
-next run-through and gives away Act Two's reveal during Act One.
+week's endpoints; a surviving container leaves the scan capability advertised into
+your next run-through.
 
-`security-scan-worker` sits behind a Compose profile and does **not** start with
-`docker compose up`. That is the walkthrough beat: through CASE-1, CASE-2a, and
-Act One the capability does not exist, and you bring it up live, mid-demo, at the
-top of Act Two with
+`security-scan-worker` does **not** start with `docker compose up`, which is the
+walkthrough beat: through CASE-1, CASE-2a, and Act One the capability does not
+exist, and you bring it up live, mid-demo, at the top of Act Two with
 
 ```
 docker compose up -d security-scan-worker
 ```
 
-after which the next pipeline run routes through the scan and the card animates
-into the dashboard. `docker compose stop security-scan-worker` takes it away
-again.
+after which the next pipeline run routes through the scan and fills in the scan
+card. The card itself arrives earlier, with the mandate: the switch is what puts
+a scan step in the pipeline, so the dashboard grows one the moment it is flipped
+and shows it idle until a scan reports.
+`docker compose stop security-scan-worker` takes the provider away again.
+
+A worker left running by mistake does not, on its own, give away Act Two. The
+mandate switch is off by default, and with it off the pipeline never asks who is
+offering a scan, so CASE-1 and CASE-2a run scan-free whatever is up. Both
+conditions have to hold — mandate on, provider answering — for a scan to happen.
 
 ## Tools
 
@@ -546,15 +560,22 @@ two acts; it is the phase that hands them something to act on.
 **The mandate.** A company-wide policy lands: no engineering team promotes its own
 service to production on its own say-so any more. Every production release goes
 through the Security team's scanning process, and Security — not the owning team —
-approves and initiates it. Enact it with the toggle on the dashboard; the label
-beside it reads `Mandate: ON` for as long as it is in force. Mechanically it does
-one thing: the next production Operation, from any caller, is created with
-`required_approver_team="security"`.
+approves and initiates it. Enact it with the switch at the top right of the
+dashboard, under **Log out**; while it is in force the line under it reads
+"Production releases require Security Team approval." Mechanically it does two
+things:
 
-There is no creation-time refusal and no second enforcement layer. A direct
-`promote_release(prod)` attempted after the mandate lands is created normally and
-simply carries the restriction; the attempt to approve it is what gets refused, on
-the same `_authorize_approver` path that was already there.
+- the release pipeline routes a gate-passed candidate through the Security team's
+  pre-prod scan before opening the production promotion. With the mandate off there
+  is no scan step in the flow at all, which is why the CASE-1 and CASE-2a runs above
+  are unaffected by it and why the Security worker can stay up throughout.
+- the next production Operation, from any caller, is created with
+  `required_approver_team="security"`.
+
+There is no creation-time refusal and no second enforcement layer for the approval
+half. A direct `promote_release(prod)` attempted after the mandate lands is created
+normally and simply carries the restriction; the attempt to approve it is what gets
+refused, on the same `_authorize_approver` path that was already there.
 
 The two acts are the same mandate before and after the Security team adopts
 Temporal. Each ends in exactly one worker kill.
@@ -715,13 +736,18 @@ startup, showing `idle` until something reaches staging and then moving through
 `running` to `passed` or `failed` — gates are the Waypoint team's own standing
 infrastructure, and an empty card saying "no candidate staged yet" is the accurate
 picture rather than something to hide. The security scan card genuinely does not
-exist until the Security team scans something, and animates into place between the
-gate and production the first time they do. Not a display toggle: the panel keys
-on whether the backend holds any scan state, so "that team has not onboarded us
-yet" and "they have" are the same code path with different state. That is what
-lets one live run tell the roadmap in order. The security scan card is the only
-one that names an owner, because it is the only one that has a
-different one. Restarting `mock-tool` restores the "before" picture for both.
+exist through CASE-1 and CASE-2a, and animates into place between the gate and
+production the moment the security mandate is switched on, because that is the
+moment a scan is part of the release pipeline. It reads `idle` until a scan
+reports, and fills in with stages and severities once one does. The card follows
+the mandate rather than the arrival of scan state, for the same reason the
+pipeline does: the mandate is the single thing that decides whether there is a
+scan step at all, and a card keyed on the last scan to have run would have shown
+the pipeline's shape trailing the rule that decides it by an entire release. Turn
+the mandate off with nothing in flight and the row goes back to gate-then-
+production, which is the flow it then has. The security scan card is the only one
+that names an owner, because it is the only one that has a different one.
+Restarting `mock-tool` clears both cards' reported state.
 
 `GET /fleet` is a read only projection of the same in-memory state the tools
 mutate, proxied from the deployment backend (`MOCK_TOOL_STATE_URL`) and gated on
@@ -906,15 +932,16 @@ Set via environment in `docker-compose.yml`.
 
 The security mandate is not an environment variable either, and deliberately not
 anything durable. It is a runtime flag held by the gateway process
-(`MANDATE_TOGGLE` in `gateway/server.py`), off at startup, flipped from the
-dashboard, and shown there as a persistent `Mandate: ON` / `Mandate: OFF` label.
+(`MANDATE_TOGGLE` in `gateway/server.py`), off at startup and flipped from the
+switch at the top right of the dashboard, which says "Production releases require
+Security Team approval." for as long as it is on and nothing at all when it is off.
 It is not a Signal, not a Search Attribute, and has no Event History of its own,
 because it is not domain state: it is a property of the gateway's configuration at
 the moment a call arrives, the same kind of thing `GATEWAY_APPROVERS` is. Its
-*effect* is durable — the value is snapshotted onto each request, so an operation
-created under the mandate keeps its restriction even if the toggle is flipped off
-a second later. It does not survive a gateway restart, and does not need to:
-flipping it live is the demo beat.
+*effect* is durable — the value is snapshotted onto each request, so a run that
+started under the mandate keeps both its scan step and its approver restriction
+even if the toggle is flipped off a second later. It does not survive a gateway
+restart, and does not need to: flipping it live is the demo beat.
 
 The idle timeout is not an environment variable. It is the `IDLE_TIMEOUT_SECONDS`
 constant in `workflows/chain.py`, set to 24 hours, kept in code so every Worker

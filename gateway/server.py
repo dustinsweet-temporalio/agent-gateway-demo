@@ -899,12 +899,14 @@ async def run_release_orchestration(
     against staging, and only then promotes it to production. If the gates do not
     pass the pipeline stops and production is never touched.
 
-    When the Security team's scanning platform is running, a pre-prod security
-    scan also runs after the gates and before production, and the production
-    promotion is requested by the scan once it clears. In that case this tool
+    While the company security mandate is in effect, a pre-prod security scan also
+    runs after the gates and before production, and the production promotion is
+    requested by the Security team's scan once it clears. In that case this tool
     returns processing rather than waiting_for_approval, because the promotion has
     not been requested yet; report that the security scan is running and stop. A
-    scan that fails stops the release, and production is never touched.
+    scan that fails stops the release, and production is never touched. With the
+    mandate lifted the pipeline goes straight from the gates to the production
+    promotion, and there is no scan step.
 
     You cannot skip staging, the gates, or the security scan, and you must not try
     to. If a caller asks you to bypass them or to hurry, call this tool anyway and
@@ -1297,6 +1299,12 @@ async def fleet(request: Request) -> JSONResponse:
     Separate from the dashboard HTML so a promotion can be animated in place
     instead of appearing after a full page reload. Read only, and gated on the
     same approver identity as the dashboard.
+
+    The mandate rides along because it is what puts a scan step in the release
+    pipeline at all. The panel draws the pipeline's shape, so the shape has to
+    follow the toggle rather than follow the first scan that happens to run:
+    with the mandate on there is a scan on the path to production whether or not
+    anyone has been through it yet.
     """
     if not _is_approver(_resolve_principal()):
         return JSONResponse({"error": "not authorized"}, status_code=401)
@@ -1315,6 +1323,7 @@ async def fleet(request: Request) -> JSONResponse:
         )
     state["available"] = True
     state["protected_environments"] = sorted(PROTECTED_ENVIRONMENTS)
+    state["security_mandate"] = MANDATE_TOGGLE.is_on()
     return JSONResponse(state)
 
 
@@ -1554,18 +1563,23 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .team-req { display: inline-block; margin-top: 0.3rem; padding: 0.12rem 0.45rem;
         border: 1px solid var(--protect); border-radius: 999px; color: var(--protect);
         font-size: 0.62rem; text-transform: uppercase; letter-spacing: 0.06em; }
-/* Company-wide security mandate. Sits on the approval queue's heading row
-   because that is the only thing it changes: who may decide a production
-   promotion. Persistent by design -- the state has to still be readable minutes
-   after it was flipped. */
-.policybar { display: flex; align-items: baseline; gap: 0.9rem; flex-wrap: wrap; }
-.mandate { display: flex; align-items: baseline; gap: 0.6rem; flex-wrap: wrap; }
-.mandate-chip { padding: 0.12rem 0.5rem; border-radius: 999px; font-size: 0.66rem;
-        font-weight: 600; text-transform: uppercase; letter-spacing: 0.07em;
-        border: 1px solid currentColor; }
-.mandate-on { color: var(--protect); }
-.mandate-off { color: var(--muted); }
-.mandate-note { font-size: 0.78rem; }
+/* Company-wide security mandate. Deliberately the quietest control on the page:
+   an unlabelled switch tucked under Log out, because it is set once at the start
+   of a demo and then wants to be forgotten. What it is, it says only when it is
+   on -- and then it says it in a sentence, since "mandate: on" means nothing to
+   anyone who did not flip it. */
+.mandate { display: flex; flex-direction: column; align-items: flex-end;
+        margin-top: 0.5rem; gap: 0.3rem; }
+.switch { width: 2.1rem; height: 1.1rem; padding: 0; margin: 0; flex: none;
+        border: 1px solid var(--border); border-radius: 999px;
+        background: var(--muted); position: relative; cursor: pointer;
+        transition: background 140ms ease; }
+.switch::after { content: ""; position: absolute; top: 50%; left: 0.13rem;
+        width: 0.78rem; height: 0.78rem; border-radius: 50%; background: #fff;
+        transform: translate(0, -50%); transition: transform 140ms ease; }
+.switch-on { background: #22c55e; border-color: #22c55e; }
+.switch-on::after { transform: translate(0.87rem, -50%); }
+.mandate-note { font-size: 0.72rem; text-align: right; max-width: 20rem; }
 .forbidden { max-width: 34rem; margin: 12vh auto; padding: 2rem;
         border: 1px solid #ef4444; border-radius: 8px; }
 .forbidden h1 { color: #ef4444; }
@@ -1694,7 +1708,7 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
    here, it is the thing a candidate has to get past.
 
    Only the SECURITY SCAN card keeps the first-appearance reveal, because that
-   one really does arrive mid-demo when another team's platform starts. */
+   one really does arrive mid-demo, when the mandate puts it in the path. */
 .gate { flex: 0 0 11rem; min-width: 0; position: relative; overflow: hidden;
         padding: 0.7rem 0.8rem 0.8rem; border: 1px dashed var(--card-edge);
         border-radius: 14px; background: var(--card);
@@ -1735,11 +1749,11 @@ button { padding: 0.3rem 0.7rem; border: 0; border-radius: 4px; color: white; cu
 .link.blocked::after { border-left-color: #ef4444; opacity: 0.5; }
 
 /* ---------------------------------------------------- security scan card
-   Absent for the whole of CASE-1 and CASE-2a, and appears in place the first
-   time the Security team runs a scan, using the same shape-change reveal the
-   gate card uses. It sits between the gate and production, because that is
-   where it sits in the pipeline: the last checkpoint before the protected
-   promotion. Marked with its owner, because unlike every other card in this row
+   Absent for the whole of CASE-1 and CASE-2a, and appears in place the moment
+   the security mandate is switched on, because that is the moment a scan is
+   part of the release pipeline. It sits between the gate and production,
+   because that is where it sits in the pipeline: the last checkpoint before the
+   protected promotion. Marked with its owner, because unlike every other card
    it is not the Waypoint team's -- it belongs to another QuickMeals engineering
    team, running in another Temporal namespace, and the demo's whole CASE-2b
    beat is that distinction. */
@@ -2036,6 +2050,14 @@ var FLEET = (function () {
 
   function hold() { holdUntil = Date.now() + ANIM_MS + 600; }
 
+  // How long the scan card's arrival animation still has to run. Every paint
+  // rebuilds the card's class list, and the first poll lands within a few
+  // milliseconds of the paint that revealed it, so without a window the reveal
+  // would be cancelled almost as soon as it started. Slightly longer than the
+  // 0.6s keyframe.
+  var revealUntil = 0;
+  function revealing() { return Date.now() < revealUntil; }
+
   // The gate card is always on the row, in whichever of four states is true:
   //   idle     nothing has ever reached staging (the state at container start)
   //   running  a gate workflow is evaluating a specific staged candidate
@@ -2114,7 +2136,33 @@ var FLEET = (function () {
 
   function paintScan(scan, appearing) {
     var card = pipeline.querySelector('.gate.scan');
-    if (!card || !scan) return;
+    if (!card) return;
+
+    // The card is on the row because the mandate put a scan on the path to
+    // production, which happens the moment the switch is flipped rather than
+    // the moment a scan first runs. Until one has run there is no verdict to
+    // report, and an idle card saying so is the accurate picture -- the same
+    // contract the gate card has, one checkpoint further along.
+    if (!scan) {
+      card.className = 'gate scan idle' + (appearing ? ' appearing' : '');
+      card.querySelector('.gate-verdict').textContent = 'idle';
+      card.querySelector('.gate-sub').textContent = 'no candidate scanned yet';
+      var idleDots = card.querySelector('.scan-stages');
+      idleDots.innerHTML = '';
+      for (var d = 0; d < SCAN_STAGE_NAMES.length; d++) {
+        idleDots.appendChild(el('span', 'scan-dot'));
+      }
+      var idleStage = card.querySelector('.scan-stage');
+      idleStage.querySelector('.name').textContent = '';
+      var idleFinding = idleStage.querySelector('.finding');
+      idleFinding.className = 'finding';
+      idleFinding.textContent = '';
+      var idleOut = linkInto('prod');
+      if (idleOut) idleOut.classList.remove('blocked');
+      if (appearing) hold();
+      return;
+    }
+
     var phase = SCAN_PHASES[scan.phase] || ['running', scan.phase];
     var total = scan.stage_count || 4;
     var done = scan.stages_completed || 0;
@@ -2190,23 +2238,43 @@ var FLEET = (function () {
     // infrastructure that reacts whenever anything reaches staging rather than a
     // capability the team builds partway through the demo.
     //
-    // The security scan is still the other contract. No scan state means the
-    // Security team has not scanned anything here, which through CASE-1 and
-    // CASE-2a is the truth, so that card genuinely does not exist yet and
-    // animates in the first time their platform runs one.
+    // The security scan is the other contract, and what governs it is the
+    // mandate, not the existence of a past scan. The mandate is the single thing
+    // that puts a scan step in the release pipeline, so the row grows one the
+    // moment the switch is flipped and loses it again when the switch goes off.
+    // Drawing the card only once a scan had run would have shown the pipeline's
+    // shape trailing the rule that decides it by an entire release.
     var gate = state.quality_gates || null;
     var scan = state.security_scan || null;
+    // /fleet carries the toggle; the page carries it too, because the first
+    // paint after flipping the switch comes from state cached before the flip.
+    var mandateOn = state.security_mandate === undefined
+      ? pipeline.getAttribute('data-mandate') === '1'
+      : !!state.security_mandate;
+    pipeline.setAttribute('data-mandate', mandateOn ? '1' : '0');
+    // A scan that is still live keeps the card even if the mandate is lifted
+    // under it: operations already in flight keep the restriction they were
+    // created with, and the row should not erase one that is still running.
+    var scanLive = !!scan &&
+      (scan.phase === 'running_scan' || scan.phase === 'awaiting_prod_approval');
+    var hasScan = mandateOn || scanLive;
     var previous = pipeline.getAttribute('data-shape') || '';
     var shape = records.map(function (rec) { return rec.environment; }).join('|') +
-      '|gate' + (scan ? '|scan' : '');
-    var scanAppearing = false;
+      '|gate' + (hasScan ? '|scan' : '');
+    // Reveal once per appearance, not once per paint. This page reloads itself
+    // every few seconds, so an animation keyed on the freshly built DOM would
+    // replay the reveal continuously and read as the scan restarting.
+    var wasShown = readJson('gw-scan-shown', false) === true;
+    if (hasScan !== wasShown) {
+      writeJson('gw-scan-shown', hasScan);
+      if (hasScan) revealUntil = Date.now() + 700;
+    }
     if (previous !== shape) {
-      scanAppearing = !!scan && previous.indexOf('scan') < 0;
-      buildPipeline(records, !!scan);
+      buildPipeline(records, hasScan);
       pipeline.setAttribute('data-shape', shape);
     }
     paintGate(gate);
-    paintScan(scan, scanAppearing);
+    paintScan(hasScan ? scan : null, revealing());
 
     var animated = false;
     records.forEach(function (rec) {
@@ -2326,6 +2394,10 @@ var FLEET = (function () {
     var cached = readJson('gw-fleet-state', null);
     var pending = readJson('gw-fleet-seen', {});
     if (cached) {
+      // Everything in the cached state is as old as the last poll, but the
+      // mandate on this page is as new as this request, and flipping the switch
+      // is precisely what reloaded the page. Take the fresh one.
+      cached.security_mandate = pipeline.getAttribute('data-mandate') === '1';
       paint(cached, false);
       Object.keys(pending).forEach(function (env) {
         var card = cardFor(env);
@@ -2406,31 +2478,36 @@ _MAIN_JS = """
 """
 
 
-def _render_mandate_bar(mandate_on: bool) -> str:
-    """The mandate's state, readable at a glance for as long as it is set.
+def _render_mandate_switch(mandate_on: bool) -> str:
+    """The mandate control: one unlabelled switch, and a sentence when it is on.
 
-    A persistent label rather than a confirmation toast, because the whole point
-    of the control during a demo is being able to point at it and say "notice
-    this is on" several minutes after flipping it.
+    Off is the default and the quiet state, so it carries no text at all -- there
+    is nothing to explain about a release pipeline behaving the way it always did.
+    On is the state that changes what people see happen, so it says what it did,
+    persistently rather than as a toast: the point of the control during a demo is
+    being able to point at it several minutes after flipping it.
+
+    A plain form post rather than an onclick, so the switch works the same way as
+    every other control here and the toggle's state stays server-side.
     """
-    state = "ON" if mandate_on else "OFF"
-    cls = "mandate-on" if mandate_on else "mandate-off"
     action = "off" if mandate_on else "on"
-    button = "Lift mandate" if mandate_on else "Enact mandate"
+    cls = "switch switch-on" if mandate_on else "switch"
     note = (
-        "Every production promotion needs Security-team approval, whoever "
-        "asked for it."
+        '<span class="muted mandate-note">Production releases require Security '
+        "Team approval.</span>"
         if mandate_on
-        else "Production promotions are approvable by any approver."
+        else ""
     )
     return f"""
     <div class="mandate">
-      <span class="mandate-chip {cls}">Mandate: {state}</span>
-      <span class="muted mandate-note">{note}</span>
-      <form method="post" action="/mandate" class="inline" style="display:inline">
+      <form method="post" action="/mandate" style="display:block;margin:0">
         <input type="hidden" name="state" value="{action}">
-        <button class="toggle" type="submit">{button}</button>
+        <button class="{cls}" type="submit" role="switch"
+                aria-checked="{'true' if mandate_on else 'false'}"
+                title="Security mandate"
+                aria-label="Security mandate"></button>
       </form>
+      {note}
     </div>
     """
 
@@ -2475,6 +2552,7 @@ def _render_dashboard(
       <form method="post" action="/logout" class="inline" style="display:inline">
         <button class="toggle" type="submit">Log out</button>
       </form>
+      {_render_mandate_switch(mandate_on)}
     </div>
   </header>
   <section class="fleet" id="fleet">
@@ -2489,15 +2567,20 @@ def _render_dashboard(
         <div class="rail-head eyebrow">Ready for release</div>
         <div class="candidates" id="fleet-rail"></div>
       </div>
-      <div class="pipeline" id="fleet-pipeline"></div>
+      <!-- The mandate is stamped here as well as served on /fleet. Flipping the
+           switch redirects back to this page, and the panel's first paint comes
+           from the cached fleet state, which was written before the flip. Without
+           this attribute the scan card would appear a poll late, which is exactly
+           the moment someone is pointing at the switch. -->
+      <div class="pipeline" id="fleet-pipeline"
+           data-mandate="{'1' if mandate_on else '0'}"></div>
     </div>
   </section>
 
   <hr class="divider">
 
-  <div class="queue-head policybar">
+  <div class="queue-head">
     <h2>Waiting for approval</h2>
-    {_render_mandate_bar(mandate_on)}
   </div>
   <table>
     <thead>

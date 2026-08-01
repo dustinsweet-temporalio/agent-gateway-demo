@@ -292,11 +292,10 @@ async def _prod_requires_approval_for_the_computed_version(
 
     # Tool1 ran the team's whole pipeline: read production (seeded at 2.2.0),
     # computed the next minor, cut it, and put it on staging. Landing on staging
-    # started a gate run, which the pipeline then waited on.
-    # ...and then it looked for a security scan provider, found none registered,
-    # and opened the production promotion itself. That last step is CASE-2a: with
-    # the Security team's platform not running, the pipeline behaves exactly as it
-    # did before the scan existed.
+    # started a gate run, which the pipeline then waited on. Then it opened the
+    # production promotion itself, which is CASE-2a: the security mandate is off
+    # on these requests, so there is no scan step in the flow and the pipeline
+    # does not even ask whether one is on offer.
     #
     # Note there is no "run_quality_gates" call. There is no such tool any more:
     # the gates are a Child Workflow the staging promotion starts, not something
@@ -305,8 +304,8 @@ async def _prod_requires_approval_for_the_computed_version(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "get_security_scan_status",
     ]
+    assert "get_security_scan_status" not in _tool_names()
     assert "release_orchestrator_prepare" not in _tool_names()
     # The bump always reads production, whatever the target.
     assert _call("get_deployed_version")[1] == {"environment": "prod"}
@@ -393,7 +392,6 @@ async def _prod_requires_approval_for_the_computed_version(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "get_security_scan_status",
         "promote_release",
         "release_orchestrator_resume",
     ]
@@ -517,7 +515,6 @@ async def _duplicate_call_dedups_without_a_second_cut(
         "get_deployed_version",
         "cut_release",
         "promote_release",
-        "get_security_scan_status",
     ]
     ledger = await handle.query(AgenticChainWorkflow.get_ledger)
     assert any(entry.event == "dedup_hit" for entry in ledger)

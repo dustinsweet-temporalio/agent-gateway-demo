@@ -109,12 +109,12 @@ LEDGER_RETENTION = 500
 PIPELINE_STAGING_ENVIRONMENT = "staging"
 PIPELINE_PRODUCTION_ENVIRONMENT = "prod"
 
-# The capability lookup the pipeline does after its gates pass. Pre-prod security
-# scanning belongs to the Security team, so the pipeline does not have it
-# configured; it asks the shared platform whether that team is currently offering
-# it, and routes through it when they are. Before the Security team onboards the
-# Waypoint team -- and any time their worker is not running -- the answer is no and the
-# pipeline opens the production promotion itself, exactly as it always did.
+# The capability lookup the pipeline does after its gates pass, once the mandate
+# has put a scan in its path at all. Pre-prod security scanning belongs to the
+# Security team, so the pipeline does not have it configured; it asks the shared
+# platform whether that team is currently offering it, and routes through it when
+# they are. Any time their worker is not running the answer is no and the pipeline
+# opens the production promotion itself, exactly as it always did.
 SCAN_CAPABILITY_TOOL = "get_security_scan_status"
 
 # Which QuickMeals engineering team must approve a promotion, keyed by the
@@ -129,9 +129,18 @@ SCAN_CAPABILITY_TOOL = "get_security_scan_status"
 CALLER_SERVICE_APPROVER_TEAMS = {"security": "security"}
 
 # The company-wide mandate: while it is in effect, no engineering team promotes
-# its own service to production on its own say-so, so every production promotion
-# needs the Security team behind it whoever asked for it. The toggle itself lives
-# in the gateway process and rides in on the request (see
+# its own service to production on its own say-so. That has two consequences, and
+# the mandate is the single thing that produces both:
+#
+#   1. The release pipeline routes a qualified candidate through the Security
+#      team's pre-prod scan before it opens the production promotion. While the
+#      mandate is off there is no scan step in the flow at all -- the pipeline does
+#      not even ask whether one is on offer -- so a run is the plain
+#      cut/stage/gate/promote pipeline it was before the Security team onboarded.
+#   2. The production promotion that comes out the far end is the Security team's
+#      to approve, whoever asked for it.
+#
+# The toggle itself lives in the gateway process and rides in on the request (see
 # ToolCallRequest.security_mandate); these two constants are the only thing the
 # Workflow knows about it.
 #
@@ -398,7 +407,7 @@ class AgenticChainWorkflow:
                         parent,
                         req.bump,
                         req.idempotency_key,
-                        allow_scan=req.controlled_tool1,
+                        allow_scan=req.controlled_tool1 and req.security_mandate,
                     )
                     resolved_tool2_arguments = {
                         **req.tool2_arguments,
@@ -1260,7 +1269,8 @@ class AgenticChainWorkflow:
             promote it to staging                  (PromoteReleaseChildWorkflow;
                                                     skipped for a staging target)
             wait for THAT candidate's gate verdict (skipped for a staging target)
-            look for a security scan provider      (allow_scan only)
+            look for a security scan provider      (allow_scan only, which needs
+                                                    the security mandate to be on)
             -- caller either hands off to the scan, or creates the target
                promotion as the child operation --
 
@@ -1275,11 +1285,14 @@ class AgenticChainWorkflow:
         itself -- a candidate that fails never reaches the approval queue -- only
         the mechanism for obtaining the verdict is.
 
-        allow_scan is set only on the first pass of a controlled, bump-driven
-        run. A replay is finishing an approval that was already granted against a
-        promotion that already exists, so there is nothing left to hand off; and
-        an uncontrolled caller cannot be parked waiting on another system's
-        verdict, since not being able to wait is what makes it uncontrolled.
+        allow_scan is set only on the first pass of a controlled, bump-driven run
+        made while the security mandate is in effect. The mandate is what puts a
+        scan in the pipeline's path at all, so with it off this stops at the
+        production promotion and no scan lookup happens. A replay is finishing an
+        approval that was already granted against a promotion that already exists,
+        so there is nothing left to hand off; and an uncontrolled caller cannot be
+        parked waiting on another system's verdict, since not being able to wait is
+        what makes it uncontrolled.
 
         Every step is an ordinary Activity, so the work is in Event History and a
         Worker or gateway restart resumes rather than starting over. That matters
@@ -1497,13 +1510,14 @@ class AgenticChainWorkflow:
                 + (": " + ", ".join(failed) if failed else "")
             )
 
-        # The candidate is qualified. Before the pipeline opens the production
-        # promotion itself, it asks whether anyone is offering a pre-prod security
-        # scan for this service. This is a lookup, not a setting: the Security team
-        # owns that capability, advertises it while their platform is running, and
-        # the pipeline routes through it when it is there. When it is not, the next
-        # line of this function is the production promotion, which is what the
-        # pipeline did for its whole life before the Security team onboarded it.
+        # The candidate is qualified. If the mandate put a scan in this pipeline's
+        # path, then before opening the production promotion itself it asks whether
+        # anyone is offering a pre-prod security scan for this service. Who provides
+        # it is a lookup, not a setting: the Security team owns that capability and
+        # advertises it while their platform is running, so the pipeline routes
+        # through whoever answers. With the mandate off, or with nobody answering,
+        # the next line of this function is the production promotion, which is what
+        # the pipeline did for its whole life before the mandate landed.
         handoff = None
         if allow_scan:
             handoff = await self._scan_capability(

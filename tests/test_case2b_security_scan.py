@@ -21,6 +21,8 @@ What each test pins down:
                     promotion is never put in front of a human
   before 2b         with no scan provider registered, the pipeline behaves
                     exactly as CASE-2a did
+  mandate off       with the mandate off there is no scan step in the flow at
+                    all, even with a provider up and advertising
 """
 
 from __future__ import annotations
@@ -301,7 +303,16 @@ async def _start_chain(env: WorkflowEnvironment, name: str) -> WorkflowHandle:
     )
 
 
-def _pipeline_request(workflow_id: str, key: str) -> NestedToolCallRequest:
+def _pipeline_request(
+    workflow_id: str, key: str, *, security_mandate: bool = True
+) -> NestedToolCallRequest:
+    """A CASE-2 pipeline run, made under the security mandate by default.
+
+    The mandate is what puts a scan in the pipeline's path at all, so every test
+    in this file that expects to see one has to be running under it. The default
+    is True for exactly that reason; the one test that turns it off is asserting
+    the absence.
+    """
     tool1_arguments = {"service": SERVICE, "bump": "minor", "environment": "prod"}
     tool2_arguments = {"service": SERVICE, "environment": "prod"}
     return NestedToolCallRequest(
@@ -324,6 +335,7 @@ def _pipeline_request(workflow_id: str, key: str) -> NestedToolCallRequest:
         nested_operation_id=f"{key}-child",
         bump="minor",
         controlled_tool1=True,
+        security_mandate=security_mandate,
     )
 
 
@@ -685,11 +697,11 @@ async def _failed_parent(handle: WorkflowHandle, operation_id: str):
 def test_without_a_registered_provider_the_pipeline_is_unchanged() -> None:
     """CASE-2a, verified as still being CASE-2a.
 
-    Before the Security team onboards Waypoint -- and any time their worker is
-    not running -- the pipeline looks for a provider, finds none, and opens the
-    production promotion itself. This is what keeps the two roadmap beats
-    separable in a live demo: the capability appears because someone started it,
-    not because a flag was flipped.
+    Two things have to be true for a scan to happen: the mandate has to be on,
+    and somebody has to be offering the capability. This is the second one
+    failing -- the mandate is on, but the Security team's worker is not running,
+    so the pipeline looks for a provider, finds none, and opens the production
+    promotion itself.
     """
 
     async def run() -> None:
@@ -715,5 +727,50 @@ def test_without_a_registered_provider_the_pipeline_is_unchanged() -> None:
                 assert backend._scan is None
                 events = await _ledger_events(handle)
                 assert "security_scan_handoff" not in events
+                # It did ask. Nobody answered.
+                assert "get_security_scan_status" in _tool_names()
+
+    asyncio.run(run())
+
+
+def test_without_the_mandate_the_scan_is_not_in_the_flow_at_all() -> None:
+    """The other half of the same rule, and the one CASE-1 depends on.
+
+    The provider is up and advertising here -- the Security team's platform is
+    running, exactly as it is for every other test in this file. The mandate is
+    off, so the pipeline does not route through the scan, and it does not even ask
+    whether one is on offer: the capability lookup never happens. A run under a
+    fresh gateway is the plain cut/stage/gate/promote pipeline, which is what
+    makes the CASE-1 scenarios demoable without stopping the Security worker.
+    """
+
+    async def run() -> None:
+        _reset_backend(scan_available=True)
+        async with await _environment() as env:
+            async with _gateway_worker(env):
+                handle = await _start_chain(env, "mandate-off-scan")
+                response = await handle.execute_update(
+                    AgenticChainWorkflow.request_nested_tool_call,
+                    _pipeline_request(
+                        handle.id, "mandate-off-scan", security_mandate=False
+                    ),
+                )
+
+                assert response.status == "waiting_for_approval"
+                parent = await _operation_view(handle, "mandate-off-scan-parent")
+                assert parent.status == "waiting_for_dependency"
+                assert "scan_workflow_id" not in parent.checkpoint
+                assert backend._scan is None
+                # Not "asked and was told no" -- never asked. The provider would
+                # have said yes.
+                assert "get_security_scan_status" not in _tool_names()
+                events = await _ledger_events(handle)
+                assert "scan_capability_discovered" not in events
+                assert "security_scan_handoff" not in events
+                # And the promotion it opened instead is nobody's team in
+                # particular, so any approver can clear it.
+                promotion = await _operation_view(handle, "mandate-off-scan-child")
+                assert promotion.status == "waiting_for_approval"
+                assert promotion.required_approver_team is None
 
     asyncio.run(run())

@@ -29,10 +29,14 @@ Keep this terminal open. The useful endpoints are:
 - MCP endpoint: http://localhost:8080/mcp
 
 One service deliberately does **not** start: `security-scan-worker`, the Security
-team's pre-prod scanning platform. It belongs to step 6's Act Two, and starting
-it early gives away the reveal -- Act One is the mandate landing *before* that
-team has adopted Temporal. If you have run this walkthrough before, check with
+team's pre-prod scanning platform. It belongs to step 6's Act Two, and starting it
+early gives away the reveal -- Act One is the mandate landing *before* that team has
+adopted Temporal. If you have run this walkthrough before, check with
 `docker compose ps` and stop it before you begin.
+
+If one is left running, nothing breaks: the mandate switch is off until step 6, and
+with it off the pipeline has no scan step at all, so steps 4 and 5 run scan-free
+either way.
 
 If you have changed any code since you last ran this, build with the profile or
 the security scan worker keeps a stale image:
@@ -263,15 +267,26 @@ computed -- both acts below take it as `<staged version>`.
 > anymore. Security has to clear it first. But Security hasn't adopted Temporal
 > yet -- their scanning process today is a plain script.
 
-**1. Enact the mandate.** On the approval dashboard at http://localhost:8080,
-click **Enact mandate**. The label beside it reads:
+**1. Enact the mandate.** On the approval dashboard at http://localhost:8080, flip
+the small switch at the top right, under **Log out**. It turns green, and a line
+appears under it:
 
 ```text
-Mandate: ON   Every production promotion needs Security-team approval, whoever asked for it.
+Production releases require Security Team approval.
 ```
 
 Point at it. It stays there for the rest of the demo, so you can come back to it
-without re-querying anything.
+without re-querying anything. Flipping it did two things: production promotions are
+now Security's to approve, and the release pipeline now routes candidates through
+the Security team's scan on the way to production -- which is the shape Act Two
+runs in. Until this moment there was no scan step in the flow at all, which is why
+everything before this step ran without one.
+
+The fleet panel says the second half of that immediately: a **Security scan** card
+animates in between the quality gates and production, owned by the Security team,
+reading `idle` because nothing has been through it yet. The pipeline grew a
+checkpoint the instant the rule landed, before any release has met it. Nothing has
+run; the shape changed.
 
 **2. Run the Security team's scanning process.** This is a plain Python script on
 the host, not a prompt: nobody phrases a scanner run as a sentence to an agent. It
@@ -382,8 +397,9 @@ security scan worker started, namespace 'security', task queue 'security-tq'
 
 Give it about five seconds to advertise itself.
 
-**2. Kick off a new run.** Get a fresh staged candidate and let the pipeline reach
-it, the same way the prerequisite did:
+**2. Kick off a new run.** Leave the mandate switch on -- it is what puts the scan
+in the pipeline's path, and Act Two is the same mandate as Act One. Then get a fresh
+staged candidate and let the pipeline reach it, the same way the prerequisite did:
 
 ```text
 Deploy the next minor version.
@@ -392,8 +408,8 @@ Deploy the next minor version.
 The Waypoint pipeline runs as it always has and then hands off. `SecurityScanWorkflow`
 appears in the `security` namespace and runs its own four stages over about
 fifteen seconds -- this time as a real, durable workflow rather than a stateless
-script. The scan card animates into the dashboard between the gate and production,
-naming each stage and the highest severity it turned up.
+script. The scan card that has been sitting `idle` since Act One fills in: a dot
+per stage, the stage running right now, and the highest severity it turned up.
 
 **3. The scan makes the nested call.** On a clean pass, `SecurityScanWorkflow`
 calls `AgentGatewayService.request_protected_action` -- a Nexus operation, straight

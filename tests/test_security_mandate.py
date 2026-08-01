@@ -1,18 +1,26 @@
-"""The company-wide security mandate toggle, and the one thing it changes.
+"""The company-wide security mandate toggle, and the two things it changes.
 
 The mandate is the in-story policy that lands between the two acts of the CASE-2
-walkthrough: no engineering team promotes its own service to production on its
-own say-so any more, so while it is in force, Security approves every production
-release. Mechanically it is a single runtime flag on the gateway process that
-changes *when* an Operation is created with required_approver_team="security".
+walkthrough: no engineering team promotes its own service to production on its own
+say-so any more. Mechanically it is a single runtime flag on the gateway process,
+and it does two things:
 
-It changes nothing about how that restriction is enforced. There is exactly one
-authorization mechanism -- Operation.required_approver_team, checked by
-gateway.server._authorize_approver at the HTTP boundary and again by
+  * a production promotion created while it is on carries
+    required_approver_team="security", so Security approves every production
+    release whoever asked for it
+  * the release pipeline routes a qualified candidate through the Security team's
+    pre-prod scan; with the mandate off there is no scan step in the flow at all
+
+This file owns the first. The second is asserted where the scan fixture lives, in
+test_case2b_security_scan.py.
+
+The mandate changes nothing about how the approver restriction is enforced. There
+is exactly one authorization mechanism -- Operation.required_approver_team,
+checked by gateway.server._authorize_approver at the HTTP boundary and again by
 AgenticChainWorkflow._approver_authorized on the durable side -- and these tests
 assert against that same mechanism rather than a second one.
 
-Four claims:
+Five claims:
 
   default off        a fresh gateway process restricts nothing, so CASE-1 as it
                      was demoed is unchanged
@@ -20,6 +28,9 @@ Four claims:
                      staging one is nobody's in particular
   grandfathering     the value is snapshotted onto the request, so flipping the
                      toggle does not reach back into operations already queued
+  dashboard          the switch says what it did, and the fleet panel draws a
+                     scan step in the pipeline the moment it is flipped, because
+                     that is the moment there is one
   end to end         the Act One shape: mandate on, uncontrolled caller gone,
                      Waypoint refused, Security approves, promotion lands
 """
@@ -28,9 +39,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import shutil
 import uuid
 
+from starlette.requests import Request
 from temporalio import activity
 from temporalio.client import WorkflowHandle
 from temporalio.testing import WorkflowEnvironment
@@ -50,10 +63,12 @@ from common.models import (
     ToolCallRequest,
     ToolCallResponse,
 )
+import gateway.server as server
 from gateway.server import (
     MANDATE_TOGGLE,
     _MandateToggle,
-    _render_mandate_bar,
+    _render_dashboard,
+    _render_mandate_switch,
 )
 from mock_tool import server as backend
 from tests import release_step_fakes
@@ -154,21 +169,76 @@ def test_a_security_requested_promotion_is_restricted_with_or_without_it() -> No
     )
 
 
-def test_the_dashboard_states_the_mandate_rather_than_announcing_it() -> None:
-    """Persistent label, not a toast.
+def test_the_dashboard_switch_says_what_it_did_only_when_it_is_on() -> None:
+    """An unlabelled switch, and a persistent sentence rather than a toast.
 
-    The walkthrough points at this several minutes after flipping it, so both
-    states have to be legible from the page alone.
+    Off is the quiet default and explains nothing, because there is nothing to
+    explain. On, the walkthrough points at the sentence several minutes after
+    flipping the switch, so it has to still be on the page then.
     """
-    off = _render_mandate_bar(False)
-    assert "Mandate: OFF" in off
-    # Off shows the control that turns it on, and nothing else.
+    off = _render_mandate_switch(False)
+    # The control that turns it on, and nothing else: no label, no note.
     assert 'value="on"' in off and 'value="off"' not in off
+    assert 'aria-checked="false"' in off
+    assert "switch-on" not in off
+    assert "mandate-note" not in off
+    # The accessible name is not a visible label, and is the only text either
+    # state carries besides the note.
+    assert 'aria-label="Security mandate"' in off
 
-    on = _render_mandate_bar(True)
-    assert "Mandate: ON" in on
-    assert "Security-team approval" in on
+    on = _render_mandate_switch(True)
     assert 'value="off"' in on and 'value="on"' not in on
+    assert 'aria-checked="true"' in on
+    assert "switch-on" in on
+    assert "Production releases require Security Team approval." in on
+
+
+def test_the_release_pipeline_row_is_drawn_from_the_toggle() -> None:
+    """The scan card is on the row because the mandate says a scan is in the path.
+
+    The fleet panel draws the pipeline's shape, and the mandate is the single
+    thing that decides whether that shape has a scan step in it. Drawing the card
+    from the last scan that happened to run instead would have shown the shape
+    trailing the rule that decides it by an entire release: flip the switch, and
+    nothing on the pipeline moves until some later run reaches the Security team.
+
+    Both surfaces carry the value because both are read. /fleet is the panel's
+    steady state, and the attribute on the page is what the very first paint
+    after the flip uses -- the switch redirects back here, and the panel's cached
+    state was written before the flip.
+    """
+    off = _render_dashboard([], [], mandate_on=False)
+    assert 'id="fleet-pipeline"' in off
+    assert 'data-mandate="0"' in off
+
+    on = _render_dashboard([], [], mandate_on=True)
+    assert 'data-mandate="1"' in on
+
+
+def test_the_fleet_endpoint_reports_the_mandate(monkeypatch) -> None:
+    """The panel's steady-state read of the same value, on its own 2s cadence."""
+    monkeypatch.setattr(server, "_APPROVERS", {"approver@demo"})
+    monkeypatch.setattr(
+        server,
+        "_fetch_fleet_state",
+        lambda: {"environments": [], "releases": [], "security_scan": None},
+    )
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/fleet", "headers": []}
+    )
+
+    def _payload() -> dict:
+        token = server._current_principal.set("approver@demo")
+        try:
+            return json.loads(asyncio.run(server.fleet(request)).body)
+        finally:
+            server._current_principal.reset(token)
+
+    toggle = _MandateToggle()
+    monkeypatch.setattr(server, "MANDATE_TOGGLE", toggle)
+    assert _payload()["security_mandate"] is False
+    toggle.set(True)
+    assert _payload()["security_mandate"] is True
 
 
 # ------------------------------------------------------------ live behavior
