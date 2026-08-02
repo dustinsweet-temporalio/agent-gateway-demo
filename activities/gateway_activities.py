@@ -59,7 +59,7 @@ def evaluate_policy(input: EvaluatePolicyInput) -> PolicyDecision:
     reads and promotions to staging, runs immediately.
     """
     if input.tool_name == "promote_release":
-        environment = str(input.arguments.get("environment", "")).lower()
+        environment = str(input.arguments.get("environment", "")).strip().lower()
         if environment in _protected_environments():
             return PolicyDecision(
                 requires_approval=True,

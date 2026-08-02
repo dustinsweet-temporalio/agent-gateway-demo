@@ -106,6 +106,8 @@ class AutonomousAgentWorkflow:
             "policy_evaluated",
             {"requires_approval": decision.requires_approval},
         )
+        if self._operation.status == OperationStatus.CANCELED:
+            return await self._finish()
 
         if decision.requires_approval:
             self._operation.status = OperationStatus.WAITING_FOR_APPROVAL
@@ -159,7 +161,10 @@ class AutonomousAgentWorkflow:
                 return await self._finish()
 
         await self._invoke_protected_action()
-        if self._operation.status == OperationStatus.FAILED:
+        if (
+            self._operation.status == OperationStatus.FAILED
+            or self._protected_result is None
+        ):
             return await self._finish()
         await self._run_dependent_action()
         return await self._finish()

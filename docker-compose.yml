@@ -6,8 +6,8 @@ services:
       context: .
       dockerfile: Dockerfile.temporal
     ports:
-      - "7233:7233"
-      - "8233:8233"
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:8233:8233"
     volumes:
       - temporal-data:/data
     healthcheck:
@@ -64,7 +64,7 @@ services:
       # too; kept here so a single .env value configures the whole demo.
       SCAN_FAIL_VERSIONS: "${SCAN_FAIL_VERSIONS:-}"
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
 
   worker:
     build:
@@ -180,7 +180,7 @@ services:
       GATEWAY_PRINCIPAL_TEAMS: '{"dustin.sweet@quickmeals.com":"waypoint","sam.ingbar@quickmeals.com":"waypoint","abe.roover@quickmeals.com":"security"}'
       GATEWAY_DEBUG: "1"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   adk-agent:
     build:
@@ -197,7 +197,7 @@ services:
       TASK_QUEUE: "agentic-gateway"
       ADK_MODEL: "${ADK_MODEL:-gemini-3.6-flash}"
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
 
 volumes:
   temporal-data:

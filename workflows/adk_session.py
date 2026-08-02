@@ -38,7 +38,6 @@ class TemporalAdkSessionWorkflow:
         self._runner: InMemoryRunner | None = None
         self._turn_lock = asyncio.Lock()
         self._turns: dict[str, AdkSessionWorkflowResult] = {}
-        self._active_turn_id: str | None = None
         self._waiting_operation_id: str | None = None
         self._approval: ApprovalResolution | None = None
 
@@ -84,7 +83,6 @@ class TemporalAdkSessionWorkflow:
         await workflow.wait_condition(lambda: self._ready)
         async with self._turn_lock:
             assert self._runner is not None
-            self._active_turn_id = turn.turn_id
             self._waiting_operation_id = None
             self._approval = None
             result = AdkSessionWorkflowResult(
@@ -133,7 +131,6 @@ class TemporalAdkSessionWorkflow:
                     return self._fail_turn(result, err)
 
             result.complete = True
-            self._active_turn_id = None
             self._waiting_operation_id = None
             return result
 
@@ -162,7 +159,6 @@ class TemporalAdkSessionWorkflow:
                 f"{result.error}"
             )
         result.complete = True
-        self._active_turn_id = None
         self._waiting_operation_id = None
         workflow.logger.warning(
             "adk session turn failed",

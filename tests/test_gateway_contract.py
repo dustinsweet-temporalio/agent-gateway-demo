@@ -6,10 +6,13 @@ import pytest
 from temporalio.client import WorkflowQueryFailedError
 from temporalio.service import RPCError, RPCStatusCode
 
+from activities.gateway_activities import evaluate_policy
 from common.models import (
     ADK_SESSION_ID_HEADER,
     CALLBACK_RUN_ID_HEADER,
     CALLBACK_WORKFLOW_ID_HEADER,
+    AdkTemporalSessionCallback,
+    EvaluatePolicyInput,
 )
 from gateway import server
 
@@ -141,6 +144,71 @@ def test_caller_idempotency_keys_are_stable_and_principal_scoped() -> None:
     )
     assert first == duplicate
     assert first != other_principal
+
+
+def test_policy_normalizes_environment_before_protection_check() -> None:
+    decision = evaluate_policy(
+        EvaluatePolicyInput(
+            tool_name="promote_release",
+            arguments={"environment": " PROD "},
+            caller_principal="requester@example.com",
+        )
+    )
+
+    assert decision.requires_approval is True
+
+
+def test_adk_callback_is_not_registered_before_owner_check(
+    monkeypatch,
+) -> None:
+    callback = AdkTemporalSessionCallback(
+        workflow_id="adk-session-workflow",
+        run_id="adk-session-run",
+        session_id="adk-session-123",
+    )
+
+    class Handle:
+        def __init__(self) -> None:
+            self.signals = []
+
+        async def query(self, *_args, **_kwargs):
+            return "workflow-owner@example.com"
+
+        async def signal(self, *args, **kwargs):
+            self.signals.append((args, kwargs))
+
+    handle = Handle()
+
+    class Client:
+        async def start_workflow(self, *_args, **_kwargs):
+            return handle
+
+    async def get_client():
+        return Client()
+
+    monkeypatch.setattr(server, "get_client", get_client)
+    monkeypatch.setattr(
+        server,
+        "_resolve_principal",
+        lambda _ctx=None: "attacker@example.com",
+    )
+    callback_token = server._current_adk_callback.set(callback)
+    try:
+        with pytest.raises(PermissionError):
+            asyncio.run(
+                server.start_google_adk_release_run(
+                    service="delivery-matching-service",
+                    version="2.5.0",
+                    environment="prod",
+                    agent_run_id="owner-check",
+                    workflow_id="existing-workflow",
+                    ctx=None,
+                )
+            )
+    finally:
+        server._current_adk_callback.reset(callback_token)
+
+    assert handle.signals == []
 
 
 class _FakeHandle:

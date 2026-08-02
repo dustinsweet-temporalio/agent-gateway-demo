@@ -51,7 +51,6 @@ _releases: dict[tuple[str, str], dict] = {
         ("2.2.0", 3600.0, ("staging", "prod")),
     )
 }
-_autonomous_followups: set[str] = set()
 
 # The quality gate card's state, and it is never absent. Gates are not a CASE-2
 # capability that appears partway through the demo any more: they are ambient
@@ -362,7 +361,6 @@ def _handle(tool_name: str, arguments: dict) -> dict:
 
     if tool_name == "record_autonomous_followup":
         run_id = str(arguments.get("agent_run_id", ""))
-        _autonomous_followups.add(run_id)
         return {
             "agent_run_id": run_id,
             "followup_recorded": True,

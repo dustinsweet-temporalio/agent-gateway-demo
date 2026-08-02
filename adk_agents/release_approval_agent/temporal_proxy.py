@@ -58,17 +58,14 @@ def _message_text(content: types.Content | None) -> str:
 
 
 def _is_observation_prompt(prompt: str) -> bool:
-    normalized = " ".join(prompt.lower().split())
-    return any(
-        phrase in normalized
-        for phrase in (
-            "resume",
-            "check status",
-            "check the status",
-            "what is the result",
-            "what's the result",
-        )
-    )
+    normalized = " ".join(prompt.lower().split()).rstrip("?!.,")
+    return normalized in {
+        "resume",
+        "check status",
+        "check the status",
+        "what is the result",
+        "what's the result",
+    }
 
 
 def _workflow_id(ctx: InvocationContext) -> str:
@@ -111,6 +108,7 @@ class TemporalSessionProxyAgent(BaseAgent):
             else None
         )
         workflow_running = False
+        started_new_workflow = False
         if handle is not None:
             try:
                 description = await handle.describe()
@@ -134,10 +132,13 @@ class TemporalSessionProxyAgent(BaseAgent):
                 id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
             )
             active_workflow_id = workflow_id
+            started_new_workflow = True
 
         saved_turn_id = str(ctx.session.state.get(TURN_STATE_KEY, ""))
         observe_existing = (
-            bool(saved_turn_id) and _is_observation_prompt(prompt)
+            not started_new_workflow
+            and bool(saved_turn_id)
+            and _is_observation_prompt(prompt)
         )
         if observe_existing:
             update_handle = handle.get_update_handle(
