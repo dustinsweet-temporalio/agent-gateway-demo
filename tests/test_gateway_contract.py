@@ -11,8 +11,10 @@ from common.models import (
     ADK_SESSION_ID_HEADER,
     CALLBACK_RUN_ID_HEADER,
     CALLBACK_WORKFLOW_ID_HEADER,
+    SCAN_MODE_PLATFORM,
     AdkTemporalSessionCallback,
     EvaluatePolicyInput,
+    ToolCallResponse,
 )
 from gateway import server
 
@@ -209,6 +211,73 @@ def test_adk_callback_is_not_registered_before_owner_check(
         server._current_adk_callback.reset(callback_token)
 
     assert handle.signals == []
+
+
+def test_adk_start_snapshots_the_same_security_controls_as_direct_calls(
+    monkeypatch,
+) -> None:
+    """CASE-3 must carry the controls used by the Claude direct-call path.
+
+    The toggle values are gateway process state, so the only safe place to read
+    them is while accepting the MCP call. The autonomous workflow can then lodge
+    the promotion with its companion AgenticChainWorkflow without either workflow
+    consulting mutable process state during replay.
+    """
+
+    principal = "release-agent@google-adk"
+    captured = {}
+
+    class Handle:
+        async def query(self, query, *args, **kwargs):
+            if query == server.AutonomousAgentWorkflow.get_workflow_owner:
+                return principal
+            return ToolCallResponse(
+                status="waiting_for_approval",
+                workflow_id="wf-adk-controls",
+                operation_id="op-adk-controls",
+            )
+
+        async def signal(self, *args, **kwargs):
+            raise AssertionError("this test did not register an ADK callback")
+
+    class Client:
+        async def start_workflow(self, _run, input, **_kwargs):
+            captured["input"] = input
+            return Handle()
+
+    async def get_client():
+        return Client()
+
+    monkeypatch.setattr(server, "get_client", get_client)
+    monkeypatch.setattr(server, "_resolve_principal", lambda _ctx=None: principal)
+
+    old_mandate = server.MANDATE_TOGGLE.is_on()
+    old_scan_mode = server.SCAN_MODE_TOGGLE.mode()
+    server.MANDATE_TOGGLE.set(True)
+    server.SCAN_MODE_TOGGLE.set(SCAN_MODE_PLATFORM)
+    try:
+        response = asyncio.run(
+            server.start_google_adk_release_run(
+                service="delivery-matching-service",
+                version="2.5.0",
+                environment="prod",
+                agent_run_id="security-controls",
+                workflow_id="wf-adk-controls",
+                ctx=None,
+            )
+        )
+    finally:
+        server.MANDATE_TOGGLE.set(old_mandate)
+        server.SCAN_MODE_TOGGLE.set(old_scan_mode)
+
+    assert response.status == "waiting_for_approval"
+    governed = captured["input"].governed_request
+    assert governed is not None
+    assert governed.security_mandate is True
+    assert governed.scan_mode == SCAN_MODE_PLATFORM
+    assert governed.correlation.workflow_id == "wf-adk-controls:gateway"
+    assert governed.correlation.caller_service == "google-adk-agent"
+    assert governed.callback_workflow_id == "wf-adk-controls"
 
 
 class _FakeHandle:

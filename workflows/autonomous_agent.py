@@ -9,7 +9,11 @@ from temporalio.common import RetryPolicy
 from temporalio.exceptions import ActivityError, ChildWorkflowError
 
 with workflow.unsafe.imports_passed_through():
-    from activities.gateway_activities import evaluate_policy, invoke_tool
+    from activities.gateway_activities import (
+        evaluate_policy,
+        invoke_tool,
+        submit_tool_call,
+    )
     from common.models import (
         AGENT_GATEWAY_APPROVAL_SIGNAL,
         AdkTemporalSessionCallback,
@@ -19,6 +23,7 @@ with workflow.unsafe.imports_passed_through():
         AutonomousAgentInput,
         CancelOperation,
         EvaluatePolicyInput,
+        GatewayOperationResolution,
         InvokeToolInput,
         LedgerEntry,
         Operation,
@@ -33,6 +38,7 @@ with workflow.unsafe.imports_passed_through():
 POLICY_TIMEOUT = timedelta(seconds=10)
 INVOKE_TIMEOUT = timedelta(seconds=60)
 RELEASE_CHILD_TIMEOUT = timedelta(minutes=5)
+GATEWAY_SUBMIT_TIMEOUT = timedelta(seconds=90)
 
 
 @workflow.defn
@@ -74,6 +80,10 @@ class AutonomousAgentWorkflow:
         self._protected_result = None
         self._callback = input.callback
         self._callback_notified = False
+        self._gateway_resolution: GatewayOperationResolution | None = None
+        self._gateway_initial_status = ""
+        self._cancel_requested: CancelOperation | None = None
+        self._cancel_forwarded = False
 
     @workflow.run
     async def run(self, input: AutonomousAgentInput) -> AgentRunSummary:
@@ -86,6 +96,16 @@ class AutonomousAgentWorkflow:
                 "call_path": self._operation.call_path,
             },
         )
+        # The optional request is an input-carried replay guard. Executions that
+        # started before ADK delegation have None and retain their exact original
+        # policy/approval/child-workflow command sequence below. New executions
+        # use AgenticChainWorkflow, the same governance path as Claude Code.
+        if input.governed_request is not None:
+            return await self._run_governed(input)
+        return await self._run_legacy(input)
+
+    async def _run_legacy(self, input: AutonomousAgentInput) -> AgentRunSummary:
+        """Original CASE-3 path, retained only for replaying older histories."""
         try:
             decision = await workflow.execute_activity(
                 evaluate_policy,
@@ -169,6 +189,183 @@ class AutonomousAgentWorkflow:
         await self._run_dependent_action()
         return await self._finish()
 
+    async def _run_governed(self, input: AutonomousAgentInput) -> AgentRunSummary:
+        """Delegate the protected call to the shared AgenticChainWorkflow path."""
+
+        request = input.governed_request
+        assert request is not None
+        self._operation.protected = True
+        self._checkpoint = {
+            "step": "submitting_to_gateway_chain",
+            "next_step": "await_gateway_resolution",
+            "governance_workflow_id": request.correlation.workflow_id,
+            "protected_action_executed": False,
+            "dependent_action_executed": False,
+        }
+        self._log(
+            "gateway_delegation_started",
+            {"governance_workflow_id": request.correlation.workflow_id},
+        )
+        try:
+            response = await workflow.execute_activity(
+                submit_tool_call,
+                request,
+                start_to_close_timeout=GATEWAY_SUBMIT_TIMEOUT,
+                retry_policy=RetryPolicy(maximum_attempts=5),
+            )
+        except ActivityError as err:
+            self._fail(
+                f"Agent Gateway did not accept the governed request: {err}",
+                "gateway_delegation_failed",
+            )
+            return await self._finish()
+
+        self._gateway_initial_status = str(response.get("status") or "processing")
+        self._operation.status = OperationStatus.WAITING_FOR_DEPENDENCY
+        self._operation.risk_reason = response.get("reason")
+        self._checkpoint = {
+            **self._checkpoint,
+            "step": (
+                "waiting_for_gateway_approval"
+                if self._gateway_initial_status == "waiting_for_approval"
+                else "waiting_for_gateway_governance"
+            ),
+            "gateway_status": self._gateway_initial_status,
+        }
+        self._log(
+            "gateway_delegation_accepted",
+            {
+                "governance_workflow_id": request.correlation.workflow_id,
+                "gateway_status": self._gateway_initial_status,
+            },
+        )
+
+        # The chain sends one terminal resolution for the original direct
+        # operation. In platform mode that cannot happen until the scan, its
+        # Security-owned approval, and the promotion have all settled. There is
+        # deliberately no second timeout here; the chain owns the approval clock.
+        while self._gateway_resolution is None:
+            await workflow.wait_condition(
+                lambda: self._gateway_resolution is not None
+                or (
+                    self._cancel_requested is not None
+                    and not self._cancel_forwarded
+                )
+            )
+            if (
+                self._gateway_resolution is None
+                and self._cancel_requested is not None
+                and not self._cancel_forwarded
+            ):
+                self._cancel_forwarded = True
+                self._checkpoint = {
+                    **self._checkpoint,
+                    "step": "cancel_requested",
+                    "next_step": "await_gateway_resolution",
+                }
+                self._log(
+                    "gateway_cancellation_forwarded",
+                    {
+                        "governance_workflow_id": request.correlation.workflow_id,
+                    },
+                )
+                await workflow.get_external_workflow_handle(
+                    request.correlation.workflow_id
+                ).signal("cancel_operation", self._cancel_requested)
+
+        resolution = self._gateway_resolution
+        assert resolution is not None
+        try:
+            terminal_status = OperationStatus(resolution.status)
+        except ValueError:
+            self._fail(
+                f"Agent Gateway returned unknown status {resolution.status!r}",
+                "gateway_resolution_invalid",
+            )
+            return await self._finish()
+        if terminal_status not in {
+            OperationStatus.COMPLETED,
+            OperationStatus.REJECTED,
+            OperationStatus.EXPIRED,
+            OperationStatus.CANCELED,
+            OperationStatus.BLOCKED,
+            OperationStatus.FAILED,
+        }:
+            self._fail(
+                f"Agent Gateway callback was not terminal: {resolution.status}",
+                "gateway_resolution_invalid",
+            )
+            return await self._finish()
+
+        # Reaching this point proves the companion successfully delivered its
+        # terminal callback to this workflow. Unlike a Claude Code session chain,
+        # this companion belongs to exactly one autonomous run and will never
+        # receive a second tool call, so let it complete gracefully instead of
+        # leaving it open for the shared chain's 24-hour idle window. The Signal
+        # is a durable Workflow command: a Worker restart after receiving the
+        # callback replays this close request before the outer run advances.
+        await workflow.get_external_workflow_handle(
+            request.correlation.workflow_id
+        ).signal("close_chain")
+        self._checkpoint = {
+            **self._checkpoint,
+            "governance_chain_close_requested": True,
+        }
+        self._log(
+            "gateway_chain_close_requested",
+            {"governance_workflow_id": request.correlation.workflow_id},
+        )
+
+        self._operation.status = terminal_status
+        self._operation.error = resolution.reason
+        self._operation.decided_iso = workflow.now().isoformat()
+        if terminal_status != OperationStatus.COMPLETED:
+            self._checkpoint = {
+                **self._checkpoint,
+                "step": terminal_status.value,
+                "next_step": None,
+            }
+            self._log(
+                "gateway_governed_action_stopped",
+                {"status": terminal_status.value, "reason": resolution.reason},
+            )
+            return await self._finish()
+
+        self._protected_result = resolution.result
+        self._operation.result = {"protected_action": resolution.result}
+        self._checkpoint = {
+            **self._checkpoint,
+            "step": "protected_action_completed",
+            "next_step": "run_dependent_action",
+            "protected_action_executed": True,
+        }
+        self._log("gateway_governed_action_completed")
+        await self._run_dependent_action()
+        return await self._finish()
+
+    @workflow.signal(name="operation_resolved")
+    def operation_resolved(
+        self,
+        resolution: GatewayOperationResolution,
+    ) -> None:
+        """The companion chain reporting the governed operation's terminal state."""
+
+        if resolution.operation_id != self._operation.operation_id:
+            self._log(
+                "gateway_resolution_ignored",
+                {
+                    "received_operation_id": resolution.operation_id,
+                    "expected_operation_id": self._operation.operation_id,
+                },
+            )
+            return
+        if self._gateway_resolution is None:
+            self._gateway_resolution = resolution
+            self._log(
+                "gateway_resolution_received",
+                {"status": resolution.status},
+            )
+
     @workflow.signal
     def register_callback(
         self,
@@ -251,6 +448,35 @@ class AutonomousAgentWorkflow:
 
     @workflow.signal
     def cancel_operation(self, cancellation: CancelOperation) -> None:
+        if self._input.governed_request is not None:
+            if (
+                cancellation.operation_id != self._operation.operation_id
+                or self._gateway_resolution is not None
+                or self._cancel_requested is not None
+                or self._operation.status
+                not in {
+                    OperationStatus.EVALUATING,
+                    OperationStatus.WAITING_FOR_DEPENDENCY,
+                }
+            ):
+                return
+            # The outer shell cannot truthfully claim cancellation until the
+            # chain confirms it. Record the request, let the main method send the
+            # Signal, and continue waiting for the authoritative terminal callback.
+            self._cancel_requested = cancellation
+            self._checkpoint = {
+                **self._checkpoint,
+                "step": "cancel_requested",
+                "next_step": "forward_cancel_to_gateway_chain",
+            }
+            self._log(
+                "gateway_cancellation_requested",
+                {
+                    "canceled_by": cancellation.canceled_by,
+                    "reason": cancellation.reason,
+                },
+            )
+            return
         if (
             cancellation.operation_id != self._operation.operation_id
             or self._operation.status
@@ -306,13 +532,13 @@ class AutonomousAgentWorkflow:
 
     @workflow.query
     def get_required_approver_team(self, operation_id: str) -> str:
-        """No team restriction ever applies to an autonomous agent run.
+        """The outer autonomous checkpoint is not an approval target.
 
-        Declared so the gateway can ask any workflow behind an approval queue
-        entry the same question without first working out which type it is. A
-        CASE-3 run promotes directly and is never gated by another QuickMeals
-        team's check, so there is no team whose approval it specifically needs;
-        the ordinary GATEWAY_APPROVERS membership check is the whole rule here.
+        New CASE-3 runs delegate their actionable operation to a companion
+        AgenticChainWorkflow, which reports the real required team (Security when
+        the mandate applies). This query remains for old histories and for the
+        dashboard's uniform workflow interface; delegated outer operations use
+        WAITING_FOR_DEPENDENCY and therefore never appear as approvable rows.
 
         Note this is about who may APPROVE. The ADK release agent
         (release-agent@google-adk) is a requester and only ever a requester: it
@@ -408,6 +634,7 @@ class AutonomousAgentWorkflow:
         )
 
     async def _run_dependent_action(self) -> None:
+        self._operation.status = OperationStatus.INVOKING
         try:
             result = await workflow.execute_activity(
                 invoke_tool,
@@ -453,6 +680,7 @@ class AutonomousAgentWorkflow:
                 OperationStatus.REJECTED,
                 OperationStatus.EXPIRED,
                 OperationStatus.CANCELED,
+                OperationStatus.BLOCKED,
                 OperationStatus.FAILED,
             }
         ):
@@ -517,6 +745,27 @@ class AutonomousAgentWorkflow:
                 poll_after_seconds=5,
                 **common,
             )
+        if op.status == OperationStatus.WAITING_FOR_DEPENDENCY:
+            if self._gateway_initial_status == "waiting_for_approval":
+                return ToolCallResponse(
+                    status="waiting_for_approval",
+                    reason="approval_required",
+                    message=(
+                        "The governed release is durably waiting for an approval "
+                        "in Agent Gateway."
+                    ),
+                    poll_after_seconds=5,
+                    **common,
+                )
+            return ToolCallResponse(
+                status="processing",
+                message=(
+                    "Agent Gateway is running the required governance steps; "
+                    "the autonomous run will resume from its durable callback."
+                ),
+                poll_after_seconds=5,
+                **common,
+            )
         if op.status in {
             OperationStatus.EVALUATING,
             OperationStatus.APPROVED,
@@ -541,6 +790,7 @@ class AutonomousAgentWorkflow:
                 "was invoked."
             ),
             OperationStatus.CANCELED: "The autonomous agent run was canceled.",
+            OperationStatus.BLOCKED: "The autonomous agent run was blocked.",
             OperationStatus.FAILED: "The autonomous agent run failed.",
         }
         return ToolCallResponse(

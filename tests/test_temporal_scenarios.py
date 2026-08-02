@@ -9,8 +9,14 @@ from temporalio.client import WorkflowHandle, WorkflowUpdateFailedError
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import Worker
 
+import activities.gateway_activities as gateway_activities
+from activities.gateway_activities import (
+    signal_operation_callback,
+    submit_tool_call,
+)
 from common.models import (
     AGENT_GATEWAY_APPROVAL_SIGNAL,
+    SCAN_MODE_LEGACY,
     AdkTemporalSessionCallback,
     ApprovalDecision,
     ApprovalResolution,
@@ -44,7 +50,7 @@ TASK_QUEUE = "test-agent-gateway"
 ACTIVITY_CALLS: list[tuple[str, dict]] = []
 
 
-@workflow.defn
+@workflow.defn(sandboxed=False)
 class ApprovalCallbackReceiverWorkflow:
     @workflow.init
     def __init__(self, session_id: str) -> None:
@@ -169,10 +175,16 @@ PROMOTION_WORKFLOWS = [PromoteReleaseChildWorkflow, QualityGateChildWorkflow]
 async def _environment() -> WorkflowEnvironment:
     temporal = shutil.which("temporal")
     assert temporal, "Temporal CLI is required for workflow tests"
-    return await WorkflowEnvironment.start_local(
+    env = await WorkflowEnvironment.start_local(
         dev_server_existing_path=temporal,
         dev_server_log_level="error",
     )
+    gateway_activities.TEMPORAL_ADDRESS = (
+        env.client.service_client.config.target_host
+    )
+    gateway_activities.TEMPORAL_NAMESPACE = env.client.namespace
+    gateway_activities.TASK_QUEUE = TASK_QUEUE
+    return env
 
 
 async def _wait_for_status(
@@ -607,6 +619,190 @@ def _autonomous_input(
         ),
         approval_timeout_seconds=timeout,
     )
+
+
+def _governed_autonomous_input(
+    workflow_id: str,
+    operation_id: str,
+) -> AutonomousAgentInput:
+    """A new CASE-3 input that delegates governance to its companion chain."""
+
+    input = _autonomous_input(workflow_id, operation_id)
+    companion_workflow_id = f"{workflow_id}:gateway"
+    input.governed_request = ToolCallRequest(
+        tool_name=input.tool_name,
+        arguments=dict(input.arguments),
+        safe_arguments=dict(input.safe_arguments),
+        idempotency_key=input.idempotency_key,
+        operation_id=input.operation_id,
+        correlation=CorrelationContext(
+            workflow_id=companion_workflow_id,
+            workflow_id_source="derived_from_agent_run",
+            agent_run_id=input.agent_run_id,
+            caller_principal=input.owner_principal,
+            caller_service="google-adk-agent",
+            runtime="GoogleADKAgent",
+            call_path=["GoogleADKAgent", "AgentGateway", "promote_release"],
+        ),
+        approval_timeout_seconds=input.approval_timeout_seconds,
+        requested_action=input.requested_action,
+        justification=input.justification,
+        security_mandate=True,
+        scan_mode=SCAN_MODE_LEGACY,
+        callback_workflow_id=workflow_id,
+    )
+    return input
+
+
+def test_case3_delegates_approval_policy_to_its_agentic_chain() -> None:
+    """ADK keeps its checkpoint shell; AgenticChain owns the governed call.
+
+    Legacy scan mode keeps this test focused on delegation and team enforcement.
+    Platform-mode scan/callback behavior is covered with the two-namespace Nexus
+    fixture in test_case2b_security_scan.py.
+    """
+
+    async def run() -> None:
+        ACTIVITY_CALLS.clear()
+        async with await _environment() as env:
+            async with Worker(
+                env.client,
+                task_queue=TASK_QUEUE,
+                workflows=[
+                    AutonomousAgentWorkflow,
+                    AgenticChainWorkflow,
+                    *PROMOTION_WORKFLOWS,
+                ],
+                activities=[
+                    fake_evaluate_policy,
+                    fake_invoke_tool,
+                    submit_tool_call,
+                    signal_operation_callback,
+                    *PROMOTION_ACTIVITIES,
+                ],
+            ):
+                workflow_id = f"wf-case3-governed-{uuid.uuid4().hex[:8]}"
+                operation_id = "op-agent-governed"
+                outer = await env.client.start_workflow(
+                    AutonomousAgentWorkflow.run,
+                    _governed_autonomous_input(workflow_id, operation_id),
+                    id=workflow_id,
+                    task_queue=TASK_QUEUE,
+                )
+
+                waiting = await _wait_for_status(
+                    outer, operation_id, "waiting_for_approval"
+                )
+                assert waiting.status == "waiting_for_approval"
+                assert ACTIVITY_CALLS == []
+
+                companion = env.client.get_workflow_handle(f"{workflow_id}:gateway")
+                chain_waiting = await _wait_for_status(
+                    companion, operation_id, "waiting_for_approval"
+                )
+                assert chain_waiting.status == "waiting_for_approval"
+                required = await companion.query(
+                    AgenticChainWorkflow.get_required_approver_team,
+                    operation_id,
+                )
+                assert required == "security"
+
+                await companion.signal(
+                    AgenticChainWorkflow.approve_operation,
+                    ApprovalDecision(
+                        operation_id=operation_id,
+                        approver="waypoint@example.com",
+                        approver_team="waypoint",
+                    ),
+                )
+                await asyncio.sleep(0.1)
+                still_waiting = await outer.query(
+                    AutonomousAgentWorkflow.get_operation_status,
+                    operation_id,
+                )
+                assert still_waiting.status == "waiting_for_approval"
+                assert ACTIVITY_CALLS == []
+
+                await companion.signal(
+                    AgenticChainWorkflow.approve_operation,
+                    ApprovalDecision(
+                        operation_id=operation_id,
+                        approver="security@example.com",
+                        approver_team="security",
+                    ),
+                )
+                completed = await asyncio.wait_for(outer.result(), timeout=15)
+                companion_summary = await asyncio.wait_for(
+                    companion.result(), timeout=5
+                )
+
+                assert completed.operations[0].status == "completed"
+                assert completed.dependent_action_executed is True
+                assert companion_summary["closing"] is True
+                assert companion_summary["operations"][0]["status"] == "completed"
+                assert [name for name, _ in ACTIVITY_CALLS] == [
+                    "promote_release",
+                    "record_autonomous_followup",
+                ]
+
+    asyncio.run(run())
+
+
+def test_case3_forwards_cancellation_to_its_governance_chain() -> None:
+    async def run() -> None:
+        ACTIVITY_CALLS.clear()
+        async with await _environment() as env:
+            async with Worker(
+                env.client,
+                task_queue=TASK_QUEUE,
+                workflows=[AutonomousAgentWorkflow, AgenticChainWorkflow],
+                activities=[
+                    fake_evaluate_policy,
+                    fake_invoke_tool,
+                    submit_tool_call,
+                    signal_operation_callback,
+                ],
+            ):
+                workflow_id = f"wf-case3-governed-cancel-{uuid.uuid4().hex[:8]}"
+                operation_id = "op-agent-governed-canceled"
+                outer = await env.client.start_workflow(
+                    AutonomousAgentWorkflow.run,
+                    _governed_autonomous_input(workflow_id, operation_id),
+                    id=workflow_id,
+                    task_queue=TASK_QUEUE,
+                )
+                await _wait_for_status(
+                    outer,
+                    operation_id,
+                    "waiting_for_approval",
+                )
+
+                await outer.signal(
+                    AutonomousAgentWorkflow.cancel_operation,
+                    CancelOperation(
+                        operation_id=operation_id,
+                        canceled_by="release-agent@google-adk",
+                        reason="request withdrawn",
+                    ),
+                )
+                canceled = await asyncio.wait_for(outer.result(), timeout=10)
+
+                assert canceled.operations[0].status == "canceled"
+                assert canceled.dependent_action_executed is False
+                assert ACTIVITY_CALLS == []
+                companion = env.client.get_workflow_handle(f"{workflow_id}:gateway")
+                companion_status = await companion.query(
+                    AgenticChainWorkflow.get_operation_status,
+                    operation_id,
+                )
+                assert companion_status.status == "canceled"
+                companion_summary = await asyncio.wait_for(
+                    companion.result(), timeout=5
+                )
+                assert companion_summary["closing"] is True
+                assert companion_summary["operations"][0]["status"] == "canceled"
+
+    asyncio.run(run())
 
 
 def test_case3_autonomous_checkpoint_resume_reject_and_expire() -> None:

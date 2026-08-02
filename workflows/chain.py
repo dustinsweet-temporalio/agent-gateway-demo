@@ -363,6 +363,19 @@ class AgenticChainWorkflow:
             existing_id = self._state.idempotency_index.get(req.idempotency_key)
             if existing_id is not None:
                 op = self._state.operations[existing_id]
+                if req.callback_workflow_id:
+                    if (
+                        op.callback_workflow_id
+                        and op.callback_workflow_id != req.callback_workflow_id
+                    ):
+                        raise ValueError(
+                            "idempotent tool call already has a different "
+                            "callback workflow"
+                        )
+                    # Covers an Activity retry after the Update committed but
+                    # before its response reached the autonomous caller. A
+                    # terminal operation becomes callback-eligible immediately.
+                    op.callback_workflow_id = req.callback_workflow_id
                 self._log("dedup_hit", op)
                 return self._response_for(op)
 
@@ -492,6 +505,33 @@ class AgenticChainWorkflow:
                 self._log("dedup_hit", parent)
                 return self._nested_response(parent, child)
 
+            if req.origin_operation_id:
+                origin = self._state.operations.get(req.origin_operation_id)
+                if (
+                    origin is None
+                    or origin.status != OperationStatus.WAITING_FOR_DEPENDENCY
+                ):
+                    # The scan can finish after its caller has canceled or
+                    # otherwise settled the original promotion. Do not create a
+                    # fresh nested promotion after that durable decision.
+                    if origin is None:
+                        return ToolCallResponse(
+                            status="failed",
+                            workflow_id=self._state.workflow_id,
+                            operation_id=req.nested_operation_id or None,
+                            reason="origin_operation_not_found",
+                            message=(
+                                "The operation waiting on this security scan no "
+                                "longer exists; no promotion was created."
+                            ),
+                        )
+                    self._log(
+                        "nested_request_refused_origin_settled",
+                        origin,
+                        {"origin_status": origin.status.value},
+                    )
+                    return self._response_for(origin)
+
             parent = self._new_nested_parent(req)
             self._state.operations[parent.operation_id] = parent
             self._state.idempotency_index[req.idempotency_key] = parent.operation_id
@@ -605,6 +645,30 @@ class AgenticChainWorkflow:
                     "version": resolved_version,
                 }
             self._log("tool1_checkpointed", parent, {"stage": "waiting_for_tool2"})
+
+            # A cancellation Signal may arrive while the safe Tool1 preparation
+            # Activity is awaited. Honor it before creating the protected Tool2.
+            if parent.status in TERMINAL:
+                return self._response_for(parent)
+            if req.origin_operation_id:
+                origin = self._state.operations.get(req.origin_operation_id)
+                if (
+                    origin is None
+                    or origin.status != OperationStatus.WAITING_FOR_DEPENDENCY
+                ):
+                    parent.status = (
+                        origin.status
+                        if origin is not None and origin.status in TERMINAL
+                        else OperationStatus.CANCELED
+                    )
+                    parent.error = (
+                        origin.error
+                        if origin is not None
+                        else "The originating operation no longer exists."
+                    )
+                    parent.decided_iso = workflow.now().isoformat()
+                    self._log("nested_request_stopped_with_origin", parent)
+                    return self._response_for(parent)
 
             handoff = prepare.get("scan_handoff") if req.bump else None
             if handoff:
@@ -910,6 +974,38 @@ class AgenticChainWorkflow:
         op = self._state.operations.get(cancellation.operation_id)
         if op is None or op.status in TERMINAL or op.status == OperationStatus.INVOKING:
             return
+
+        # If this is an operation parked on a scan, the scan may already have
+        # created its nested promotion. Cancellation is still safe until that
+        # protected child begins invoking. Once invocation starts (or finishes),
+        # the eventual result is authoritative and we refuse to claim it stopped.
+        dependents = [
+            candidate
+            for candidate in self._state.operations.values()
+            if candidate.origin_operation_id == op.operation_id
+        ]
+        for dependent in dependents:
+            child = (
+                self._state.operations.get(dependent.child_operation_id)
+                if dependent.child_operation_id
+                else None
+            )
+            if dependent.status == OperationStatus.COMPLETED or (
+                child is not None
+                and child.status
+                in {OperationStatus.INVOKING, OperationStatus.COMPLETED}
+            ):
+                self._log(
+                    "cancellation_refused_dependency_committed",
+                    op,
+                    {
+                        "dependent_operation_id": dependent.operation_id,
+                        "child_operation_id": (
+                            child.operation_id if child is not None else None
+                        ),
+                    },
+                )
+                return
         self._touch()
         op.status = OperationStatus.CANCELED
         op.approver = cancellation.canceled_by
@@ -939,6 +1035,37 @@ class AgenticChainWorkflow:
                         "parent_canceled": True,
                     },
                 )
+        for dependent in dependents:
+            if dependent.status not in TERMINAL:
+                dependent.status = OperationStatus.CANCELED
+                dependent.approver = cancellation.canceled_by
+                dependent.error = cancellation.reason
+                dependent.decided_iso = workflow.now().isoformat()
+                self._log(
+                    "canceled",
+                    dependent,
+                    {
+                        "canceled_by": cancellation.canceled_by,
+                        "reason": cancellation.reason,
+                        "origin_canceled": True,
+                    },
+                )
+            if dependent.child_operation_id:
+                child = self._state.operations.get(dependent.child_operation_id)
+                if child is not None and child.status not in TERMINAL:
+                    child.status = OperationStatus.CANCELED
+                    child.approver = cancellation.canceled_by
+                    child.error = cancellation.reason
+                    child.decided_iso = workflow.now().isoformat()
+                    self._log(
+                        "canceled",
+                        child,
+                        {
+                            "canceled_by": cancellation.canceled_by,
+                            "reason": cancellation.reason,
+                            "origin_canceled": True,
+                        },
+                    )
         self._propagate_child_terminal(op)
 
     @workflow.signal
@@ -2008,6 +2135,7 @@ class AgenticChainWorkflow:
             or [req.correlation.runtime, req.tool_name],
             safe_arguments=req.safe_arguments or req.arguments,
             workflow_id_source=req.correlation.workflow_id_source,
+            callback_workflow_id=req.callback_workflow_id,
             # A single-step call has no Tool1 above it, so the only thing that
             # can restrict it is the mandate. Before the mandate lands this is
             # None for every CASE-1 call, which is exactly how CASE-1 behaved

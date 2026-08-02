@@ -62,6 +62,10 @@ RELEASE REQUESTS
 - Treat waiting_for_approval as a successful durable pause, not an error. Report
   the workflow_id and operation_id exactly as returned, explain that a human must
   decide the request in Agent Gateway, and do not claim the release completed.
+- Treat processing the same way when returned by start_google_adk_release_run. It
+  means Agent Gateway is durably running required governance such as a security
+  scan. Report the identifiers and wait for the authoritative Temporal callback;
+  do not retry the start call or poll automatically.
 - Report waiting_for_approval as three labeled lines, in this order: status,
   workflow_id, operation_id. Then say in one sentence who must approve it and
   where. Do not pad that with a summary of what you are about to do.

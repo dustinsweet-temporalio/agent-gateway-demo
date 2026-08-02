@@ -8,7 +8,12 @@ from typing import Any
 
 import requests
 from temporalio import activity
-from temporalio.client import Client
+from temporalio.client import (
+    Client,
+    WithStartWorkflowOperation,
+    WorkflowUpdateStage,
+)
+from temporalio.common import WorkflowIDConflictPolicy
 from temporalio.exceptions import ApplicationError
 
 from common.models import (
@@ -16,6 +21,7 @@ from common.models import (
     ArchiveArtifactsInput,
     AwaitQualityGateInput,
     CalculateHashesInput,
+    ChainInput,
     CorrelationContext,
     DeployBinariesInput,
     EvaluatePolicyInput,
@@ -30,16 +36,18 @@ from common.models import (
     SignalOperationCallbackInput,
     SubmitNestedToolCallInput,
     TagCommitInput,
+    ToolCallRequest,
     ToolCallResponse,
     UpdateReleaseNotesInput,
     UpdateRoutingInput,
 )
 
 TEMPORAL_ADDRESS = os.getenv("TEMPORAL_ADDRESS", "temporal:7233")
-# This worker's own namespace. Both Activities at the bottom of this file
+# This worker's own namespace. The orchestration Activities at the bottom
 # connect here and nowhere else: there is no longer any code in the gateway that
 # reaches into another team's cluster, because the Nexus Endpoint does that.
 TEMPORAL_NAMESPACE = os.getenv("TEMPORAL_NAMESPACE", WAYPOINT_NAMESPACE)
+TASK_QUEUE = os.getenv("TASK_QUEUE", "agentic-gateway")
 OPERATION_RESOLVED_SIGNAL = "operation_resolved"
 
 
@@ -430,11 +438,63 @@ async def await_quality_gate(input: AwaitQualityGateInput) -> dict[str, Any]:
 
 # ------------------------------------------------- serving an external caller
 #
-# Both Activities below connect to this worker's OWN namespace. Nothing in the
+# All Activities below connect to this worker's OWN namespace. Nothing in the
 # gateway reaches into another team's cluster any more: the cross-team hop is a
 # Nexus Endpoint, and by the time either of these runs, the call has already
 # crossed it. Workflow code still never holds a client, because it has to replay
 # deterministically and a network call cannot.
+
+
+@activity.defn
+async def submit_tool_call(input: ToolCallRequest) -> dict[str, Any]:
+    """Submit a direct call to the same chain entrypoint used by Claude Code.
+
+    Workflow code cannot issue an Update against another workflow, so the
+    autonomous ADK checkpoint shell uses this same-namespace Activity as a thin
+    adapter. The request is already fully formed at the gateway boundary,
+    including its snapshotted security controls and callback target; this
+    Activity does not make policy decisions or modify it.
+
+    Update-with-start and the request's application idempotency key make retries
+    safe whether the companion chain exists already or is created by this call.
+    String workflow/update names avoid a chain -> activities -> chain import
+    cycle.
+    """
+    request = input
+    workflow_id = request.correlation.workflow_id
+    if not workflow_id:
+        raise ApplicationError(
+            "governed tool call is missing its chain workflow_id",
+            non_retryable=True,
+        )
+
+    client = await Client.connect(TEMPORAL_ADDRESS, namespace=TEMPORAL_NAMESPACE)
+    start_op = WithStartWorkflowOperation(
+        "AgenticChainWorkflow",
+        ChainInput(
+            workflow_id=workflow_id,
+            owner_principal=request.correlation.caller_principal or "",
+        ),
+        id=workflow_id,
+        task_queue=TASK_QUEUE,
+        id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
+    )
+    update = await client.start_update_with_start_workflow(
+        "request_tool_call",
+        request,
+        id=f"tool-call::{request.operation_id or request.idempotency_key}",
+        wait_for_stage=WorkflowUpdateStage.ACCEPTED,
+        start_workflow_operation=start_op,
+        result_type=ToolCallResponse,
+    )
+    response: ToolCallResponse = await update.result()
+    activity.logger.info(
+        "chain %s accepted governed direct call %s with status %s",
+        workflow_id,
+        response.operation_id,
+        response.status,
+    )
+    return dataclasses.asdict(response)
 
 
 @activity.defn

@@ -29,9 +29,9 @@ Google ADK Web -> TemporalAdkSessionWorkflow -> MCP Activity
                                               |
                    +--------------------------+------+
                    |                                 |
-         Chain entity workflow            Autonomous-agent workflow
-      (CASE-1, CASE-2a, CASE-2b)             (CASE-3 checkpoint)
-                   |                                 |
+         Chain entity workflow <----- Autonomous-agent workflow
+      (all governed tool calls)          (CASE-3 checkpoint shell;
+                   |                      delegates the same request)
     child workflows, same namespace, same task queue:
       CutReleaseChildWorkflow      tag / archive / hash
       PromoteReleaseChildWorkflow  deploy / health / route / notes
@@ -129,9 +129,10 @@ target namespace and task queue; callers address it by name and learn neither.
     moment later. The same toggle is what puts the pre-prod scan in the release
     pipeline's path at all — see below.
 
-  Everything else — every staging promotion, every read, CASE-1's production
-  promotions before the mandate lands, and CASE-3 — carries no team restriction
-  and is decided by any principal in `GATEWAY_APPROVERS`, unchanged.
+  Everything else — every staging promotion, every read, and production
+  promotions created before the mandate lands — carries no team restriction and
+  is decided by any principal in `GATEWAY_APPROVERS`, unchanged. CASE-3 delegates
+  its promotion to this same rule, so it requires Security while the mandate is on.
 - The pre-prod security scan (CASE-2b) is a second, independently owned system,
   not a module. `SecurityScanWorkflow` runs in the `security` namespace, on the
   `security-tq` task queue, in a worker the gateway team does not deploy, from a
@@ -181,8 +182,9 @@ target namespace and task queue; callers address it by name and learn neither.
   heartbeats that registration while it runs, and the entry expires on its own when
   it stops. The answer is *who*, and nothing about how: which stages run, the
   severity threshold, and which versions fail all live behind the endpoint. With no
-  provider answering, the pipeline opens the production promotion itself. So a scan
-  happens when the mandate says it must and someone is there to run it; the
+  provider answering while platform mode is selected, the release fails closed
+  rather than opening an unscanned production promotion. Legacy mode inserts no
+  Temporal scan because the Security team runs its host script separately. The
   approval requirement on production is the mandate's alone and holds either way.
 - Each ADK Web session maps to one running `TemporalAdkSessionWorkflow`. ADK Web
   submits later user turns as Updates to that same workflow, which owns one ADK
@@ -191,10 +193,16 @@ target namespace and task queue; callers address it by name and learn neither.
   directly; the worker runs both through Temporal Activities with a Scenario
   3-only tool allowlist and the `release-agent@google-adk` identity.
 - The Temporal ADK tool activity attaches its workflow, run, and ADK session IDs
-  to MCP calls. Agent Gateway persists that callback with the protected run and
+  to MCP calls. The autonomous workflow stores a snapshotted `ToolCallRequest` and
+  delegates it to a deterministic companion `AgenticChainWorkflow` (`<adk-id>:gateway`),
+  which is the exact direct-call path used by Claude Code. Agent Gateway persists
+  that callback with the protected run and
   sends a durable `agent_gateway_approval_resolved` signal after the operation
-  completes, rejects, expires, cancels, or fails. Dashy sends an internal resume
-  turn to the existing ADK session and reports the terminal result automatically.
+  completes, rejects, expires, cancels, or fails. Once the outer ADK workflow
+  receives that terminal callback, it gracefully closes its one-run companion;
+  reusable Claude Code session chains keep their normal 24-hour idle lifecycle.
+  Dashy sends an internal resume turn to the existing ADK session and reports the
+  terminal result automatically.
 - Explicit caller-provided workflow IDs are accepted only from authenticated
   principals. Every workflow records its owner; lifecycle queries and retries
   must come from that owner.
@@ -211,7 +219,7 @@ target namespace and task queue; callers address it by name and learn neither.
 | CASE-2a: pipeline and gates | `run_release_orchestration` (the pipeline) or `run_nested_release` (explicit version) | Fixed release pipeline, quality gates, full call path, child operation, controlled checkpoint/resume, uncontrolled fail-closed/retry |
 | CASE-2b: security scan as a separate Tool1 (walkthrough Act Two) | any path to prod, with the scanner switch on `Temporal` | Nexus handoff to another team's endpoint, a real nested Tool1 -> Tool2 call back into the same `workflow_id`, Tool1 suspending on a pending Nexus operation across the approval, fail-closed on a blocking finding |
 | CASE-2b: uncontrolled Tool1 (walkthrough Act One) | `security_scan/legacy_security_scan_script.py` | A stateless process that cannot hold the pause: prints the operation id, exits non-zero, and requires a human `resume_nested_release` |
-| CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run correlation, plan checkpoint, gateway-owned decision, protected action then dependent action |
+| CASE-3: autonomous agent | `start_google_adk_release_run` | Agent-run checkpoint around the same governed direct-call chain as Claude Code; mandated scan/approval first, dependent action only after terminal success |
 
 Services in `docker-compose.yml`: `temporal` (dev server plus Web UI, with the
 `waypoint` and `security` namespaces -- one per team), `nexus-endpoints` (registers the
@@ -680,12 +688,14 @@ docker compose up --build worker adk-agent
    and ready to go.
    ```
 
-   The first response is `waiting_for_approval` and includes the durable
-   `workflow_id` and `operation_id`. The ADK turn stays attached to the Temporal
-   session. Reusing the same `agent_run_id` recovers this run instead of creating
-   a duplicate.
-3. Open http://localhost:8080, sign in with `tok_approver`, and approve the
-   operation. Agent Gateway signals the ADK session, which sends Dashy an
+   The first response is `processing` while a mandated platform scan runs, or
+   `waiting_for_approval` when the request has already reached its approval. Both
+   include the durable `workflow_id` and `operation_id`, and both keep the ADK
+   turn attached to its Temporal callback. Reusing the same `agent_run_id`
+   recovers this run instead of creating a duplicate.
+3. Open http://localhost:8080. With the mandate on, sign in with `tok_abe` and
+   approve as Security; with it off, any configured approver may decide. Agent
+   Gateway signals the ADK session, which sends Dashy an
    internal resume/status prompt. The completed result then appears in the same
    ADK turn and contains both the protected promotion and dependent autonomous
    follow-up.
@@ -701,14 +711,15 @@ CASE-3 and the two additions above, stated explicitly rather than assumed:
   because this path never reads one. The agent's tool allowlist also excludes the
   pipeline tools entirely (`start_google_adk_release_run` and lifecycle reads
   only), so it cannot reach `run_release_orchestration` even indirectly.
-- **The promotion is still a Child Workflow.** `AutonomousAgentWorkflow` runs its
-  approved `promote_release` through `PromoteReleaseChildWorkflow`, the same type
-  CASE-1 and CASE-2a use, so a promotion means the same four steps however it was
-  requested.
+- **The promotion is still a Child Workflow.** `AutonomousAgentWorkflow` delegates
+  the exact `ToolCallRequest` to its companion `AgenticChainWorkflow`; that chain
+  runs `PromoteReleaseChildWorkflow`, the same path and type Claude Code reaches.
+  Under the platform mandate it first hands off to `SecurityScanWorkflow`, and
+  only the scan's resulting Security-owned promotion reaches the child.
 - **`release-agent@google-adk` is a requester, never an approver.** It is not in
-  `GATEWAY_APPROVERS`, so it cannot decide anything, its own runs included, and
-  CASE-3 operations carry no `required_approver_team` for it or anyone else to
-  satisfy.
+  `GATEWAY_APPROVERS`, so it cannot decide anything, its own runs included. The
+  companion chain sets `required_approver_team=security` for production while the
+  mandate is on, exactly as it does for a Claude Code direct promotion.
 
 If the browser disconnects while waiting, reopen the same ADK session and send
 `resume` or `check the status`; the web proxy reattaches to its saved Temporal

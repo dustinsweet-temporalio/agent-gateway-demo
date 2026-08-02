@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from temporalio.contrib.google_adk_agents import (
     TemporalMcpToolSet,
     TemporalModel,
@@ -26,6 +28,7 @@ from common.models import (
     CALLBACK_WORKFLOW_ID_HEADER,
     AdkTemporalSessionCallback,
 )
+from workflows.adk_session import TemporalAdkSessionWorkflow
 
 
 def test_adk_web_root_is_only_a_temporal_session_proxy() -> None:
@@ -43,6 +46,7 @@ def test_adk_agent_has_durable_pause_and_recovery_instructions() -> None:
     assert "Never claim to have changed code or external state" in AGENT_INSTRUCTION
     assert "start_google_adk_release_run" in AGENT_INSTRUCTION
     assert "waiting_for_approval" in AGENT_INSTRUCTION
+    assert "Treat processing the same way" in AGENT_INSTRUCTION
     assert "workflow_id and operation_id" in AGENT_INSTRUCTION
     assert "Never invent a replacement ID" in AGENT_INSTRUCTION
     assert "get_operation_result returns completed" in AGENT_INSTRUCTION
@@ -116,3 +120,23 @@ def test_temporal_agent_routes_model_and_mcp_calls_through_plugin() -> None:
     assert isinstance(agent.model, TemporalModel)
     assert len(agent.tools) == 1
     assert isinstance(agent.tools[0], TemporalMcpToolSet)
+
+
+def test_adk_session_waits_for_processing_governance_callbacks() -> None:
+    for status in ("waiting_for_approval", "processing"):
+        part = SimpleNamespace(
+            function_response=SimpleNamespace(
+                name="start_google_adk_release_run",
+                response={
+                    "structuredContent": {
+                        "status": status,
+                        "operation_id": "op-governed",
+                    }
+                },
+            )
+        )
+
+        assert (
+            TemporalAdkSessionWorkflow._waiting_operation_from_part(part)
+            == "op-governed"
+        )

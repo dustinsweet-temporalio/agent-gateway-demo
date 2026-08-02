@@ -612,10 +612,18 @@ ready to go.
 Expected result:
 
 ```text
-Status: waiting_for_approval
+Status: processing
 Workflow ID: wf-adk-...
 Operation ID: op-...
 ```
+
+With the security mandate on and the scanner set to `Temporal`, `processing`
+means the companion `wf-adk-...:gateway` chain is durably waiting on the scan.
+If the request has already reached a human gate (or platform scanning is not in
+the path), the status is `waiting_for_approval` instead. Both states keep the ADK
+turn attached to the same terminal callback. After that callback reaches the
+outer ADK workflow, the one-run companion closes gracefully rather than waiting
+through the reusable chain's 24-hour idle window.
 
 Nothing in that sentence is demo scaffolding. Service, version, and environment
 are the only facts the agent needs, and it picks the durable run key itself:
@@ -630,15 +638,17 @@ your own key: `use agent_run_id walkthrough-adk-run-2`.
 The autonomous workflow checkpoint in Temporal shows:
 
 ```text
-step: waiting_for_approval
-next_step: invoke_protected_action
+step: waiting_for_gateway_governance
+next_step: await_gateway_resolution
+governance_workflow_id: wf-adk-...:gateway
 protected_action_executed: false
 dependent_action_executed: false
 ```
 
 ### C. Approve and watch Dashy resume
 
-Leave the ADK turn open and approve the operation in the Agent Gateway dashboard.
+Leave the ADK turn open. After the scan creates the promotion, sign in as
+`tok_abe` and approve the Security-owned operation in the Agent Gateway dashboard.
 The gateway sends `agent_gateway_approval_resolved` to the originating
 `TemporalAdkSessionWorkflow`. That workflow sends Dashy an internal resume/status
 user turn and the final answer appears automatically in the same ADK conversation.

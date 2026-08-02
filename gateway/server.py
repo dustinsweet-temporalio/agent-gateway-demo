@@ -696,6 +696,42 @@ def _requested_action(tool_name: str, arguments: dict) -> str:
     return f"Call {tool_name}"
 
 
+def _build_tool_call_request(
+    *,
+    tool_name: str,
+    arguments: dict,
+    idempotency_key: str,
+    operation_id: str,
+    correlation: CorrelationContext,
+    justification: Optional[str],
+    callback_workflow_id: str = "",
+) -> ToolCallRequest:
+    """Build the governed direct-call contract at the gateway boundary.
+
+    Claude Code calls submit this request immediately. Google ADK stores the
+    same request in its autonomous workflow input and submits it from there, so
+    both runtimes share policy evaluation, scan insertion, approval ownership,
+    and downstream execution rather than merely sharing the promotion child.
+    """
+    return ToolCallRequest(
+        tool_name=tool_name,
+        arguments=arguments,
+        idempotency_key=idempotency_key,
+        correlation=correlation,
+        approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
+        requested_action=_requested_action(tool_name, arguments),
+        justification=justification,
+        operation_id=operation_id,
+        safe_arguments=_safe_arguments(arguments),
+        # These are mutable gateway process settings, so snapshot them before a
+        # Workflow starts. Their recorded values, not a later toggle flip, govern
+        # replay and retry on both the Claude Code and ADK paths.
+        security_mandate=MANDATE_TOGGLE.is_on(),
+        scan_mode=SCAN_MODE_TOGGLE.mode(),
+        callback_workflow_id=callback_workflow_id,
+    )
+
+
 async def _submit_tool_call(
     tool_name: str,
     arguments: dict,
@@ -730,26 +766,13 @@ async def _submit_tool_call(
         runtime=runtime,
         call_path=[runtime, tool_name],
     )
-    req = ToolCallRequest(
+    req = _build_tool_call_request(
         tool_name=tool_name,
         arguments=arguments,
         idempotency_key=idem,
-        correlation=correlation,
-        approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
-        requested_action=_requested_action(tool_name, arguments),
-        justification=justification,
         operation_id=operation_id,
-        safe_arguments=_safe_arguments(arguments),
-        # Read here, at the boundary, exactly like the approver's team is. The
-        # Workflow decides what the mandate means; it does not get to look up
-        # whether it is on.
-        security_mandate=MANDATE_TOGGLE.is_on(),
-        # Both toggles ride on the single-tool path too, not just the pipeline's.
-        # This is the path an agent takes when it decides to call promote_release
-        # itself instead of run_release_orchestration, and it is precisely the
-        # path a company-wide mandate has to hold on: a control an agent can step
-        # around by picking a different tool is not a control.
-        scan_mode=SCAN_MODE_TOGGLE.mode(),
+        correlation=correlation,
+        justification=justification,
     )
 
     # Deliver the tool call as an Update. wait_for_stage=ACCEPTED returns the handle
@@ -1179,6 +1202,27 @@ async def start_google_adk_release_run(
         runtime="GoogleADKAgent",
         call_path=["GoogleADKAgent", "AgentGateway", "promote_release"],
     )
+    governance_workflow_id = f"{resolved_workflow_id}:gateway"
+    governed_request = _build_tool_call_request(
+        tool_name="promote_release",
+        arguments=arguments,
+        idempotency_key=idem,
+        operation_id=operation_id,
+        correlation=CorrelationContext(
+            workflow_id=governance_workflow_id,
+            workflow_id_source="derived_from_autonomous_run",
+            operation_id=operation_id,
+            idempotency_key=idem,
+            agent_session_id=correlation.agent_session_id,
+            agent_run_id=agent_run_id,
+            caller_service="google-adk-agent",
+            caller_principal=principal,
+            runtime="GoogleADKAgent",
+            call_path=list(correlation.call_path),
+        ),
+        justification=justification or None,
+        callback_workflow_id=resolved_workflow_id,
+    )
     input = AutonomousAgentInput(
         workflow_id=resolved_workflow_id,
         operation_id=operation_id,
@@ -1194,6 +1238,7 @@ async def start_google_adk_release_run(
         correlation=correlation,
         approval_timeout_seconds=APPROVAL_TIMEOUT_SECONDS,
         callback=callback,
+        governed_request=governed_request,
     )
     client = await get_client()
     handle = await client.start_workflow(

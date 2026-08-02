@@ -153,6 +153,11 @@ class ToolCallRequest:
     # an agent can step around by calling promote_release directly instead of
     # run_release_orchestration is not a mandate.
     scan_mode: str = SCAN_MODE_LEGACY
+    # A workflow in this namespace that is waiting for the terminal result of
+    # this direct call. The Google ADK autonomous workflow uses this to delegate
+    # governance to AgenticChainWorkflow without polling or reimplementing policy.
+    # Empty for ordinary Claude Code/MCP calls, whose caller polls the chain.
+    callback_workflow_id: str = ""
 
 
 @dataclass
@@ -711,6 +716,11 @@ class AutonomousAgentInput:
     correlation: CorrelationContext
     approval_timeout_seconds: int = 300
     callback: Optional[AdkTemporalSessionCallback] = None
+    # New CASE-3 runs carry the exact ToolCallRequest used by the Claude Code
+    # direct-call path. Its presence is also the replay guard: histories created
+    # before delegation leave this None and retain the original workflow command
+    # sequence, while new runs submit it to a companion AgenticChainWorkflow.
+    governed_request: Optional[ToolCallRequest] = None
 
 
 @dataclass

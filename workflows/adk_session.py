@@ -216,7 +216,13 @@ class TemporalAdkSessionWorkflow:
         structured = response.get("structuredContent", response)
         if not isinstance(structured, dict):
             return None
-        if structured.get("status") != "waiting_for_approval":
+        # Platform scanning returns processing before a human approval exists.
+        # It is still a durable pause: the autonomous workflow has registered
+        # this session as its callback target and will signal the terminal result.
+        if structured.get("status") not in {
+            "waiting_for_approval",
+            "processing",
+        }:
             return None
         operation_id = structured.get("operation_id")
         return str(operation_id) if operation_id else None

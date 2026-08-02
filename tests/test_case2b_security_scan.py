@@ -35,7 +35,7 @@ import shutil
 import time
 import uuid
 
-from temporalio import activity
+from temporalio import activity, workflow
 from temporalio.api.nexus.v1 import EndpointSpec, EndpointTarget
 from temporalio.api.operatorservice.v1 import CreateNexusEndpointRequest
 from temporalio.client import Client, WorkflowHandle
@@ -55,6 +55,7 @@ from common.models import (
     ChainInput,
     CorrelationContext,
     EvaluatePolicyInput,
+    GatewayOperationResolution,
     InvokeToolInput,
     NestedToolCallRequest,
     PolicyDecision,
@@ -104,6 +105,29 @@ TEST_STAGE_COUNT = 2
 # whether a step ran as an Activity or inside a release Child Workflow.
 INVOKE_CALLS = release_step_fakes.TOOL_CALLS
 PUBLISHED: list[PublishScanStateInput] = []
+
+
+@workflow.defn(sandboxed=False)
+class OperationCallbackReceiverWorkflow:
+    """Stand-in for the outer autonomous workflow waiting on its chain."""
+
+    def __init__(self) -> None:
+        self._resolution: GatewayOperationResolution | None = None
+
+    @workflow.run
+    async def run(self) -> GatewayOperationResolution:
+        await workflow.wait_condition(lambda: self._resolution is not None)
+        assert self._resolution is not None
+        return self._resolution
+
+    @workflow.signal(name="operation_resolved")
+    def operation_resolved(self, resolution: GatewayOperationResolution) -> None:
+        if self._resolution is None:
+            self._resolution = resolution
+
+    @workflow.query
+    def get_resolution(self) -> GatewayOperationResolution | None:
+        return self._resolution
 
 _PRISTINE_DEPLOYED = copy.deepcopy(backend._deployed)
 _PRISTINE_RELEASES = copy.deepcopy(backend._releases)
@@ -253,6 +277,7 @@ def _gateway_worker(env: WorkflowEnvironment) -> Worker:
         workflows=[
             AgenticChainWorkflow,
             ProtectedActionWorkflow,
+            OperationCallbackReceiverWorkflow,
             # The Waypoint team's own release steps. Same namespace and task
             # queue as the chain that starts them, which is the deliberate
             # contrast with SecurityScanWorkflow below.
@@ -767,6 +792,8 @@ def _direct_promotion_request(
     caller_service: str | None = None,
     security_mandate: bool = True,
     scan_mode: str = SCAN_MODE_PLATFORM,
+    callback_workflow_id: str = "",
+    runtime: str = "ClaudeCode",
 ) -> ToolCallRequest:
     """A single promote_release call, the way an agent makes one by hand.
 
@@ -790,12 +817,13 @@ def _direct_promotion_request(
             workflow_id_source="explicit_authorized",
             caller_principal=PRINCIPAL,
             caller_service=caller_service,
-            runtime="ClaudeCode",
-            call_path=["ClaudeCode", "promote_release"],
+            runtime=runtime,
+            call_path=[runtime, "promote_release"],
         ),
         requested_action=f"Promote {SERVICE} {version} to {environment}",
         security_mandate=security_mandate,
         scan_mode=scan_mode,
+        callback_workflow_id=callback_workflow_id,
     )
 
 
@@ -844,6 +872,88 @@ def test_a_hand_rolled_promotion_cannot_step_around_the_mandate() -> None:
                         op.checkpoint["scan_workflow_id"]
                     )
                     assert await scan.query("get_status") is not None
+
+    asyncio.run(run())
+
+
+def test_an_adk_companion_chain_notifies_its_outer_workflow_after_the_scan() -> None:
+    """The ADK shell delegates to the same governed operation as Claude Code.
+
+    The callback belongs to the original single-tool operation. It must remain
+    unresolved while the mandated scan is running and while the scan's production
+    promotion awaits Security approval, then receive the origin operation's final
+    result after that nested promotion completes. This is the seam that lets the
+    autonomous workflow run its dependent follow-up without owning a second copy
+    of gateway policy.
+    """
+
+    async def run() -> None:
+        _reset_backend(scan_available=True)
+        async with await _environment() as env:
+            scan_client = await _scan_client(env)
+            async with _gateway_worker(env), _scan_worker(scan_client):
+                outer_workflow_id = f"wf-adk-shell-{uuid.uuid4().hex[:8]}"
+                callback = await env.client.start_workflow(
+                    OperationCallbackReceiverWorkflow.run,
+                    id=outer_workflow_id,
+                    task_queue=GATEWAY_TASK_QUEUE,
+                )
+                companion_workflow_id = f"{outer_workflow_id}:gateway"
+                chain = await env.client.start_workflow(
+                    AgenticChainWorkflow.run,
+                    ChainInput(
+                        workflow_id=companion_workflow_id,
+                        owner_principal=PRINCIPAL,
+                    ),
+                    id=companion_workflow_id,
+                    task_queue=GATEWAY_TASK_QUEUE,
+                )
+                assert chain.id == f"{outer_workflow_id}:gateway"
+                response = await chain.execute_update(
+                    AgenticChainWorkflow.request_tool_call,
+                    _direct_promotion_request(
+                        chain.id,
+                        "adk-companion",
+                        caller_service="google-adk-agent",
+                        callback_workflow_id=outer_workflow_id,
+                        runtime="GoogleADKAgent",
+                    ),
+                )
+
+                assert response.status == "processing"
+                assert (
+                    await callback.query(
+                        OperationCallbackReceiverWorkflow.get_resolution
+                    )
+                    is None
+                )
+
+                promotion = await _waiting_promotion(chain)
+                assert promotion.required_approver_team == "security"
+                assert (
+                    await callback.query(
+                        OperationCallbackReceiverWorkflow.get_resolution
+                    )
+                    is None
+                )
+
+                await chain.signal(
+                    AgenticChainWorkflow.approve_operation,
+                    ApprovalDecision(
+                        operation_id=promotion.operation_id,
+                        approver="Abe Roover <abe.roover@quickmeals.com>",
+                        approver_team="security",
+                    ),
+                )
+
+                resolution = await asyncio.wait_for(callback.result(), timeout=30)
+                assert resolution.operation_id == "adk-companion-op"
+                assert resolution.status == "completed"
+                assert (
+                    resolution.result["scan_result"]["tool2_result"]["environment"]
+                    == "prod"
+                )
+                assert backend._deployed["prod"]["version"] == "2.3.0"
 
     asyncio.run(run())
 
