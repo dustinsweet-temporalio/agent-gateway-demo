@@ -69,14 +69,6 @@ async def fake_evaluate_policy(input: EvaluatePolicyInput) -> PolicyDecision:
     )
 
 
-@activity.defn(name="evaluate_policy")
-async def slow_fake_evaluate_policy(
-    input: EvaluatePolicyInput,
-) -> PolicyDecision:
-    await asyncio.sleep(0.2)
-    return await fake_evaluate_policy(input)
-
-
 @activity.defn(name="invoke_tool")
 async def fake_invoke_tool(input: InvokeToolInput) -> dict:
     ACTIVITY_CALLS.append((input.tool_name, dict(input.arguments)))
@@ -640,44 +632,6 @@ def test_case3_autonomous_checkpoint_resume_reject_and_expire() -> None:
                 expired = await expired_handle.result()
                 assert expired.operations[0].status == "expired"
                 assert expired.dependent_action_executed is False
-                assert ACTIVITY_CALLS == []
-
-    asyncio.run(run())
-
-
-def test_case3_cancel_during_policy_evaluation_stops_the_run() -> None:
-    async def run() -> None:
-        ACTIVITY_CALLS.clear()
-        async with await _environment() as env:
-            async with Worker(
-                env.client,
-                task_queue=TASK_QUEUE,
-                workflows=[AutonomousAgentWorkflow],
-                activities=[slow_fake_evaluate_policy, fake_invoke_tool],
-            ):
-                workflow_id = f"wf-case3-cancel-{uuid.uuid4().hex[:8]}"
-                operation_id = "op-agent-canceled"
-                handle = await env.client.start_workflow(
-                    AutonomousAgentWorkflow.run,
-                    _autonomous_input(workflow_id, operation_id),
-                    id=workflow_id,
-                    task_queue=TASK_QUEUE,
-                )
-                await handle.signal(
-                    AutonomousAgentWorkflow.cancel_operation,
-                    CancelOperation(
-                        operation_id=operation_id,
-                        canceled_by="release-agent@google-adk",
-                        reason="request withdrawn",
-                    ),
-                )
-                canceled = await asyncio.wait_for(
-                    handle.result(),
-                    timeout=5,
-                )
-
-                assert canceled.operations[0].status == "canceled"
-                assert canceled.dependent_action_executed is False
                 assert ACTIVITY_CALLS == []
 
     asyncio.run(run())

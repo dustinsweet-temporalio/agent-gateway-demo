@@ -191,10 +191,7 @@ class InvokeToolInput:
 
 @dataclass
 class LedgerEntry:
-    """One application-level audit entry stored in Workflow state.
-
-    Temporal Event History remains the underlying execution record.
-    """
+    """One durable audit record. The full ledger is also the Event History."""
 
     ts: str
     event: str

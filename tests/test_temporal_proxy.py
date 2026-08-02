@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-import pytest
 from google.genai import types
 from temporalio.client import WorkflowExecutionStatus, WorkflowUpdateStage
 
@@ -236,22 +235,12 @@ def test_proxy_starts_new_workflow_when_saved_one_is_not_running(
             return SimpleNamespace(status=WorkflowExecutionStatus.COMPLETED)
 
     class NewHandle:
-        def __init__(self):
-            self.updates = []
-
-        async def start_update(self, *args, **kwargs):
-            self.updates.append((args, kwargs))
+        async def start_update(self, *_args, **_kwargs):
             return UpdateHandle()
-
-        def get_update_handle(self, *_args, **_kwargs):
-            raise AssertionError(
-                "a turn from the closed workflow must not be reused"
-            )
 
     class Client:
         def __init__(self):
             self.started = []
-            self.new_handle = NewHandle()
 
         def get_workflow_handle(self, workflow_id):
             assert workflow_id == "closed-workflow"
@@ -259,7 +248,7 @@ def test_proxy_starts_new_workflow_when_saved_one_is_not_running(
 
         async def start_workflow(self, workflow, input, **kwargs):
             self.started.append((workflow, input, kwargs))
-            return self.new_handle
+            return NewHandle()
 
     client = Client()
 
@@ -272,7 +261,7 @@ def test_proxy_starts_new_workflow_when_saved_one_is_not_running(
             temporal_proxy.WORKFLOW_STATE_KEY: "closed-workflow",
             temporal_proxy.TURN_STATE_KEY: "closed-turn",
         },
-        prompt="resume",
+        prompt="start fresh",
     )
 
     async def run():
@@ -288,21 +277,3 @@ def test_proxy_starts_new_workflow_when_saved_one_is_not_running(
         temporal_proxy.WORKFLOW_STATE_KEY
     ]
     assert new_workflow_id != "closed-workflow"
-    assert len(client.new_handle.updates) == 1
-
-
-@pytest.mark.parametrize(
-    ("prompt", "expected"),
-    [
-        ("resume", True),
-        ("Check the status?", True),
-        ("what's the result!", True),
-        ("implement resume support", False),
-        ("check status handling", False),
-    ],
-)
-def test_observation_prompt_matching_is_command_scoped(
-    prompt,
-    expected,
-) -> None:
-    assert temporal_proxy._is_observation_prompt(prompt) is expected

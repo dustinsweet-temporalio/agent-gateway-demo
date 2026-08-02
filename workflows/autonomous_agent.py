@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta, timezone, datetime
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
@@ -102,8 +102,6 @@ class AutonomousAgentWorkflow:
             "policy_evaluated",
             {"requires_approval": decision.requires_approval},
         )
-        if self._operation.status == OperationStatus.CANCELED:
-            return await self._finish()
 
         if decision.requires_approval:
             self._operation.status = OperationStatus.WAITING_FOR_APPROVAL
@@ -157,10 +155,7 @@ class AutonomousAgentWorkflow:
                 return await self._finish()
 
         await self._invoke_protected_action()
-        if (
-            self._operation.status == OperationStatus.FAILED
-            or self._protected_result is None
-        ):
+        if self._operation.status == OperationStatus.FAILED:
             return await self._finish()
         await self._run_dependent_action()
         return await self._finish()

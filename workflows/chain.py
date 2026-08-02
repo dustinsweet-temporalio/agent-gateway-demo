@@ -625,7 +625,6 @@ class AgenticChainWorkflow:
         except ActivityError as err:
             op.status = OperationStatus.FAILED
             op.error = str(err)
-            op.decided_iso = workflow.now().isoformat()
             self._log("failed", op, {"error": str(err)})
             self._propagate_child_terminal(op)
 
