@@ -1,6 +1,6 @@
-# Version floors. These are minimums known to carry the APIs this demo uses
-# (update-with-start in temporalio, streamable-http transport in mcp). Newer
-# releases are fine.
+# Version floors known to carry the APIs this demo uses (update-with-start in
+# temporalio and streamable HTTP in mcp). Install versions within the declared
+# ranges below.
 temporalio>=1.30.0
 mcp>=1.12.0
 google-adk[mcp]>=2.5.0,<3.0.0

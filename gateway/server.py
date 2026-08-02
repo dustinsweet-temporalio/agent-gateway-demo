@@ -78,7 +78,12 @@ TERMINAL_STATUSES = {
     "failed",
 }
 UNVERIFIED_PRINCIPAL = "claude-code (unverified)"
-GATEWAY_DEBUG = bool(os.getenv("GATEWAY_DEBUG"))
+GATEWAY_DEBUG = os.getenv("GATEWAY_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 POLL_AFTER_SECONDS = int(os.getenv("POLL_AFTER_SECONDS", "5"))
 
 # Per-tool sync/async handling.
@@ -791,16 +796,18 @@ async def start_google_adk_release_run(
         task_queue=TASK_QUEUE,
         id_conflict_policy=WorkflowIDConflictPolicy.USE_EXISTING,
     )
-    if callback is not None:
-        await handle.signal(
-            AutonomousAgentWorkflow.register_callback,
-            callback,
-        )
+    # USE_EXISTING may return a workflow created by another caller. Confirm
+    # ownership before mutating that workflow, including callback registration.
     owner = await handle.query(
         AutonomousAgentWorkflow.get_workflow_owner
     )
     if owner != principal:
         raise PermissionError("workflow_id is owned by a different principal")
+    if callback is not None:
+        await handle.signal(
+            AutonomousAgentWorkflow.register_callback,
+            callback,
+        )
 
     # The first Workflow Task performs policy evaluation. Briefly wait for the
     # externally useful pause/completion state without tying agent liveness to the

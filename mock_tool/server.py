@@ -10,12 +10,9 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-# Pretend deployment backend. Holds just enough in-memory state to keep the demo
-# story internally consistent: cut releases are remembered, and a promotion moves
-# the target environment to that version so a later read reflects it.
+# Pretend deployment backend. Holds only the in-memory deployment state needed
+# for a later read to reflect a promotion.
 _deployed: dict[str, str] = {"test": "2.3.0", "staging": "2.2.0", "prod": "2.1.0"}
-_releases: set[tuple[str, str]] = set()
-_autonomous_followups: set[str] = set()
 
 # Idempotency store keyed by the Idempotency-Key header. A replayed activity
 # attempt with the same key returns the original result and does not apply the
@@ -54,7 +51,6 @@ def _handle(tool_name: str, arguments: dict) -> dict:
     if tool_name == "cut_release":
         service = str(arguments.get("service", ""))
         version = str(arguments.get("version", ""))
-        _releases.add((service, version))
         return {
             "service": service,
             "version": version,
@@ -95,7 +91,6 @@ def _handle(tool_name: str, arguments: dict) -> dict:
 
     if tool_name == "record_autonomous_followup":
         run_id = str(arguments.get("agent_run_id", ""))
-        _autonomous_followups.add(run_id)
         return {
             "agent_run_id": run_id,
             "followup_recorded": True,

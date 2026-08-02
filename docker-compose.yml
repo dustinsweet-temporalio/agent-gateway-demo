@@ -6,8 +6,8 @@ services:
       context: .
       dockerfile: Dockerfile.temporal
     ports:
-      - "7233:7233"
-      - "8233:8233"
+      - "127.0.0.1:7233:7233"
+      - "127.0.0.1:8233:8233"
     volumes:
       - temporal-data:/data
     healthcheck:
@@ -27,7 +27,7 @@ services:
       SLOW_CUT_VERSION: "2.3.1"
       SLOW_CUT_DELAY_SECONDS: "30"
     ports:
-      - "9000:9000"
+      - "127.0.0.1:9000:9000"
 
   worker:
     build:
@@ -67,7 +67,7 @@ services:
       GATEWAY_APPROVERS: "approver@demo"
       GATEWAY_DEBUG: "1"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
   adk-agent:
     build:
@@ -83,7 +83,7 @@ services:
       TASK_QUEUE: "agentic-gateway"
       ADK_MODEL: "${ADK_MODEL:-gemini-2.5-flash}"
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
 
 volumes:
   temporal-data:
