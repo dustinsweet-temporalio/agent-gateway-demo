@@ -81,6 +81,18 @@ The resolved identity should be:
 Dustin Sweet <dustin.sweet@quickmeals.com>
 ```
 
+Then copy the demo's session instructions into the repo you have open in the IDE:
+
+```bash
+cp claude-code-session/CLAUDE.md /path/to/the/repo/you/have/open/CLAUDE.md
+```
+
+That file is what keeps the agent scoped to the `agent-gateway` tools and out of
+the local working tree, which is set dressing rather than the release system. The
+repo you open can be anything, including an empty directory — all release state
+lives in the gateway. Background and caveats:
+[claude-code-session/README.md](claude-code-session/README.md).
+
 ## 3. Sign in as the approver
 
 Open http://localhost:8080 and enter:

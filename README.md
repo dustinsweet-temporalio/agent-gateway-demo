@@ -1,5 +1,12 @@
 # Agent Gateway: durable suspend and resume for agentic tool calls
 
+> [!IMPORTANT]
+> **This is demonstration code, not production code — deliberately so.** It was
+> built to show what Temporal makes possible, quickly, and it was scoped for that:
+> some best practices were knowingly set aside, and some of it may simply be
+> wrong. Please read [What this code is, and what it is
+> not](#what-this-code-is-and-what-it-is-not) before you read the code.
+
 A runnable implementation of all three scenarios in the "Suspend/Resume Primitive
 for Agentic Work" requirements. An MCP server (the Agent Gateway) pauses protected
 tool calls for human approval. Temporal holds the chain, nested Tool1 checkpoint,
@@ -14,6 +21,55 @@ any repo, the repo does not have to be this one) and drive a release through
 environments. Reading what is deployed, cutting a release, and promoting to
 staging all run immediately. Promoting to prod is the protected action: the
 gateway pauses it and a human approves or rejects before it proceeds.
+
+Load [claude-code-session/CLAUDE.md](claude-code-session/CLAUDE.md) into that code
+session first — it is the instruction file Temporal presented the demo with, and it
+is what keeps the agent on the gateway instead of reading the repo it happens to be
+sitting in. See [Load the session
+instructions](#load-the-session-instructions).
+
+## What this code is, and what it is not
+
+This repository exists to answer one question quickly: what can Temporal do for
+agentic work that has to stop and wait on a human? It answers by running. Every
+scenario here executes end to end, survives worker and gateway restarts, and picks
+back up from durable state. Those mechanics are real, and they are the reason to
+read this code: an approval that outlives the process that asked for it, a nested
+tool call that fails closed rather than guessing, two teams calling each other
+across a namespace boundary through Nexus, an autonomous agent that checkpoints
+its own progress. Take those ideas seriously — they transfer.
+
+Production quality, on the other hand, was an explicit non-goal. That was a
+scoping decision rather than an oversight: pursuing it would have pushed the
+timeline out substantially without making the demonstration any more convincing.
+Three consequences are worth stating plainly.
+
+**Temporal best practices were followed selectively, on purpose.** Where a
+practice was material to what we were showing, we followed it, and [How this maps
+to Temporal best practices](#how-this-maps-to-temporal-best-practices) records
+which ones and why. Where it was not material, we skipped it. [Honest
+caveats](#honest-caveats) lists the shortcuts we are aware of. Neither list is
+exhaustive, and parts of this code are likely to be flat wrong. So: **please do not
+read this repository as the sanctioned way to build on Temporal.** Where it
+disagrees with Temporal's documented guidance, the guidance is right and this is
+not.
+
+**The story is stagecraft.** The Waypoint team, the Security team,
+`delivery-matching-service`, the release fleet panel — that scaffolding exists to
+make a live walkthrough land in front of an audience, and it works well for that.
+It earns nothing when you are reading for the patterns, and it will actively get
+in your way if you try to map it onto your own organization. The durable
+primitives underneath are the transferable part; the org chart around them is set
+dressing, and you should feel free to discard it.
+
+**A focused reference implementation is a different artifact, and we would be glad
+to build it.** Canonical, narrow implementations of whichever of these patterns
+matter to your architecture — proven patterns, best practices followed throughout,
+none of the demo scaffolding — were out of scope for this build. They are very much
+in scope as a next step. Either way, the highest-leverage thing you can do is
+bring Temporal's Solution Architects in early, while your designs are still ideas
+rather than commitments. Vetting a direction before it is built into a system
+costs very little; discovering the problem afterward does not.
 
 ## Architecture
 
@@ -384,6 +440,37 @@ Confirm it is connected:
 ```
 claude mcp list
 ```
+
+### Load the session instructions
+
+Before driving any scenario, copy the demo's `CLAUDE.md` into the repo you have
+open in your IDE:
+
+```
+cp claude-code-session/CLAUDE.md /path/to/the/repo/you/have/open/CLAUDE.md
+```
+
+This is the same project-instruction file Temporal used to present the demo. It
+scopes the session to the `agent-gateway` tools, tells the agent that the open
+working tree is inert set dressing rather than the release system, maps each
+scenario's phrasing to the right tool, names the steps that are deliberately
+performed by someone other than the coding agent, and keeps the reporting to a
+few status lines. Without it a coding agent will read the local repo to answer
+"what's deployed", reach for unrelated connectors, or hand-roll its own
+`cut_release` → `promote_release` sequence around the pipeline tools — all of
+which make the scenarios narrate badly.
+
+See [claude-code-session/README.md](claude-code-session/README.md) for what each
+rule is defending against and the two rough edges kept in the file as-is.
+
+> **On the repo you have open.** When Temporal presented this demo on August 3rd,
+> 2026, a dummy project (`delivery-matching-service`) was loaded into the VS Code
+> IDE. It was window dressing to make the demo work — **not real code**, not the
+> release system, and never read by the gateway. It lives in its own GitHub repo
+> and can be provided on request. You do not need it: open any repo, or an empty
+> directory, drop the `CLAUDE.md` above into it, and every scenario behaves
+> identically, because all release state lives in the gateway rather than on
+> disk.
 
 ## Run CASE-3 with Google ADK
 
@@ -1013,6 +1100,9 @@ activities/gateway_activities.py  evaluate_policy, invoke_tool, the individual
 worker.py                   registers the workflow and activities
 gateway/server.py           MCP HTTP server, deployment tools, approver UI
 mock_tool/server.py         pretend deploy backend with idempotency and continuity
+claude-code-session/CLAUDE.md  the project instructions loaded into the Claude
+                            Code session that drives the demo. Prompt-side
+                            scaffolding; nothing in the running system reads it
 tests/                      Temporal scenarios, gateway contract, and ADK agent
                             tests. release_step_fakes.py stands in for the
                             release Child Workflows' leaf steps so the suite
